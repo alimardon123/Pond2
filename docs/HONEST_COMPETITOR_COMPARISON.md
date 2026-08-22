@@ -230,7 +230,7 @@ ecosystem (Kafka protocol, Flink connector) and throughput optimizations
 - **Branch-aware shards:** shards live under branches (git-like)
 - **Branch switching:** checkout() changes active branch, shards follow
 - **Merge:** three-level merge (row groups + rows + branches)
-- **Works on ANY storage:** no CAS dependency (local FS, S3, GCS)
+- **Works on ANY S3-compatible storage:** no CAS dependency (local FS, S3, R2, MinIO, Wasabi, DigitalOcean Spaces. GCS interface-ready but not implemented)
 
 ### This is Pond's competitive advantage
 No other storage system offers CRDT-based concurrent multi-writer with
@@ -321,7 +321,7 @@ No production use to validate the design.
 2. **Git-like versioning on any collection:** branch/merge/history/revert
    unified across workloads. Real.
 3. **Cross-lens access:** any lens can read/write any collection. Real.
-4. **Storage independence:** no CAS dependency — local FS, S3, GCS. Real.
+4. **Storage independence:** no CAS dependency — local FS, S3, R2, MinIO, Wasabi, Spaces. GCS is interface-ready but not yet implemented. Real.
 5. **Unified architecture:** ONE storage format, ONE commit format, ONE
    concurrency model for ALL workloads. Real (but the format has
    per-workload inefficiencies — see §2 vector storage, §7 indexing).
@@ -351,7 +351,7 @@ No production use to validate the design.
 | Efficient | ⚠️ Inconclusive | Immutable blobs deduped. O(live) GC asserted but not measured. |
 | Beautiful | ✅ Supported | shards ARE branches, CRDT = G-Set union, no CAS. Real architectural beauty. |
 | Functional | ⚠️ Inconclusive | 6 workloads implemented. 2 falsified (vector, ACID). 4 inconclusive. |
-| Storage-indep | ✅ Supported | Works on local FS, S3, GCS. No CAS dependency. Real. |
+| Storage-indep | ⚠️ Inconclusive | Works on local FS, S3, R2, MinIO, Wasabi, Spaces. No CAS dependency. GCS not yet implemented. |
 
 ---
 

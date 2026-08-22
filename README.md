@@ -75,7 +75,7 @@ UnifiedStorage (ONE storage engine — Rust core)
   - gc / vacuum / optimize (Delta/Iceberg parity)
   ↓
 Kernel (3 ops: Write, Read, Ref)
-  - ObjectStore trait (local FS, S3, GCS, in-memory)
+  - ObjectStore trait (local FS, S3, in-memory)
   - PND2 format (ONE binary format for ALL workloads)
   - CollectionManifest (ONE index — flat → StatsTree at PB scale)
   - JSON commit blobs (ONE commit format)
@@ -438,7 +438,7 @@ gc, vacuum. Does not expose structured row operations or .sql().
 5. **Efficient** — immutable blobs (deduped), O(live) GC, parallel fetch
 6. **Beautiful** — shards ARE branches, CRDT = G-Set union, no CAS, SQL WHERE strings
 7. **Functional** — lakehouse, KV, vector, streaming, semantic, OLTP
-8. **Storage-Independent** — no CAS, works on local FS / S3 / R2 / MinIO / GCS
+8. **Storage-Independent** — no CAS, works on local FS / S3 / R2 / MinIO (GCS interface-ready, not implemented)
 
 ---
 

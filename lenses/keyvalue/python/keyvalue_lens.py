@@ -119,12 +119,10 @@ class KeyValueLens(PondLens):
                   There is now only ONE storage path — the unified
                   manifest-based architecture. All lenses use PND2
                   blobs + CollectionManifest + JSON commit blobs.
-            compact_after_commit: if False (default), shards are NOT compacted
-                  after every commit. This is the correct default for
-                  multi-writer workloads — compaction is O(N) and should
-                  be done periodically (background job or explicit call to
-                  compact_shards). Set to True only for single-writer
-                  workloads where HEAD must be current immediately.
+            compact_after_commit: if True (default), shards ARE compacted
+                  after every commit. For multi-writer or high-throughput
+                  workloads, set to False and compact periodically via
+                  compact_shards() or a background job.
                   See VETERAN_ARCHITECT_REVIEW.md §3.7 for the tradeoff.
         """
         super().__init__(kernel)

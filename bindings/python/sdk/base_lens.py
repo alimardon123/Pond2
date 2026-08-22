@@ -1,11 +1,13 @@
 """
-PondLens — the SHARED NAMESPACE base for all Lenses.
+PondLens — the shared base class for all Python Lenses.
 
-DEPRECATED: This base class is vestigial. UnifiedStorage already provides
-all the operations that PondLens re-exposes (branch, list_collections,
-history, etc.). New lenses (including the Rust ports) do NOT extend
-PondLens — they just own a UnifiedStorage instance and add workload-
-specific methods.
+All 5 production Python lenses extend this class: KeyValueLens, LakehouseLens,
+VectorLens, StreamingLens, OLTPLens. PondLens provides shared convenience methods
+for branching, collection listing, history, and definition management that would
+otherwise be duplicated across every lens.
+
+Rust lenses do NOT use this class — they own a UnifiedStorage instance
+directly and add workload-specific methods.
 
 This class is kept for backward compatibility with existing Python lenses
 that extend it. New Python lenses should follow the Rust pattern:
