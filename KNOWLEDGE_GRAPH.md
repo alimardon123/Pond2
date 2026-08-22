@@ -920,3 +920,13 @@ All active files in the repository (excluding archive/, __pycache__, .git):
 - scripts/test_gc.py
 - scripts/test_streaming.py
 - scripts/test_oltp.py
+- `scripts/test_rust_s3.py`
+- `scripts/test_rust_s3_r2.py`
+- `lenses/oltp/README.md`
+- `tla/VERIFICATION_REPORT.md`
+- `docs/API_WORKFLOW.md`
+- `docs/PIXELTABLE_COMPARISON.md`
+- `tests/integration/test_api_demo.py`
+- `tests/integration/test_beautiful_api.py`
+- `tests/integration/test_merge_advanced.py`
+- `tests/integration/test_sql_where.py`

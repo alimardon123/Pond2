@@ -15,13 +15,15 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KG_PATH = os.path.join(REPO_ROOT, "KNOWLEDGE_GRAPH.md")
 
 # Directories to skip (historical, not active)
-SKIP_DIRS = {".git", "archive", "__pycache__", ".pytest_cache"}
+SKIP_DIRS = {".git", "archive", "__pycache__", ".pytest_cache",
+              ".venv", ".venv-pond", "node_modules", ".mypy_cache",
+              ".ruff_cache", ".target"}
 
 # File extensions to check
 CHECK_EXTENSIONS = {".py", ".md", ".tla", ".cfg"}
 
 # Files to skip (generated, temporary, or not worth tracking)
-SKIP_FILES = {"KNOWLEDGE_GRAPH.md"}  # self
+SKIP_FILES = {"KNOWLEDGE_GRAPH.md", "fix_ci.py"}  # self + gitignored temp scripts
 
 
 def find_active_files():

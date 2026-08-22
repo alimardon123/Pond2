@@ -149,8 +149,7 @@ jobs:
         env:
           PYTHONPATH: "target/release:bindings/python/core:bindings/python/sdk:bindings/python/sdk/extensions/physical_structures:lenses/keyvalue/python:lenses/lakehouse/python:archive/legacy-extensions"
         run: |
-          pytest tests/test_all.py -v \
-            --deselect tests/test_all.py::test_rust_s3_r2_backend
+          pytest tests/test_all.py -v
 
   # ─────────────────────────────────────────────────────────────────────
   # Go SDK (bindings/go/) — cgo over libpond_storage.a + libpond_kernel.a.
@@ -353,5 +352,5 @@ jobs:
 
       - name: Run lens laws CI harness (6 laws × 5 lens contracts)
         env:
-          PYTHONPATH: "bindings/python/core:bindings/python/sdk:bindings/python/sdk/extensions/physical_structures:lenses/keyvalue/python:archive/legacy-extensions"
+          PYTHONPATH: "bindings/python/core:bindings/python/sdk:bindings/python/sdk/extensions/physical_structures:lenses/keyvalue/python:lenses/lakehouse/python:archive/legacy-extensions"
         run: python tests/lens_algebra/run_lens_laws_ci.py

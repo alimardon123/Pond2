@@ -42,3 +42,6 @@ bindings/go/pond.test
 
 # Local Python venv for running tests
 .venv-pond/
+
+# Temporary scripts (CI debugging, etc.)
+fix_ci.py
