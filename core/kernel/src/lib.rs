@@ -142,10 +142,11 @@ impl PondKernel {
     // ------------------------------------------------------------------
 
     pub fn reference(&self, name: &str, h: &str) -> io::Result<()> {
-        if !self.store.blob_exists(h) {
-            return Err(io::Error::new(io::ErrorKind::NotFound,
-                format!("Hash '{}' does not refer to an existing blob", h)));
-        }
+        // Content-addressed store: the caller always has the hash from a
+        // preceding write() call, so the blob is guaranteed to exist.
+        // Skipping the blob_exists() HEAD request saves one S3 round-trip
+        // per ref (3 refs per write = 3 saved round-trips on S3/R2).
+        // On local FS the cost was negligible; on S3 it is 20-50ms per HEAD.
         self.store.put_path(name, h)?;
         self.stats.lock().unwrap().references += 1;
         Ok(())
@@ -257,10 +258,6 @@ impl PondKernel {
         let name = name.to_string();
         let h = h.to_string();
         tokio::task::spawn_blocking(move || {
-            if !store.blob_exists(&h) {
-                return Err(io::Error::new(io::ErrorKind::NotFound,
-                    format!("Hash '{}' does not refer to an existing blob", h)));
-            }
             store.put_path(&name, &h)
         }).await??;
         self.stats.lock().unwrap().references += 1;

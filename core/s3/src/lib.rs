@@ -482,18 +482,16 @@ impl S3ObjectStore {
     ) -> Result<ureq::Response, io::Error> {
         let signed = self.build_signed_request(method, key, query, body, extra_headers)?;
 
-        // Build the ureq request. Each call builds a fresh agent (matches
-        // pre-refactor behavior — the struct's `self.agent` field is unused
-        // for this path; it's preserved for back-compat).
-        let agent = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(30))
-            .build();
-
+        // Use the struct's pre-built agent (with connection pooling /
+        // keep-alive) instead of creating a fresh one per request.
+        // A fresh agent would open a new TCP+TLS connection every time,
+        // adding 20-50ms overhead per S3 call. The struct agent reuses
+        // connections via HTTP keep-alive.
         let req = match signed.method.as_str() {
-            "GET" => agent.get(&signed.url),
-            "PUT" => agent.put(&signed.url),
-            "DELETE" => agent.delete(&signed.url),
-            "HEAD" => agent.head(&signed.url),
+            "GET" => self.agent.get(&signed.url),
+            "PUT" => self.agent.put(&signed.url),
+            "DELETE" => self.agent.delete(&signed.url),
+            "HEAD" => self.agent.head(&signed.url),
             _ => return Err(io::Error::new(io::ErrorKind::InvalidInput,
                 format!("unsupported method: {}", signed.method))),
         };
