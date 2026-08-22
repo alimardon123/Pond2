@@ -62,15 +62,15 @@ by Python and vice versa.
 | Python reference kernel | `bindings/python/core/` | Maintained (bug fixes only) |
 | Python SDK (PondStorage, lenses) | `bindings/python/sdk/` | Maintained (bug fixes only) |
 | Python UnifiedStorage (PND2, 5767 LOC) | `bindings/python/sdk/extensions/physical_structures/` | Production (PND2 format) |
-| Lenses (Lakehouse, Vector — Python only) | `lenses/{name}/python/` | Production (Python) |
+| LakehouseLens, VectorLens (Python) | `lenses/{name}/python/` | Production (Python) | Rust core API exists (see Done table) |
 | base_lens.py (PondLens) | `bindings/python/sdk/base_lens.py` | Production (5 Python lenses extend it) |
 
 ### Not Started (Future — prioritized by impact)
 
 | Component | Path | Priority | Notes |
 |---|---|---|---|
-| LakehouseLens (Rust port, production-quality) | `lenses/lakehouse/rust/` | HIGH | Most complex lens (DuckDB SQL pushdown) |
-| VectorLens (Rust port, production-quality) | `lenses/vector/rust/` | HIGH | IVF ANN with per-cluster blob refs |
+| LakehouseLens (Rust production polish) | `lenses/lakehouse/rust/` | HIGH | Core API done; needs DuckDB SQL pushdown |
+| VectorLens (Rust production polish) | `lenses/vector/rust/` | HIGH | Core API done; IVF Bug 10 fixed |
 | eval_predicate_encoded | `core/codec/` | MEDIUM | Vortex-style pruning without decode |
 | StatsTree | `core/storage/` | LOW | PB-scale hierarchical stats (defer) |
 | Lens C ABI protocol | `lenses/base/pond_lens.h` | LOW | Placeholder only |
@@ -82,13 +82,13 @@ by Python and vice versa.
 
 | Suite | Count | Status |
 |---|---|---|
-| Rust unit tests (cargo test --workspace) | ~375 | ✅ All pass |
+| Rust unit tests (cargo test --workspace) | ~391 | ✅ All pass |
 | CLI integration tests | 17 | ✅ All pass |
 | S3 unit tests (SigV4, HMAC, URL encoding) | 6 | ✅ All pass |
 | S3 mock server tests (moto) | 12 | ✅ All pass |
 | S3 real R2 tests (Cloudflare R2) | 7 | ✅ All pass |
 | Go SDK tests | 10 | ✅ All pass |
-| Python pytest suite | 23 | ✅ All pass (2 skipped) |
+| Python pytest suite | 25 | ✅ All pass (2 skipped: R2/S3 env) |
 | KNOWLEDGE_GRAPH coverage | 236/236 | ✅ 100% |
 
 ---
