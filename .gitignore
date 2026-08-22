@@ -39,3 +39,6 @@ target/
 *.exe
 bindings/go/pond.test
 .pond/
+
+# Local Python venv for running tests
+.venv-pond/

@@ -413,9 +413,10 @@ def test_rust_s3_r2_backend():
         pytest.skip("pond binary not built — run `cargo build -p pond_cli`")
 
     # Run the R2 integration test script (real Cloudflare R2, needs .env creds)
+    # 180s budget: ~20 sequential network subprocess calls to R2 (review Perf-P1).
     result = subprocess.run(
         [sys.executable, os.path.join(REPO_ROOT, "scripts", "test_rust_s3_r2.py")],
-        cwd=REPO_ROOT, capture_output=True, text=True, timeout=120,
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=180,
     )
     assert result.returncode == 0, \
         f"R2 test failed:\nSTDOUT:\n{result.stdout[-2000:]}\nSTDERR:\n{result.stderr[-1000:]}"

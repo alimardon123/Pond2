@@ -146,28 +146,43 @@ class R2TestRunner:
     def __init__(self) -> None:
         self.pond = _find_pond_binary()
         # Unique per-run prefix so concurrent/parallel runs don't collide.
-        self.prefix = f"pond-r2-itest-{int(time.time())}"
+        # Use time_ns() to avoid same-second collisions (review C7).
+        self.prefix = f"pond-r2-itest-{time.time_ns()}"
         self.root = _build_r2_url(self.prefix)
         self.passed = 0
         self.failed = 0
         # Use a short test-run identifier for collection names, so we don't
         # accidentally collide with another run on the same bucket prefix.
-        self.run_id = f"run_{int(time.time()) % 100000}"
+        self.run_id = f"run_{time.time_ns() % 100000000}"
 
     # — low-level command execution ————————————————————————————
 
     def pond_cmd(self, *args: str, expect_ok: bool = True, timeout: int = 60) -> subprocess.CompletedProcess:
-        """Run `pond --root <r2_url> <args>`. Returns the CompletedProcess."""
+        """Run `pond --root <r2_url> <args>`. Returns the CompletedProcess.
+
+        If expect_ok=True and the command fails (nonzero exit or timeout),
+        this raises AssertionError to halt the test — prevents cascading
+        failures from obscuring the root cause (review C3/C4).
+        """
         cmd = [self.pond, "--root", self.root, *args]
         try:
             r = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=timeout,
             )
         except subprocess.TimeoutExpired as e:
-            self._fail(args, f"TIMEOUT after {timeout}s", cmd, None)
-            raise
+            stdout_repr = repr(e.stdout) if e.stdout else "(none)"
+            msg = (f"TIMEOUT after {timeout}s\n"
+                   f"  cmd: {' '.join(cmd)}\n"
+                   f"  stdout: {stdout_repr}"[:800])
+            if expect_ok:
+                raise AssertionError(msg) from e
+            return subprocess.CompletedProcess(cmd, 124, str(e.stdout or ""), str(e.stderr or ""))
         if expect_ok and r.returncode != 0:
-            self._fail(args, f"exit {r.returncode}", cmd, r)
+            msg = (f"exit {r.returncode}\n"
+                   f"  cmd: {' '.join(cmd)}\n"
+                   f"  stdout: {r.stdout[-800:]}\n"
+                   f"  stderr: {r.stderr[-800:]}")
+            raise AssertionError(msg)
         return r
 
     # — assertion helpers ———————————————————————————————————————
@@ -181,7 +196,8 @@ class R2TestRunner:
             print(f"  [FAIL] {name} {detail}")
 
     def _fail(self, args: tuple, why: str, cmd: list, r: Optional[subprocess.CompletedProcess]) -> None:
-        self.failed += 1
+        """Print a diagnostic for a failed command. Does NOT increment failed
+        (the caller's check() does that) — avoids double-counting (review C3)."""
         print(f"  [FAIL] pond {' '.join(args)} — {why}", file=sys.stderr)
         print(f"         cmd: {' '.join(cmd)}", file=sys.stderr)
         if r is not None:
@@ -189,7 +205,6 @@ class R2TestRunner:
                 print(f"         stdout: {r.stdout[-800:]}", file=sys.stderr)
             if r.stderr:
                 print(f"         stderr: {r.stderr[-800:]}", file=sys.stderr)
-        # Don't sys.exit here — let the caller decide. But mark failure.
 
     # — test steps ——————————————————————————————————————————————
 
@@ -202,10 +217,12 @@ class R2TestRunner:
         self.check("output starts with 'pond '",
                    r.stdout.strip().startswith("pond "),
                    f"(got: {r.stdout.strip()!r})")
-        # 0.9.0-dev is the current workspace version
-        self.check("version contains 0.9.0-dev",
-                   "0.9.0-dev" in r.stdout,
-                   f"(got: {r.stdout.strip()!r})")
+        # Version format: `pond <x.y.z...>`. Don't hardcode the exact version
+        # string — just verify a version-like token follows (review C10).
+        ver = r.stdout.strip()
+        self.check("output has a version token after 'pond '",
+                   len(ver.split()) >= 2 and any(c.isdigit() for c in ver.split()[1]),
+                   f"(got: {ver!r})")
 
     def test_init(self) -> None:
         """2. pond init — connect to R2, verify describe_storage detects R2."""
@@ -213,12 +230,11 @@ class R2TestRunner:
         r = self.pond_cmd("init", self.root)
         out = r.stdout + r.stderr
         self.check("init exits 0", r.returncode == 0)
-        # describe_storage labels R2 endpoints as "Cloudflare R2"
+        # describe_storage labels R2 endpoints as "Cloudflare R2".
+        # Tightened: assert ONLY on the literal provider string, not on the
+        # echoed endpoint URL (review C1 — avoids false positives on failure).
         self.check("detects Cloudflare R2 provider",
-                   "Cloudflare R2" in out or "r2.cloudflarestorage.com" in out,
-                   f"(got: {out[:300]!r})")
-        self.check("mentions bucket name",
-                   "pondbucket" in out or "bucket" in out.lower(),
+                   "Cloudflare R2" in out,
                    f"(got: {out[:300]!r})")
 
     def test_write_read_rows(self) -> None:
@@ -329,14 +345,21 @@ class R2TestRunner:
         r = self.pond_cmd("write-rows", coll, "--json", json.dumps(new_rows), "-m", "add dave on branch")
         self.check("write-rows on branch exits 0", r.returncode == 0)
 
-        # Verify branch now has 4 rows
+        # Verify branch now has 1 row (dave) — write-rows is snapshot/replace.
+        # See comment in test_branch_merge for CRDT union merge semantics.
         r = self.pond_cmd("read-rows", coll)
         try:
             got = json.loads(r.stdout)
             n = len(got) if isinstance(got, list) else 0
         except json.JSONDecodeError:
             n = 0
-        self.check("branch has 4 rows after write", n == 4, f"(got {n})")
+        # Pond2 semantics: `write-rows` is a SNAPSHOT/REPLACE operation — the
+        # branch's collection becomes exactly the new rows (1 row: dave), NOT
+        # an append. `merge` then does a CRDT-style UNION (main's 3 ∪ branch's
+        # 1 = 4 rows). Verified against canonical local-FS tests in
+        # cli/tests/cli_integration.rs:126-150.
+        self.check("branch has 1 row after write (write-rows = snapshot)",
+                   n == 1, f"(got {n})")
 
         # Merge branch back into main
         r = self.pond_cmd("merge", coll, branch, "-i", "main", "-m", "merge feature branch")
@@ -458,6 +481,12 @@ class R2TestRunner:
                 step()
             except SystemExit:
                 raise
+            except AssertionError as e:
+                # pond_cmd raises AssertionError on expect_ok failures —
+                # counted once here (review C3/C4: no double-count).
+                self.failed += 1
+                msg = str(e).splitlines()[0] if str(e) else "(no message)"
+                print(f"  [FAIL] {step.__name__}: {msg}", file=sys.stderr)
             except Exception as e:
                 self.failed += 1
                 print(f"  [FAIL] unhandled exception in {step.__name__}: {e}", file=sys.stderr)

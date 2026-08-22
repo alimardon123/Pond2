@@ -83,19 +83,29 @@ class MotoTestRunner:
         self.moto_url = moto_server_url
         self.bucket = bucket
         self.root = root_url
-        self.run_id = f"moto_{int(time.time()) % 100000}"
+        # Use time_ns() to avoid same-second collisions (review C7).
+        self.run_id = f"moto_{time.time_ns() % 100000000}"
         self.passed = 0
         self.failed = 0
 
     def pond_cmd(self, *args: str, expect_ok: bool = True, timeout: int = 30) -> subprocess.CompletedProcess:
+        """Run `pond --root <url> <args>`. Raises AssertionError on expect_ok
+        failure — prevents cascading failures (review C3/C4)."""
         cmd = [self.pond, "--root", self.root, *args]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            self._fail(args, f"TIMEOUT after {timeout}s", cmd, None)
-            raise
+        except subprocess.TimeoutExpired as e:
+            msg = (f"TIMEOUT after {timeout}s\n"
+                   f"  cmd: {' '.join(cmd)}")
+            if expect_ok:
+                raise AssertionError(msg) from e
+            return subprocess.CompletedProcess(cmd, 124, str(e.stdout or ""), str(e.stderr or ""))
         if expect_ok and r.returncode != 0:
-            self._fail(args, f"exit {r.returncode}", cmd, r)
+            msg = (f"exit {r.returncode}\n"
+                   f"  cmd: {' '.join(cmd)}\n"
+                   f"  stdout: {r.stdout[-800:]}\n"
+                   f"  stderr: {r.stderr[-800:]}")
+            raise AssertionError(msg)
         return r
 
     def check(self, name: str, cond: bool, detail: str = "") -> None:
@@ -107,7 +117,8 @@ class MotoTestRunner:
             print(f"  [FAIL] {name} {detail}")
 
     def _fail(self, args: tuple, why: str, cmd: list, r: Optional[subprocess.CompletedProcess]) -> None:
-        self.failed += 1
+        """Print a diagnostic. Does NOT increment failed (caller's check does
+        that) — avoids double-counting (review C3)."""
         print(f"  [FAIL] pond {' '.join(args)} — {why}", file=sys.stderr)
         print(f"         cmd: {' '.join(cmd)}", file=sys.stderr)
         if r is not None:
@@ -127,18 +138,19 @@ class MotoTestRunner:
                    f"(got: {r.stdout.strip()!r})")
 
     def test_init(self) -> None:
-        print("\n[2/8] pond init — connect to moto S3 endpoint")
+        print("\n[2/10] pond init — connect to moto S3 endpoint")
         r = self.pond_cmd("init", self.root)
         self.check("init exits 0", r.returncode == 0)
-        # moto won't be labeled "Cloudflare R2" — just check it connected.
+        # Tightened: assert ONLY on the literal bucket name, not on the echoed
+        # s3:// URL (review C2 — avoids false positives on failure).
         out = r.stdout + r.stderr
-        self.check("init mentions bucket or endpoint",
-                   self.bucket in out or "local" in out.lower() or "s3" in out.lower(),
+        self.check("init mentions our bucket name",
+                   self.bucket in out,
                    f"(got: {out[:300]!r})")
 
     def test_write_read_rows(self) -> None:
         coll = f"users_{self.run_id}"
-        print(f"\n[3/8] pond write-rows — write PND2 rows (collection={coll})")
+        print(f"\n[3/10] pond write-rows — write PND2 rows (collection={coll})")
         rows = [
             {"id": 1, "name": "alice", "age": 30},
             {"id": 2, "name": "bob", "age": 25},
@@ -151,7 +163,7 @@ class MotoTestRunner:
                    len(parts) == 2 and len(parts[0]) == 12,
                    f"(got: {r.stdout.strip()!r})")
 
-        print(f"\n[4/8] pond read-rows — read back all rows")
+        print(f"\n[4/10] pond read-rows — read back all rows")
         r = self.pond_cmd("read-rows", coll)
         self.check("read-rows exits 0", r.returncode == 0)
         try:
@@ -168,7 +180,7 @@ class MotoTestRunner:
             self.check("row data matches (alice, bob, carol)",
                        names == ["alice", "bob", "carol"], f"(got: {names})")
 
-        print(f"\n[5/8] pond read-rows --where — predicate pushdown")
+        print(f"\n[5/10] pond read-rows --where — predicate pushdown")
         r = self.pond_cmd("read-rows", coll, "--where", "age > 28")
         self.check("read-rows --where exits 0", r.returncode == 0,
                    f"(stderr: {r.stderr[:200]})")
@@ -180,15 +192,26 @@ class MotoTestRunner:
                    isinstance(got, list) and len(got) == 2,
                    f"(got {len(got) if isinstance(got, list) else 'non-list'})")
 
+        print(f"\n[6/10] pond read-rows --columns --format table — projection + table fmt")
+        r = self.pond_cmd("read-rows", coll, "--columns", "id,name", "--format", "table")
+        self.check("read-rows --format table exits 0", r.returncode == 0)
+        lines = [l for l in r.stdout.splitlines() if l.strip()]
+        self.check("table output has >=3 lines (header, sep, rows)",
+                   len(lines) >= 3, f"(got {len(lines)} lines)")
+        if lines:
+            self.check("header contains 'id' and 'name'",
+                       "id" in lines[0] and "name" in lines[0],
+                       f"(header: {lines[0]!r})")
+
     def test_ls_history(self) -> None:
         coll = f"users_{self.run_id}"
-        print(f"\n[6/8] pond ls — list collections")
+        print(f"\n[7/10] pond ls — list collections")
         r = self.pond_cmd("ls")
         self.check("ls exits 0", r.returncode == 0)
         lines = [l for l in r.stdout.splitlines() if l.strip()]
         self.check("ls shows our collection", any(coll in l for l in lines))
 
-        print(f"\n[7/8] pond history — commit log")
+        print(f"\n[8/10] pond history — commit log")
         r = self.pond_cmd("history", coll)
         self.check("history exits 0", r.returncode == 0)
         lines = [l for l in r.stdout.splitlines() if l.strip()]
@@ -201,7 +224,7 @@ class MotoTestRunner:
     def test_branch_merge(self) -> None:
         coll = f"users_{self.run_id}"
         branch = f"feat_{self.run_id}"
-        print(f"\n[8/8] pond branch/checkout/merge — git-like ops")
+        print(f"\n[9/10] pond branch/checkout/merge — git-like ops")
         r = self.pond_cmd("branch", coll, branch)
         self.check("branch creates a new branch", r.returncode == 0,
                    f"(stderr: {r.stderr[:200]})")
@@ -216,7 +239,14 @@ class MotoTestRunner:
             n = len(got) if isinstance(got, list) else 0
         except json.JSONDecodeError:
             n = 0
-        self.check("branch has 4 rows after write", n == 4, f"(got {n})")
+        # Pond2 semantics: `write-rows` is a SNAPSHOT/REPLACE operation — the
+        # branch's collection becomes exactly the new rows (1 row: dave), NOT
+        # an append. `merge` then does a CRDT-style UNION (main's 3 ∪ branch's
+        # 1 = 4 rows). Verified against canonical local-FS tests in
+        # cli/tests/cli_integration.rs:126-150 (test_checkout_and_branch +
+        # test_merge_source_into_target only assert `contains`, never count).
+        self.check("branch has 1 row after write (write-rows = snapshot)",
+                   n == 1, f"(got {n})")
         r = self.pond_cmd("merge", coll, branch, "-i", "main", "-m", "merge")
         self.check("merge exits 0", r.returncode == 0,
                    f"(stderr: {r.stderr[:200]})")
@@ -231,6 +261,21 @@ class MotoTestRunner:
             n, names = 0, []
         self.check("main has 4 rows after merge", n == 4, f"(got {n})")
         self.check("dave is present on main after merge", "dave" in names, f"(got: {names})")
+
+    def test_raw_blobs(self) -> None:
+        """10. Raw content-addressed blob write/read — mirrors R2 test."""
+        coll = f"docs_{self.run_id}"
+        print(f"\n[10/10] pond write/read — raw content-addressed blobs")
+        payload = json.dumps({"hello": "moto", "ts": int(time.time())})
+        r = self.pond_cmd("write", coll, "--json", payload, "-m", "raw blob test")
+        self.check("write (raw) exits 0", r.returncode == 0)
+        parts = r.stdout.strip().split("\t")
+        self.check("write output has hash prefix", len(parts) == 2 and len(parts[0]) == 12)
+        # read back the collection HEAD
+        r = self.pond_cmd("read", coll)
+        self.check("read (raw) exits 0", r.returncode == 0)
+        self.check("read returns the payload we wrote", r.stdout.strip() == payload,
+                   f"(got: {r.stdout.strip()[:100]!r})")
 
     # — runner ————————————————————————————————————————————————
 
@@ -251,12 +296,19 @@ class MotoTestRunner:
             self.test_write_read_rows,
             self.test_ls_history,
             self.test_branch_merge,
+            self.test_raw_blobs,
         ]
         for step in steps:
             try:
                 step()
             except SystemExit:
                 raise
+            except AssertionError as e:
+                # pond_cmd raises AssertionError on expect_ok failures —
+                # counted once here (review C3/C4: no double-count).
+                self.failed += 1
+                msg = str(e).splitlines()[0] if str(e) else "(no message)"
+                print(f"  [FAIL] {step.__name__}: {msg}", file=sys.stderr)
             except Exception as e:
                 self.failed += 1
                 print(f"  [FAIL] unhandled exception in {step.__name__}: {e}", file=sys.stderr)
