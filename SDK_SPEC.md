@@ -226,7 +226,8 @@ pond_core = { path = "core/codec", features = ["zstd"] }
 ### 5.1 Lens design
 
 Each lens owns a `UnifiedStorage` and adds workload-specific semantics.
-**No base class needed** — the `PondLens` base class in Python is deprecated.
+All 5 Python lenses extend `PondLens` (base_lens.py) for shared
+branch/list/history support. Rust lenses own UnifiedStorage directly.
 
 ```rust
 pub struct KeyValueLens {
@@ -242,8 +243,8 @@ pub struct KeyValueLens {
 | KeyValueLens | ✅ core API | ✅ full | KV with staging + commit |
 | StreamingLens | ✅ core API | ✅ full | Chunked storage, range read |
 | OLTPLens | ✅ core API | ✅ full | Memtable + batch flush |
-| LakehouseLens | ❌ | ✅ | Tabular + DuckDB SQL |
-| VectorLens | ❌ | ✅ | IVF + HNSW ANN |
+| LakehouseLens | ✅ core API | ✅ | Tabular + DuckDB SQL |
+| VectorLens | ✅ core API | ✅ | IVF + HNSW ANN |
 
 ### 5.3 Lens structure
 
@@ -262,7 +263,7 @@ lenses/{name}/
 
 | Extension | Python | Rust | Notes |
 |---|---|---|---|
-| UnifiedStorage (PND2) | ✅ 5767 LOC | ⚠️ partial | Python has full PND2 + caching + pruning |
+| UnifiedStorage (PND2) | ✅ 5,767 LOC | ✅ | Python has full PND2 + caching + pruning; Rust has write/read/branch/merge/GC |
 | CollectionManifest | ✅ | ✅ | PMAN format |
 | StatsTree | ✅ | ❌ | PB-scale hierarchical stats (defer) |
 | Encoding (RLE/DICT/BITPACK) | ✅ | ✅ | Auto-selection |
@@ -274,11 +275,12 @@ lenses/{name}/
 | Extension | Python | Rust | Notes |
 |---|---|---|---|
 | CollectionIndexer | ✅ | ❌ | Secondary indexes (JSON blob format) |
-| IVFIndex | ✅ | ❌ | Vector ANN (known Bug 10: reads ALL vectors) |
-| HNSWIndex | ✅ | ❌ | Graph ANN (pure-Python, 10-100x slower than Rust) |
+| IVFIndex | ✅ | ✅ | Vector ANN (Bug 10 fixed in Rust; Python still reads ALL vectors) |
+| HNSWIndex | ✅ | ✅ | Graph ANN (pure-Python, 10-100x slower than Rust) |
 
-**Known gap:** IVF search reads ALL vectors then filters — `n_probe` has no
-effect on I/O. Fix: store per-cluster blob references in index format.
+**Known gap (Python only):** IVF search reads ALL vectors then filters —
+`n_probe` has no effect on I/O in Python. Fixed in Rust via per-cluster
+blob references.
 
 ### 6.3 Maintenance
 
@@ -376,7 +378,8 @@ pond write users --json '[{"id":1}]' -m "first"  # uses POND_ROOT or --root
 5. **Efficient** — immutable blobs (deduped), O(live) GC, parallel fetch
 6. **Beautiful** — shards ARE branches, CRDT = G-Set union, no CAS
 7. **Functional** — lakehouse, KV, vector, streaming, notebook, git
-8. **Storage-Independent** — no CAS, works on local FS / S3 / R2 / MinIO / GCS
+8. **Storage-Independent** — no CAS, works on local FS / S3 / R2 / MinIO
+   (GCS via S3-interop, not a native backend)
 
 ---
 
