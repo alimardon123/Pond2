@@ -83,13 +83,19 @@ jobs:
   # shells out to them. PYTHONPATH=target/release lets `import pond` work
   # without `pip install`.
   #
-  # Two tests are deselected because they reference source paths that
-  # don't exist (a pre-existing bug, tracked for a separate task):
-  #   - test_rust_s3_backend calls os.path.dirname(REPO_ROOT)/scripts/test_rust_s3.py
-  #     — the script is not in the repo (and never was). Cannot be fixed
-  #     without modifying source, so we deselect here.
-  #   - test_rust_s3_r2_backend requires a .env with real R2 credentials
-  #     — always skips, but we deselect it explicitly for clarity.
+  # S3 integration tests:
+  #   - test_rust_s3_backend (MOTO, hermetic) — NOW RUNS in CI. The path
+  #     bug (os.path.dirname(REPO_ROOT) stripping one dir too many) was
+  #     fixed in Task 0-m, and scripts/test_rust_s3.py now exists. It starts
+  #     an in-process moto server, creates a bucket, and drives the `pond`
+  #     CLI through write-rows/read-rows/ls/history/branch/merge. Requires
+  #     only moto+boto3 (both in requirements.txt) + the release `pond` bin.
+  #   - test_rust_s3_r2_backend (REAL R2) — still deselected; it needs a .env
+  #     with real Cloudflare R2 credentials that CI does not have. It skips
+  #     gracefully if .env is absent, but we deselect it explicitly to keep
+  #     CI logs clean and the intent obvious. Run locally with:
+  #       cp .env.example .env  # fill in R2 creds
+  #       pytest tests/test_all.py::test_rust_s3_r2_backend -v -s
   #
   # Two tests skip gracefully by design (we leave them alone):
   #   - test_feature_store_lens — pond-labs/ experimental, needs migration.
@@ -144,7 +150,6 @@ jobs:
           PYTHONPATH: "target/release:bindings/python/core:bindings/python/sdk:bindings/python/sdk/extensions/physical_structures:lenses/keyvalue/python:lenses/lakehouse/python:archive/legacy-extensions"
         run: |
           pytest tests/test_all.py -v \
-            --deselect tests/test_all.py::test_rust_s3_backend \
             --deselect tests/test_all.py::test_rust_s3_r2_backend
 
   # ─────────────────────────────────────────────────────────────────────
