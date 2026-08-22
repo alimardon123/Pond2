@@ -16,95 +16,91 @@ pond_repo/
 ├── KNOWLEDGE_GRAPH.md           # Navigational map of the repo
 ├── worklog.md                   # Append-only research log
 │
-├── bindings/python/core/                   # Layer 0: Storage Kernel + storage backends (NOT FROZEN)
-│   ├── kernel.py                # PondMinimal — 3 ops + batch I/O helpers (~274 LOC)
-│   ├── object_store_native_kernel.py # ObjectStoreNativeKernel (no SQLite; refs as blobs)
-│   ├── local_fs_object_store.py # LocalFSObjectStore (pure files)
-│   ├── s3_object_store.py       # S3ObjectStore (real boto3)
-│   ├── s3_mock_backend.py       # Latency-injecting S3 mock
-│   └── make_kernel.py           # make_kernel(url) factory — file:// or s3://
+├── core/                        # Layer 0: Rust core (canonical implementation)
+│   ├── kernel/                  # PondKernel — 3 primitives (Write/Read/Ref) + CRDT + HLC
+│   ├── storage/                 # UnifiedStorage — versioning, branching, shards, GC, PondPack
+│   ├── codec/                   # PND2 codec — encode/decode (RLE/DICT/BITPACK/RAW) + C ABI
+│   ├── arrow/                   # PND2 → Arrow bridge
+│   ├── s3/                      # S3ObjectStore — SigV4 from scratch, no AWS SDK dep
+│   ├── sql/                     # SQL engine — parser, WHERE clauses, executor
+│   └── build.sh                 # Unified build script
 │
-├── bindings/python/sdk/                    # Layer 1: Storage infrastructure + extensions
-│   ├── base_lens.py             # PondLens — shared namespace base (no format awareness)
-│   ├── pond_storage.py          # PondStorage — THE unified SDK class (namespace + commit + data I/O)
-│   ├── pond_config.py           # PondConfig — persistent pruning/encoding settings
-│   ├── row_query.py             # LensQuery — lazy row-level query builder
-│   ├── uuid7.py                 # UUIDv7 time-ordered UUID for _rowid
-│   ├── hlc.py                   # HLC — Hybrid Logical Clock for clock-skew-safe LWW CRDT
-│   ├── maintenance.py           # Tombstone helpers (RFC-0008)
-│   └── extensions/              # Optional modules (data-side, not lens-side)
-│       ├── indexing/            # Collection-level indexing + vector ANN
-│       │   ├── base.py          # CollectionIndexerInterface (abstract)
-│       │   ├── collection_index.py # CollectionIndexer (RECOMMENDED)
-│       │   ├── ivf_index.py     # IVFIndex — IVF ANN (Known Gap: reads ALL vectors)
-│       │   └── hnsw_index.py    # HNSWIndex — HNSW graph ANN
-│       ├── maintenance/         # GC + vacuum
-│       │   └── vacuum.py        # GarbageCollector — collect() + vacuum(...)
-│       ├── semantic/            # Semantic model management
-│       │   ├── base.py          # SemanticModelAdapter (abstract)
-│       │   └── ossie.py         # SemanticMixin + OssieAdapter
-│       └── physical_structures/ # Universal storage backend + derived structures
-│           ├── __init__.py
-│           ├── unified_storage.py       # UnifiedStorage + PND2 — THE universal backend (5,540 LOC)
-│           ├── collection_manifest.py   # CollectionManifest — one manifest per commit (PMAN)
-│           ├── stats_tree.py            # StatsTreeReader — PB-scale hierarchical stats index
-│           ├── embedded_stats.py        # ColumnStats + value-type constants
-│           ├── compression.py           # zstd / LZ4 transparent compression
-│           ├── encoding.py              # ColumnEncoding — FastLanes-style RLE/Dict/Bitpack/Raw
-│           ├── column_source.py         # ColumnSource — format-agnostic column access protocol
-│           └── pond_pack.py             # PondPack — commit+manifest in one PNPK blob
-│
-├── lenses/                      # Layer 2: Production Lens implementations
-│   ├── keyvalue/                # KeyValueLens (KV storage over UnifiedStorage)
-│   │   └── keyvalue_lens.py     # extends PondLens directly
-│   ├── lakehouse/               # LakehouseLens (tabular: CREATE TABLE, INSERT, time travel)
-│   │   └── lakehouse_lens.py    # NO base class — documented exception (see SDK_SPEC.md)
-│   ├── vector/                  # VectorLens (packed binary vector storage + k-NN search)
-│   │   ├── vector_lens.py       # extends PondLens directly
-│   │   └── test_vector.py       # Tests
+├── lenses/                      # Layer 1: Lens implementations (Python + Rust)
+│   ├── base/                    # Shared lens infrastructure
+│   │   └── pond_lens.h          # Lens C ABI protocol (placeholder)
+│   ├── keyvalue/                # KeyValueLens (KV storage with staging + commit)
+│   │   ├── python/              # Python — extends PondLens
+│   │   └── rust/                # Rust — owns UnifiedStorage directly
+│   ├── lakehouse/               # LakehouseLens (tabular: INSERT, time travel, SQL pushdown)
+│   │   ├── python/              # Python — extends PondLens
+│   │   └── rust/                # Rust — core API done
+│   ├── vector/                  # VectorLens (packed binary vectors + k-NN search)
+│   │   ├── python/              # Python — extends PondLens
+│   │   └── rust/                # Rust — IVF Bug 10 fixed (per-cluster blob refs)
 │   ├── streaming/               # StreamingLens (chunked segments, range reads)
-│   │   └── streaming_lens.py    # extends PondLens directly
-│   └── oltp/                    # OLTPLens (in-memory memtable + batch flush to CRDT shards)
-│       └── oltp_lens.py         # NO base class — documented exception (see SDK_SPEC.md)
+│   │   ├── python/              # Python — extends PondLens
+│   │   └── rust/                # Rust — owns UnifiedStorage directly
+│   └── oltp/                    # OLTPLens (in-memory memtable + batch flush)
+│       ├── python/              # Python — extends PondLens
+│       └── rust/                # Rust — owns UnifiedStorage directly
 │
-├── services/                    # Cross-cutting services (on the kernel only)
+├── extensions/                  # Layer 1.5: Optional extensions
+│   ├── indexes/                 # Vector and scalar indexes
+│   │   ├── ivf/rust/            # IVF ANN index (Bug 10 fixed — per-cluster blob refs)
+│   │   ├── hnsw/rust/           # HNSW graph ANN index
+│   │   └── simple/rust/         # Simple B-tree index
+│   └── semantic/                # Semantic model adapters
+│       ├── base/rust/           # SemanticModelAdapter trait
+│       └── ossie/rust/          # Ossie adapter (placeholder)
+│
+├── cli/                         # `pond` CLI binary (Rust)
+│   └── src/main.rs              # init, read, write, branch, merge, history, ls, cat
+│
+├── mcp-server/                  # MCP server (Rust)
+│
+├── bindings/                    # Cross-language bindings
+│   ├── base/                    # C ABI header + test blobs
+│   │   ├── pond.h               # Unified C ABI (kernel + storage + codec + S3)
+│   │   ├── test_c_abi.c         # 131-check codec C ABI test
+│   │   ├── test_storage_c_abi.c # Storage C ABI test
+│   │   └── test_blobs/          # 7 binary blobs (all encodings x vtypes)
+│   ├── python/
+│   │   ├── core/                # Python reference kernel (~274 LOC) + storage backends
+│   │   │   ├── kernel.py        # PondMinimal — 3 ops + batch I/O
+│   │   │   ├── local_fs_object_store.py
+│   │   │   ├── s3_object_store.py
+│   │   │   └── make_kernel.py   # make_kernel(url) factory
+│   │   ├── sdk/                 # Python SDK + extensions
+│   │   │   ├── base_lens.py     # PondLens — shared base (all 5 Python lenses extend it)
+│   │   │   ├── pond_storage.py  # PondStorage — unified SDK class
+│   │   │   ├── pond_config.py   # PondConfig — persistent settings
+│   │   │   ├── row_query.py     # LensQuery — lazy query builder
+│   │   │   ├── uuid7.py         # UUIDv7 time-ordered UUID
+│   │   │   ├── hlc.py           # Hybrid Logical Clock
+│   │   │   ├── maintenance.py   # Tombstone helpers (RFC-0008)
+│   │   │   └── extensions/
+│   │   │       ├── indexing/    # IVF (Python, Bug 10 open), HNSW, CollectionIndexer
+│   │   │       ├── maintenance/ # GarbageCollector (vacuum)
+│   │   │       ├── semantic/    # SemanticMixin + OssieAdapter
+│   │   │       └── physical_structures/ # UnifiedStorage + PND2 (5,767 LOC)
+│   │   └── pyo3/                # PyO3 wrapper (produces pond.so)
+│   └── go/                      # Go SDK (cgo over C ABI)
+│       ├── pond/                # Public Go API
+│       └── internal/cabi/       # Private cgo layer
+│
+├── services/                    # Cross-cutting Python services
 │   ├── transport/               # Transport Layer (compression + encryption)
-│   │   ├── transport.py         # Reference (zlib + XOR)
-│   │   └── transport_production.py # Production (zstd + AES-GCM)
 │   ├── schema/                  # Schema Registry (versioned schemas)
-│   │   └── schema_registry.py
 │   └── replication/             # Replication Coordinator
-│       └── replication_coordinator.py # Primary-secondary + 2PC
 │
 ├── pond-labs/                   # Development & experimental code (NOT production)
 │   ├── lenses/                  # Lab lens prototypes
-│   │   └── feature_store_lens.py # FeatureStoreLens (extends PondLens directly)
 │   ├── tracks/                  # Lab tracks (compat, benchmarks, case studies)
 │   ├── demos/                   # Demonstration scripts
-│   │   └── interop_demo.py      # Feature Store ↔ Lakehouse interop
 │   └── benchmarks/              # Performance benchmarks
-│       ├── pruning_benchmark.py # Vortex-style pruning effectiveness
-│       ├── overhead_audit.py    # Zone map overhead for all workloads
-│       ├── sql_pushdown_benchmark.py # SQL pushdown end-to-end
-│       └── loc_benchmark.py     # LOC saved vs from-scratch
-│
-├──                    # Cross-language Rust core + Python bindings
-│   ├── bindings/python/core/               # Pure-Rust PND2 codec + C ABI (zero deps)
-│   │   ├── src/lib.rs           # pnd2_decode (all encodings) + pnd2_encode_* + C ABI
-│   │   └── pond_core.h          # C ABI header for Go/Java/Node/C/C++/Zig
-│   ├── pond-python/             # PyO3 wrapper (produces pond.so)
-│   │   └── src/lib.rs           # Thin glue — delegates to bindings/python/core
-│   └── tests/                   # C ABI test + Python blob generator
-│       ├── test_c_abi.c         # 131-check end-to-end C ABI test
-│       └── test_blobs/          # 7 binary blobs (all encodings × vtypes)
-│
-├── bindings/go/                      # Go SDK (PND2 codec bindings via cgo)
-│   ├── pond/                    # Public Go API (Result, Column, Encoder)
-│   ├── internal/cabi/           # Private cgo layer over libpond_core.a
-│   └── go.mod                   # Module github.com/pond/pond-go
 │
 ├── tests/                       # All tests, organized by purpose
-│   ├── test_all.py              # Single pytest entry point (24 tests)
+│   ├── test_all.py              # Single pytest entry point (25 tests)
 │   ├── architecture/            # 18 architecture laws (executable spec)
 │   ├── lens_algebra/            # RFC-0007 6-law property tests
 │   └── integration/             # Integration tests (pruning, projection, etc.)
@@ -118,45 +114,39 @@ pond_repo/
 ## Dependency rules
 
 ```
-bindings/python/core (kernel.py 274 LOC + storage backends; NOT FROZEN —
-           gained write_batch / read_blob_batch in the thread-safety round)
+core/kernel (3 primitives, CRDT, HLC, ObjectStore trait — zero external deps)
     ↓
-bindings/python/sdk (base_lens, pond_storage, pond_config, hlc, uuid7,
-          maintenance, row_query, extensions/{indexing, maintenance,
-          semantic, physical_structures/unified_storage})
-    ↓
-lenses/ (keyvalue, lakehouse, vector, streaming, oltp)
-    ↓
-pond-labs/ (experimental code, depends on everything)
-
-core/codec (pure-Rust PND2 codec + C ABI, zero deps)
+core/storage (UnifiedStorage — versioning, branching, shards, PondPack, GC)
+core/codec (PND2 encode/decode — zero external deps, statically linkable)
+core/s3 (S3ObjectStore — SigV4 from scratch, HTTP deps)
+core/arrow (PND2 → Arrow bridge)
+core/sql (SQL parser, WHERE, executor)
     ↓                              ↓
-bindings/python/pyo3           bindings/go/ (cgo over libpond_core.a)
+bindings/python/pyo3           bindings/go/ (cgo over C ABI)
 (PyO3 wrapper → pond.so)
     ↓
-(importable by bindings/python/sdk for fast encode/decode)
+bindings/python/sdk (PondStorage, PondLens, extensions)
+    ↓
+lenses/ (all 5: keyvalue, lakehouse, vector, streaming, oltp)
+    ↓
+pond-labs/ (experimental code, depends on everything)
 ```
 
 **Rules:**
 - No lens depends on another lens.
-- KeyValueLens, VectorLens, and StreamingLens extend `PondLens` directly.
-- `LakehouseLens` and `OLTPLens` declare NO base class — documented
-  exceptions, NOT bugs (see `SDK_SPEC.md` and `DESIGN_GOALS.md` Known Gaps).
-- bindings/python/sdk depends only on pond-core.
-- Services depend only on bindings/python/core (not on bindings/python/sdk or lenses).
+- All 5 Python lenses extend `PondLens` (base_lens.py).
+- Rust lenses own `UnifiedStorage` directly (no shared base struct).
+- `core/codec` has ZERO external dependencies (statically linkable from Go/Java/Node).
+- `core/s3` has HTTP deps; `core/kernel` stays minimal.
 - Extensions are data-side (collection-level), not lens-side.
+- Services depend only on `bindings/python/core` (not on SDK or lenses).
 - pond-labs depends on everything (it's experimental).
-- core/codec has ZERO external dependencies (so it can be
-  statically linked from Go/Java/Node without dragging transitive crates).
-- bindings/python/pyo3 depends on core/codec + PyO3.
-- sdk-go depends on core/codec (via cgo over libpond_core.a).
-  It does NOT depend on Python — Go programs can encode/decode PND2
-  blobs without any Python runtime.
 
 ## The weekly question
 
-> If I deleted everything except `bindings/python/core` and `bindings/python/sdk`, would the
+> If I deleted everything except `core/` and `bindings/`, would the
 > architecture still make sense? (DESIGN_GOALS.md §4)
 
-Yes. The kernel and SDK are self-contained. Every lens, service, and
-lab code can be removed without affecting lower layers.
+Yes. The Rust core (kernel + storage + codec + s3) and the C ABI are
+self-contained. Every lens, extension, service, and lab code can be
+removed without affecting lower layers.
