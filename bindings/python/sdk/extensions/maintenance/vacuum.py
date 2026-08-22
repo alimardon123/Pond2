@@ -139,7 +139,7 @@ class GarbageCollector:
             dry_run: if True, report what would be deleted without deleting.
 
             tentative_ttl_seconds: preserve tentative shards (from
-                in-flight ACID transactions) younger than this many
+                in-flight atomic publication transactions) younger than this many
                 seconds. A long-running transaction (e.g. 30 min between
                 begin_tx and commit_tx) has no commit marker until
                 commit_tx runs — without this TTL, a concurrent vacuum
@@ -238,7 +238,7 @@ class GarbageCollector:
             names = filtered
 
         # Walk every ref as a potential starting point
-        # ACID transactions: tentative shards from UNCOMMITTED transactions
+        # Atomic publication: tentative shards from UNCOMMITTED transactions
         # are NOT walked (their refs are walked but the tx commit marker
         # doesn't exist, so the reader filters them out — and GC treats
         # them as dead since no commit marker = unreachable).
@@ -410,7 +410,7 @@ class GarbageCollector:
         (written by append_shard with tx_id set). It is "young" if the
         UUIDv7 tx_id encodes a timestamp newer than ttl_seconds ago.
 
-        Such shards belong to in-flight ACID transactions that haven't
+        Such shards belong to in-flight atomic publication transactions that haven't
         committed yet (no transactions/{tx_id} marker). They are
         excluded from the live set by _build_live_set (so gc() reports
         them as dead), but vacuum must NOT delete them — the transaction

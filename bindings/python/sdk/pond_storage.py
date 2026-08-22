@@ -371,7 +371,7 @@ class PondStorage:
                       tx_id: Optional[str] = None) -> str:
         """Concurrent-safe append — NO CAS, NO retry, NO coordination.
 
-        ACID: pass tx_id from begin_tx() to make the shard tentative
+        Atomic publication: pass tx_id from begin_tx() to make the shard tentative
         (invisible until commit_tx is called). Without tx_id, the shard
         is immediately visible (normal CRDT).
         """
@@ -406,7 +406,7 @@ class PondStorage:
             row_group_size=row_group_size, tx_id=tx_id)
 
     # ==================================================================
-    # ACID Transactions — commit markers on top of CRDT shards
+    # Atomic Publication — commit markers on top of CRDT shards
     # ==================================================================
 
     def begin_tx(self) -> str:
@@ -798,7 +798,7 @@ class PondStorage:
                 non-preserved commits are NEVER deleted (they're live).
             dry_run: if True, report what would be deleted without deleting.
             tentative_ttl_seconds: preserve tentative shards from in-flight
-                ACID transactions younger than this many seconds. Default
+                atomic publication transactions younger than this many seconds. Default
                 3600 (1 hour). A long-running transaction has no commit
                 marker until commit_tx runs — without this TTL, a concurrent
                 vacuum would delete its tentative shards. Set to 0 to
