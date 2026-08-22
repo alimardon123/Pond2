@@ -108,7 +108,7 @@ class KeyValueLens(PondLens):
 
     def __init__(self, kernel: PondMinimal, name: Optional[str] = None,
                  use_unified_storage: bool = True,
-                 compact_after_commit: bool = True):
+                 compact_after_commit: bool = False):
         """Create a KeyValueLens.
 
         Args:
@@ -119,10 +119,12 @@ class KeyValueLens(PondLens):
                   There is now only ONE storage path — the unified
                   manifest-based architecture. All lenses use PND2
                   blobs + CollectionManifest + JSON commit blobs.
-            compact_after_commit: if True (default), shards ARE compacted
-                  after every commit. For multi-writer or high-throughput
-                  workloads, set to False and compact periodically via
-                  compact_shards() or a background job.
+            compact_after_commit: if True, shards ARE compacted
+                  after every commit. Default is False — compaction is
+                  O(N) per commit; for high-throughput workloads, compact
+                  periodically via compact_shards() or a background job.
+                  Set to True only for low-write scenarios where immediate
+                  consistency with branch/merge/history is worth the cost.
                   See VETERAN_ARCHITECT_REVIEW.md §3.7 for the tradeoff.
         """
         super().__init__(kernel)
