@@ -1,4 +1,30 @@
-name: View Algebra CI
+# Pond CI — replaces the broken RFC-0007-only workflow.
+#
+# Old workflow (.github/workflows/view-laws.yml before Task 0-c) referenced
+# 14 paths; 13 of them had been moved to archive/ or tests/ without the
+# workflow being updated. CI was effectively a 100% no-op that failed on
+# every step except `bindings/python/sdk/maintenance.py`.
+#
+# This file is the new canonical CI. It wires up ONLY the test suites that
+# actually exist today:
+#
+#   - Rust workspace (cargo test --workspace — 391 #[test] markers across
+#     18 crates including kernel, storage, codec, s3, sql, all 5 lens
+#     crates, IVF/HNSW/simple/semantic indexes, mcp-server, and pond CLI).
+#   - Python pytest (tests/test_all.py — 25 test functions covering
+#     property tests, hazards, architecture laws, lakehouse, KG coverage,
+#     Rust-Python roundtrip, C ABI, Go SDK, decode benchmark, pond CLI).
+#   - Go SDK (bindings/go — cgo over libpond_storage.a + libpond_kernel.a).
+#   - C ABI (bindings/base/test_c_abi.c + test_storage_c_abi.c).
+#   - KNOWLEDGE_GRAPH.md coverage (scripts/verify_knowledge_graph.py).
+#   - Architecture laws (tests/architecture/architecture_laws.py — 18 laws).
+#   - Lens algebra (tests/lens_algebra/run_lens_laws_ci.py — RFC-0007 6 laws).
+#
+# Each job reports pass/fail independently. Jobs that don't need Rust
+# (knowledge-graph, architecture-laws, lens-laws) start in parallel with
+# the Rust build so contributors get fast feedback.
+
+name: Pond CI
 
 on:
   push:
@@ -6,66 +32,321 @@ on:
   pull_request:
     branches: [main]
 
-jobs:
-  view-laws:
-    name: RFC-0007 View Algebra Property Tests
-    runs-on: ubuntu-latest
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
+jobs:
+  # ─────────────────────────────────────────────────────────────────────
+  # Rust workspace — 391 unit/integration tests across 18 crates.
+  # ─────────────────────────────────────────────────────────────────────
+  rust-tests:
+    name: Rust workspace (cargo test --workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + git
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache cargo build target
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-target-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-target-
+
+      - name: Build (release)
+        run: cargo build --release --workspace
+
+      - name: Test (workspace)
+        run: cargo test --workspace --release
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Python tests via tests/test_all.py (the canonical pytest entry point).
+  #
+  # Builds the Rust workspace first so the PyO3 `pond.so` module, the
+  # C ABI static libs, and the `pond` CLI binary all exist when pytest
+  # shells out to them. PYTHONPATH=target/release lets `import pond` work
+  # without `pip install`.
+  #
+  # Two tests are deselected because they reference source paths that
+  # don't exist (a pre-existing bug, tracked for a separate task):
+  #   - test_rust_s3_backend calls os.path.dirname(REPO_ROOT)/scripts/test_rust_s3.py
+  #     — the script is not in the repo (and never was). Cannot be fixed
+  #     without modifying source, so we deselect here.
+  #   - test_rust_s3_r2_backend requires a .env with real R2 credentials
+  #     — always skips, but we deselect it explicitly for clarity.
+  #
+  # Two tests skip gracefully by design (we leave them alone):
+  #   - test_feature_store_lens — pond-labs/ experimental, needs migration.
+  #   - test_loc_benchmark — skips if duckdb is not installed (it is in
+  #     requirements.txt, so it actually runs in CI).
+  # ─────────────────────────────────────────────────────────────────────
+  python-tests:
+    name: Python pytest (tests/test_all.py)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + git + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-python-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-python-
+            ${{ runner.os }}-cargo-target-
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build Rust workspace (release) for PyO3 + C ABI + pond CLI
+        run: cargo build --release --workspace
+
+      - name: Symlink libpond.so → pond.so (Python expects the latter)
+        run: |
+          if [ -f target/release/libpond.so ] && [ ! -f target/release/pond.so ]; then
+            ln target/release/libpond.so target/release/pond.so
+          fi
+
+      - name: Run pytest
+        env:
+          PYTHONPATH: "target/release:bindings/python/core:bindings/python/sdk:bindings/python/sdk/extensions/physical_structures:lenses/keyvalue/python:lenses/lakehouse/python:archive/legacy-extensions"
+        run: |
+          pytest tests/test_all.py -v \
+            --deselect tests/test_all.py::test_rust_s3_backend \
+            --deselect tests/test_all.py::test_rust_s3_r2_backend
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Go SDK (bindings/go/) — cgo over libpond_storage.a + libpond_kernel.a.
+  #
+  # The Go tests decode Python-generated PND2 blobs in bindings/base/test_blobs/
+  # for cross-language compatibility verification. Those blobs are checked
+  # into the repo, so we don't need to regenerate them — but if the dir is
+  # missing or empty, we regenerate via bindings/base/generate_test_blobs.py.
+  # ─────────────────────────────────────────────────────────────────────
+  go-tests:
+    name: Go SDK (bindings/go)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + git + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-go-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-go-
+            ${{ runner.os }}-cargo-target-
+
+      - name: Set up Go 1.22
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          # No go.sum (the module has no external deps — only cgo).
+          cache: false
+
+      - name: Set up Python 3.12 (for test-blob generation if needed)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies (for blob generation)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build Rust workspace (release) — provides static libs for cgo
+        run: cargo build --release --workspace
+
+      - name: Generate cross-language test blobs (idempotent)
+        env:
+          PYTHONPATH: "bindings/python/core:bindings/python/sdk:bindings/python/sdk/extensions/physical_structures"
+        run: |
+          if [ ! -s bindings/base/test_blobs/i64_raw.bin ]; then
+            python bindings/base/generate_test_blobs.py
+          fi
+
+      - name: Run Go tests
+        run: cd bindings/go && go test -v ./...
+
+  # ─────────────────────────────────────────────────────────────────────
+  # C ABI tests (bindings/base/test_c_abi.c + test_storage_c_abi.c).
+  #
+  # test_c_abi.c      — PND2 codec C ABI (131 checks across all encodings).
+  # test_storage_c_abi.c — storage layer C ABI (write/read/branch/merge/undo).
+  # ─────────────────────────────────────────────────────────────────────
+  c-abi-tests:
+    name: C ABI (bindings/base)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + git + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-cabi-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-cabi-
+            ${{ runner.os }}-cargo-target-
+
+      - name: Build Rust workspace (release) — produces static libs
+        run: cargo build --release --workspace
+
+      - name: Compile + run test_c_abi.c (codec C ABI)
+        run: |
+          cc bindings/base/test_c_abi.c \
+            -I bindings/base \
+            target/release/libpond_storage.a \
+            -lpthread -ldl -lm \
+            -o target/test_c_abi
+          ./target/test_c_abi
+          test -f target/test_c_abi  # sanity check
+
+      - name: Compile + run test_storage_c_abi.c (storage C ABI)
+        run: |
+          cc bindings/base/test_storage_c_abi.c \
+            -I bindings/base \
+            target/release/libpond_storage.a \
+            target/release/libpond_kernel.a \
+            -lpthread -ldl -lm \
+            -o target/test_storage_c_abi
+          ./target/test_storage_c_abi
+          test -f target/test_storage_c_abi  # sanity check
+
+  # ─────────────────────────────────────────────────────────────────────
+  # KNOWLEDGE_GRAPH.md coverage — verifies every active .py/.md/.tla/.cfg
+  # file in the repo is mentioned in KNOWLEDGE_GRAPH.md. Pure Python, no
+  # Rust needed. Fast (~5 s) so it gives the quickest "is the repo
+  # internally consistent" signal.
+  # ─────────────────────────────────────────────────────────────────────
+  knowledge-graph:
+    name: KNOWLEDGE_GRAPH.md coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
+      - name: Verify KNOWLEDGE_GRAPH.md covers all active files
+        run: python scripts/verify_knowledge_graph.py
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Architecture laws — tests/architecture/architecture_laws.py
+  #
+  # 18 executable laws: Identity, Reachability, History, Lens (purity),
+  # Derived rebuild, Branch, Merge, Determinism, Scale (×2), Index (×2),
+  # Lakehouse restart/isolation/merge/time-travel/range/storage.
+  # Pure Python (uses PondMinimal kernel). No Rust build required.
+  # ─────────────────────────────────────────────────────────────────────
+  architecture-laws:
+    name: Architecture laws (tests/architecture)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          # pyarrow is required for the ArrowView adapter tests.
-          # duckdb, polars, and pandas are tested when present (interop
-          # tests gracefully skip if any are missing, but we install all
-          # so the tests actually exercise the interop paths).
-          pip install pyarrow duckdb polars pandas
+          pip install -r requirements.txt
 
-      - name: Run view_laws.py CI harness (5 SDK Views)
-        run: python bindings/python/sdk/run_lens_laws_ci.py
+      - name: Run architecture laws (18 laws)
+        env:
+          PYTHONPATH: "bindings/python/core:bindings/python/sdk:bindings/python/sdk/extensions/physical_structures:lenses/keyvalue/python:lenses/lakehouse/python"
+        run: python tests/architecture/architecture_laws.py
 
-      - name: Run view_laws.py on ArrowView (Phase D adapter)
-        run: python pond-arrow/run_arrow_view_laws.py
+  # ─────────────────────────────────────────────────────────────────────
+  # Lens algebra (RFC-0007) — tests/lens_algebra/run_lens_laws_ci.py
+  #
+  # 6 laws any Lens must satisfy: Round-trip, Purity, Encoding
+  # preservation, Materialization determinism, Composition, Kernel
+  # independence. Pure Python (uses PondMinimal kernel).
+  #
+  # NOTE: The harness still imports `collection_metadata` which has been
+  # archived to archive/legacy-extensions/. We add that dir to PYTHONPATH
+  # so the harness runs unmodified. Cleaning up the harness to either drop
+  # the dependency or use the modern manifest API is tracked separately.
+  # ─────────────────────────────────────────────────────────────────────
+  lens-laws:
+    name: Lens algebra (RFC-0007) property tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Run view_laws.py on external GraphView (Task 12 validation)
-        run: python validation/run_graph_view_laws.py
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
 
-      - name: Run ArrowView functional tests
-        run: python pond-arrow/arrow_view.py
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Run tombstone helper tests (RFC-0008)
-        run: python bindings/python/sdk/maintenance.py
-
-      - name: Run Feature Store production tests (RFC-0011)
-        run: python pond-feature-store/feature_store.py
-
-      - name: Run Feature Store end-to-end ML workflow
-        run: python pond-feature-store/e2e_workflow.py
-
-      - name: Run ViewQuery tests (elegant cross-view reading)
-        run: python bindings/python/sdk/test_lens_query.py
-
-      - name: Run shared Views test (multiple Views, same bytes, no overhead)
-        run: python bindings/python/sdk/test_shared_lenses.py
-
-      - name: Run Lens Architecture test (RFC-0012 milestone)
-        run: python bindings/python/sdk/test_lens_architecture.py
-
-      - name: Run TypedBlob middle layer test (any lens, any blob)
-        run: python bindings/python/sdk/experiments/resolver_comparison/test_typed_blob.py
-
-      - name: Run Architecture Laws (executable specification)
-        run: python bindings/python/sdk/architecture_laws.py
-
-      - name: Run Collection layer tests
-        run: python bindings/python/sdk/collection.py
-
-      - name: Run differential testing (reference vs Pond, 100 scenarios)
-        run: python -c "from experiments.differential_test import run_differential_test; r = run_differential_test(100, 30); print(f'Passed: {r[\"passed\"]}/{r[\"scenarios\"]}'); assert r['failed'] == 0"
+      - name: Run lens laws CI harness (6 laws × 5 lens contracts)
+        env:
+          PYTHONPATH: "bindings/python/core:bindings/python/sdk:bindings/python/sdk/extensions/physical_structures:lenses/keyvalue/python:archive/legacy-extensions"
+        run: python tests/lens_algebra/run_lens_laws_ci.py
