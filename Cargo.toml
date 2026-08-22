@@ -23,12 +23,12 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.9.0-dev"
 edition = "2021"
 license = "MIT"
 authors = ["Pond Contributors"]
-repository = "https://github.com/alimardon123/Pond"
-description = "Pond storage system — Rust core (kernel + storage + codec + arrow), CLI, language bindings"
+repository = "https://github.com/alimardon123/Pond2"
+description = "Pond — universal content-addressed storage substrate (Rust core, git-like versioning, CRDT multi-writer, lens composition)"
 
 # Workspace-level release profile — fast builds, optimized for FFI hot paths
 [profile.release]
