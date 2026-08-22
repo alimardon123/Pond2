@@ -377,9 +377,9 @@ def test_rust_s3_backend():
         import pytest
         pytest.skip("moto/boto3 not available — run `pip install moto boto3`")
 
-    # Run the S3 integration test script
+    # Run the S3 integration test script (moto-mocked S3, no real creds needed)
     result = subprocess.run(
-        [sys.executable, os.path.join(os.path.dirname(REPO_ROOT), "scripts", "test_rust_s3.py")],
+        [sys.executable, os.path.join(REPO_ROOT, "scripts", "test_rust_s3.py")],
         cwd=REPO_ROOT, capture_output=True, text=True, timeout=120,
         env={**os.environ, "AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test",
              "AWS_DEFAULT_REGION": "us-east-1"}
@@ -412,9 +412,9 @@ def test_rust_s3_r2_backend():
         import pytest
         pytest.skip("pond binary not built — run `cargo build -p pond_cli`")
 
-    # Run the R2 integration test script
+    # Run the R2 integration test script (real Cloudflare R2, needs .env creds)
     result = subprocess.run(
-        [sys.executable, os.path.join(os.path.dirname(REPO_ROOT), "scripts", "test_rust_s3_r2.py")],
+        [sys.executable, os.path.join(REPO_ROOT, "scripts", "test_rust_s3_r2.py")],
         cwd=REPO_ROOT, capture_output=True, text=True, timeout=120,
     )
     assert result.returncode == 0, \
