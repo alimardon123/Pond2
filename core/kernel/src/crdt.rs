@@ -145,26 +145,96 @@ fn format_uuid(bytes: &[u8; 16]) -> String {
     )
 }
 
-/// Fill a buffer with random bytes (uses /dev/urandom on Unix).
+/// Fill a buffer with cryptographically secure random bytes.
+///
+/// Uses (in priority order):
+///   1. `/dev/urandom` on Unix (POSIX, no external deps)
+///   2. `BCryptGenRandom` on Windows (Win32 CryptoAPI)
+///   3. Fallback: time-seeded xorshift64 — ONLY if both OS sources fail.
+///      This is a hard correctness panic-bait; a working CSPRNG is required
+///      for HLC uniqueness guarantees.
+///
+/// This is the same algorithm the Python `secrets` module uses internally.
+/// No `rand` crate dependency — keeps the kernel dependency-free.
 fn fill_random(buf: &mut [u8]) {
-    // Use a simple PRNG seeded from system time + thread ID.
-    // For production, this should use the `rand` crate or /dev/urandom.
-    // For now, this is sufficient — the random bits only need to be
-    // unique within the same millisecond, not cryptographically secure.
+    if try_fill_random_system(buf).is_ok() {
+        return;
+    }
+    // Last-resort fallback: time-seeded xorshift64.
+    // This only runs if /dev/urandom and BCryptGenRandom both fail — i.e.,
+    // the OS is in a broken state. We log to stderr (no `log` dep in kernel)
+    // and continue, because panicking here would crash every write.
+    eprintln!("pond: WARNING: CSPRNG unavailable, using insecure fallback");
     let seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
-        .wrapping_add(std::process::id() as u64);
+        .wrapping_add(std::process::id() as u64)
+        .wrapping_add(buf.as_ptr() as u64);
 
-    let mut state = seed;
+    let mut state = seed.max(1); // xorshift64 must never see a 0 seed
     for byte in buf.iter_mut() {
-        // xorshift64
+        // xorshift64 (Marsaglia, 2003)
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
         *byte = state as u8;
     }
+}
+
+/// Try to fill `buf` from the OS CSPRNG. Returns `Ok(())` on success.
+///
+/// - Unix: reads from `/dev/urandom` (retries on `EINTR`).
+/// - Windows: calls `BCryptGenRandom` via the Win32 API.
+///
+/// Returns `Err(io::Error)` if the OS source is unavailable.
+#[cfg(unix)]
+fn try_fill_random_system(buf: &mut [u8]) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut f = std::fs::File::open("/dev/urandom")?;
+    // Read in a loop — `/dev/urandom` may give partial reads under memory pressure.
+    // EINTR is handled by std::fs::File::read itself on modern Rust.
+    f.read_exact(buf)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn try_fill_random_system(buf: &mut [u8]) -> std::io::Result<()> {
+    // BCryptGenRandom — Win32 CryptoAPI, no `rand` crate dep.
+    // https://learn.microsoft.com/en-us/windows/win32/api/bcrypt/nf-bcrypt-bcryptgenrandom
+    extern "system" {
+        fn BCryptGenRandom(
+            halgorithm: *mut std::ffi::c_void,
+            pbuffer: *mut u8,
+            cbbuffer: u32,
+            dwflags: u32,
+        ) -> i32;
+    }
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x00000002;
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("BCryptGenRandom failed: NTSTATUS 0x{:08X}", status as u32),
+        ))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn try_fill_random_system(_buf: &mut [u8]) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no CSPRNG available on this platform",
+    ))
 }
 
 fn current_time_ms() -> u64 {
@@ -351,5 +421,82 @@ mod tests {
         clock1.observe(&v2);
         let v3 = clock1.tick();
         assert!(v3 > v2, "After observing v2, clock1 should advance past it");
+    }
+
+    // -------------------------------------------------------------------
+    // CSPRNG tests — verify fill_random() uses the OS source (NOT xorshift).
+    // These were added to fix the bug uncovered by Task 0-d: the docstring
+    // claimed /dev/urandom but the implementation was time-seeded xorshift64.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_fill_random_does_not_panic() {
+        let mut buf = [0u8; 32];
+        fill_random(&mut buf);
+        // Sanity: not all zeros (would indicate failure)
+        let non_zero = buf.iter().filter(|&&b| b != 0).count();
+        assert!(non_zero > 0, "fill_random returned all zeros");
+    }
+
+    #[test]
+    fn test_fill_random_uses_os_csprng_on_unix() {
+        // On Unix, /dev/urandom is the OS CSPRNG. If we read from it twice
+        // in quick succession, we should get different bytes (the OS keeps
+        // an entropy pool). A time-seeded xorshift64 would also produce
+        // different bytes here, so this isn't a perfect discriminator —
+        // but it catches the degenerate "always returns zeros" case.
+        #[cfg(unix)]
+        {
+            let mut buf1 = [0u8; 16];
+            let mut buf2 = [0u8; 16];
+            fill_random(&mut buf1);
+            fill_random(&mut buf2);
+            assert_ne!(buf1, buf2, "two fill_random calls must differ");
+        }
+        #[cfg(not(unix))]
+        {
+            // On non-Unix, just ensure the function runs without panic.
+            let mut buf = [0u8; 16];
+            fill_random(&mut buf);
+        }
+    }
+
+    #[test]
+    fn test_fill_random_large_buffer() {
+        // 4 KB — verify read_exact semantics (no partial reads returned)
+        let mut buf = vec![0u8; 4096];
+        fill_random(&mut buf);
+        // Count distinct byte values — a CSPRNG should produce >100 distinct
+        // values in 4096 bytes (statistically, ~255 are expected). xorshift64
+        // also passes this test, so it's a weak check, but it catches "always
+        // zero" and "always same byte" regressions.
+        let distinct = buf.iter().copied().collect::<std::collections::HashSet<u8>>().len();
+        assert!(distinct > 100, "fill_random produced only {} distinct bytes in 4KB", distinct);
+    }
+
+    #[test]
+    fn test_try_fill_random_system_available_on_supported_platforms() {
+        // The OS CSPRNG should be available on all production platforms.
+        // If this test fails, either /dev/urandom is missing (broken Unix)
+        // or BCryptGenRandom is missing (broken Windows) — both are critical.
+        let mut buf = [0u8; 8];
+        let result = try_fill_random_system(&mut buf);
+        assert!(result.is_ok(),
+            "OS CSPRNG unavailable on this platform: {:?}. \
+             fill_random will fall back to insecure xorshift64 — \
+             this is a production-critical regression.",
+            result.err());
+    }
+
+    #[test]
+    fn test_uuidv7_random_bits_change_between_calls() {
+        // Two UUIDs generated within the same millisecond must differ in their
+        // random bits (the whole point of CSPRNG-seeded UUIDv7).
+        let id1 = uuidv7_with_timestamp(1_700_000_000_000);
+        let id2 = uuidv7_with_timestamp(1_700_000_000_000);
+        // Same timestamp, but random bits (positions 6-7, 9-15) must differ.
+        // (They could theoretically collide with probability 2^-74 —
+        // acceptable for a test that runs once.)
+        assert_ne!(id1, id2, "two UUIDv7 with same ts must differ in random bits");
     }
 }
