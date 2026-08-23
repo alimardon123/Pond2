@@ -335,6 +335,87 @@ impl ObjectStore for CachingObjectStore {
         self.remove_blob_from_disk(hash);
         Ok(result)
     }
+
+    /// Batch get: check disk cache for each hash, batch-fetch cache misses
+    /// from inner store (which may be parallel on S3), populate cache.
+    ///
+    /// This is critical: without this override, the trait default calls
+    /// `get_blob` sequentially per hash — killing parallelism when
+    /// `CachingObjectStore` wraps `S3ObjectStore`. With this override,
+    /// cache hits are served from disk (~10 µs) and only misses are
+    /// batch-fetched via `inner.get_blob_batch()` (32-way parallel on S3).
+    ///
+    /// Performance impact for 100 standalone RGs:
+    ///   WITHOUT this override: 100 sequential inner.get_blob() calls (~5 s)
+    ///   WITH this override: 1 batch call to inner + parallel fetch (~200 ms)
+    fn get_blob_batch(&self, hashes: &[String]) -> io::Result<Vec<Vec<u8>>> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut results: Vec<Option<Vec<u8>>> = vec![None; hashes.len()];
+        let mut miss_indices: Vec<usize> = Vec::new();
+        let mut miss_hashes: Vec<String> = Vec::new();
+
+        // Phase 1: Check disk cache for each hash.
+        for (i, hash) in hashes.iter().enumerate() {
+            match self.read_blob_from_disk(hash) {
+                Ok(data) => {
+                    // Cache hit — promote in LRU (true LRU: read updates recency).
+                    if let Ok(meta) = fs::metadata(self.blob_path(hash)) {
+                        self.access_order.lock().unwrap().put(
+                            hash.to_string(),
+                            DiskEntry { bytes: meta.len() as usize },
+                        );
+                    }
+                    results[i] = Some(data);
+                }
+                Err(_) => {
+                    miss_indices.push(i);
+                    miss_hashes.push(hash.clone());
+                }
+            }
+        }
+
+        // Phase 2: Batch-fetch cache misses from inner store.
+        // This delegates to inner's potentially-parallel implementation
+        // (S3ObjectStore uses 32-way thread::scope parallelism).
+        if !miss_hashes.is_empty() {
+            let miss_results = self.inner.get_blob_batch(&miss_hashes)?;
+
+            // Phase 3: Populate cache for misses and place in results.
+            for (j, (data, hash)) in miss_results.iter().zip(miss_hashes.iter()).enumerate() {
+                let _ = self.write_blob_to_disk(hash, data);
+                results[miss_indices[j]] = Some(data.clone());
+            }
+        }
+
+        // Phase 4: Collect in input order.
+        Ok(results
+            .into_iter()
+            .map(|opt| opt.expect("all slots filled (hits + misses)"))
+            .collect())
+    }
+
+    /// Batch put: delegate to inner store (parallel on S3), then cache all
+    /// results to local disk.
+    ///
+    /// Without this override, the trait default calls `put_blob` sequentially
+    /// per item — each doing an inner put + cache write. With this override,
+    /// the inner store can batch-parallel the puts, and we cache all results
+    /// in a single pass.
+    fn put_blob_batch(&self, items: &[Vec<u8>]) -> io::Result<Vec<String>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Delegate to inner (parallel on S3, sequential fallback on LocalFS).
+        let hashes = self.inner.put_blob_batch(items)?;
+        // Cache all written blobs to local disk.
+        for (data, hash) in items.iter().zip(hashes.iter()) {
+            let _ = self.write_blob_to_disk(hash, data);
+        }
+        Ok(hashes)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -552,5 +633,125 @@ mod tests {
         // Range read should delegate to inner store (which has the blob).
         let r = store.get_blob_range(&h, 5, 15).unwrap();
         assert_eq!(r, b"56789ABCDE", "cache-miss range read should delegate to inner");
+    }
+
+    // -----------------------------------------------------------------
+    // Batch passthrough tests (G7.5)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_get_blob_batch_all_cache_miss() {
+        // Fresh cache: all blobs fetched from inner store in one batch call.
+        let (store, _inner, _cache) = make_cached_store();
+        let items = [b"alpha".to_vec(), b"bravo".to_vec(), b"charlie".to_vec()];
+        let hashes: Vec<String> = items.iter().map(|d| store.put_blob(d).unwrap()).collect();
+
+        // Clear cache to simulate fresh start.
+        for h in &hashes {
+            std::fs::remove_file(store.blob_path(h)).unwrap();
+        }
+
+        // Batch read — all should come from inner store.
+        let results = store.get_blob_batch(&hashes).unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0], b"alpha");
+        assert_eq!(results[1], b"bravo");
+        assert_eq!(results[2], b"charlie");
+
+        // Verify they're now cached.
+        for h in &hashes {
+            assert!(store.blob_path(h).exists(), "blob should be cached after batch read");
+        }
+    }
+
+    #[test]
+    fn test_get_blob_batch_all_cache_hit() {
+        // All blobs already cached — should serve from disk, no inner calls.
+        let (store, inner_dir, _cache) = make_cached_store();
+        let items = [b"x".to_vec(), b"y".to_vec(), b"z".to_vec()];
+        let hashes: Vec<String> = items.iter().map(|d| store.put_blob(d).unwrap()).collect();
+
+        // Verify cached.
+        for h in &hashes {
+            assert!(store.blob_path(h).exists());
+        }
+
+        // Delete from inner to prove cache serves them.
+        for h in &hashes {
+            let inner_blob = inner_dir.path().join("blobs").join(&h[..2]).join(h);
+            std::fs::remove_file(inner_blob).unwrap();
+        }
+
+        let results = store.get_blob_batch(&hashes).unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0], b"x");
+        assert_eq!(results[1], b"y");
+        assert_eq!(results[2], b"z");
+    }
+
+    #[test]
+    fn test_get_blob_batch_partial_cache_hit() {
+        // Mix of cache hits and misses — only misses should be fetched from inner.
+        let (store, _inner, _cache) = make_cached_store();
+        let items = [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()];
+        let hashes: Vec<String> = items.iter().map(|d| store.put_blob(d).unwrap()).collect();
+
+        // Remove middle blob from cache (partial miss).
+        std::fs::remove_file(store.blob_path(&hashes[1])).unwrap();
+        assert!(!store.blob_path(&hashes[1]).exists());
+        assert!(store.blob_path(&hashes[0]).exists());
+        assert!(store.blob_path(&hashes[2]).exists());
+
+        let results = store.get_blob_batch(&hashes).unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0], b"one");
+        assert_eq!(results[1], b"two");
+        assert_eq!(results[2], b"three");
+
+        // Middle blob should now be cached.
+        assert!(store.blob_path(&hashes[1]).exists(), "fetched miss should be cached");
+    }
+
+    #[test]
+    fn test_get_blob_batch_preserves_order() {
+        // Verify results are in the same order as input hashes.
+        let (store, _inner, _cache) = make_cached_store();
+        let items = [b"aaa".to_vec(), b"bbb".to_vec(), b"ccc".to_vec()];
+        let hashes: Vec<String> = items.iter().map(|d| store.put_blob(d).unwrap()).collect();
+
+        // Request in reverse order.
+        let reversed = vec![hashes[2].clone(), hashes[0].clone(), hashes[1].clone()];
+        let results = store.get_blob_batch(&reversed).unwrap();
+        assert_eq!(results[0], b"ccc");
+        assert_eq!(results[1], b"aaa");
+        assert_eq!(results[2], b"bbb");
+    }
+
+    #[test]
+    fn test_get_blob_batch_empty() {
+        let (store, _inner, _cache) = make_cached_store();
+        let results = store.get_blob_batch(&[]).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_put_blob_batch_caches_all() {
+        // Verify put_blob_batch writes to inner AND caches all blobs.
+        let (store, _inner, _cache) = make_cached_store();
+        let items = [b"p".to_vec(), b"q".to_vec(), b"r".to_vec()];
+        let hashes = store.put_blob_batch(&items).unwrap();
+
+        assert_eq!(hashes.len(), 3);
+        for (i, h) in hashes.iter().enumerate() {
+            assert_eq!(store.get_blob(h).unwrap(), items[i]);
+            assert!(store.blob_path(h).exists(), "blob should be cached after put_batch");
+        }
+    }
+
+    #[test]
+    fn test_put_blob_batch_empty() {
+        let (store, _inner, _cache) = make_cached_store();
+        let hashes = store.put_blob_batch(&[]).unwrap();
+        assert!(hashes.is_empty());
     }
 }
