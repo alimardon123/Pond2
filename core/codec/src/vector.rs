@@ -304,7 +304,7 @@ mod tests {
         let a: Vec<f32> = (0..1536).map(|i| (i as f32) * 0.001).collect();
         let b: Vec<f32> = (0..1536).map(|i| (i as f32) * 0.001 + 0.01).collect();
         let d_simd = cosine_distance(&a, &b);
-        assert!(d_simd >= 0.0 && d_simd < 0.1, "1536-dim cosine: {}", d_simd);
+        assert!((0.0..0.1).contains(&d_simd), "1536-dim cosine: {}", d_simd);
     }
 
     #[test]

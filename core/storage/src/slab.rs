@@ -496,10 +496,7 @@ pub fn decode_slab(blob: &[u8]) -> Option<Slab> {
     let mut row_groups = Vec::with_capacity(n_row_groups);
     for entry in &footer.entries {
         let start = entry.byte_offset as usize;
-        let end = match start.checked_add(entry.byte_len as usize) {
-            Some(e) => e,
-            None => return None, // overflow — malformed slab
-        };
+        let end = start.checked_add(entry.byte_len as usize)?;
         if end > tail_start {
             return None;
         }

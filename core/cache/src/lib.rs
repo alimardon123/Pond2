@@ -469,15 +469,15 @@ mod tests {
             .with_max_disk_bytes(350); // room for ~3.5 blobs of 100 bytes
 
         // Write A, B, C (each 100 bytes = 300 bytes total, triggers eviction)
-        let h_a = store.put_blob(&vec![1u8; 100]).unwrap();
-        let h_b = store.put_blob(&vec![2u8; 100]).unwrap();
-        let h_c = store.put_blob(&vec![3u8; 100]).unwrap();
+        let h_a = store.put_blob(&[1u8; 100]).unwrap();
+        let h_b = store.put_blob(&[2u8; 100]).unwrap();
+        let h_c = store.put_blob(&[3u8; 100]).unwrap();
 
         // Read A to promote it in LRU (now A is most-recently-used).
         let _ = store.get_blob(&h_a).unwrap();
 
         // Write D — should evict B (least-recently-used), keep A and C.
-        let h_d = store.put_blob(&vec![4u8; 100]).unwrap();
+        let h_d = store.put_blob(&[4u8; 100]).unwrap();
 
         // A and C should still be in cache (A was promoted by read).
         assert!(store.blob_path(&h_a).exists(), "A should survive (was read)");

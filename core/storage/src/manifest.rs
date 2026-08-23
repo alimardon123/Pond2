@@ -8,21 +8,26 @@
 //
 // Binary format (PMAN):
 //   Magic: "PMAN" (4B)
-//   Version: 1 (1B)
+//   Version: 2 (1B)  [v2 adds slab_byte_offset + slab_byte_len per RG]
 //   n_columns: u16 LE (2B)
 //   key_col_len: u8 (1B)
 //   key_col: bytes (key_col_len)
 //   Schema: per col: name_len(1B) + name + vtype(1B)
 //   n_row_groups: u32 LE (4B)
-//   Row groups: per rg: rg_key_len(1B) + rg_key + blob_hash(64B string) + n_rows(4B)
-//               + per col: has_stats(1B) + [min + max] + null_count(4B)
+//   Row groups: per rg:
+//     rg_key_len(1B) + rg_key
+//     blob_hash_len(u32 LE) + blob_hash
+//     n_rows(u32 LE)
+//     per col: has_stats(1B) + [min + max] + null_count(4B)
+//     [v2 only] slab_byte_offset(u64 LE) + slab_byte_len(u32 LE)
 //   Optional: partition_spec (u32 LE length + JSON bytes)
 //   Optional: schema_version (u32 LE)
 //   Optional: bloom_filter_ref (u32 LE length + string)
 //   Optional: parent_manifest (u32 LE length + string)
 
 const PMAN_MAGIC: &[u8] = b"PMAN";
-const PMAN_VERSION: u8 = 1;
+const PMAN_VERSION_V1: u8 = 1;
+const PMAN_VERSION: u8 = 2;
 
 // Value types (match pond_core)
 const VT_INT64: u8 = 1;
@@ -107,9 +112,17 @@ fn i64_from_le_bytes(b: &[u8]) -> i64 {
 #[derive(Debug, Clone)]
 pub struct RowGroupEntry {
     pub key: String,
+    /// Content hash of the blob holding this row group's data.
+    /// For slab-backed RGs, this is the PSLB slab hash (not an individual PND2 hash).
     pub blob_hash: String,
     pub n_rows: u32,
     pub columns: Vec<ColumnStatsEntry>,
+    /// If this RG lives inside a PSLB slab, the byte offset within the slab blob.
+    /// `None` = standalone blob (read via `get_blob(blob_hash)`).
+    /// `Some(offset)` = slab-backed (read via `get_blob_range(blob_hash, offset, offset + len)`).
+    pub slab_byte_offset: Option<u64>,
+    /// If this RG lives inside a PSLB slab, the byte length of the RG's PND2 payload.
+    pub slab_byte_len: Option<u32>,
 }
 
 impl RowGroupEntry {
@@ -174,11 +187,15 @@ impl CollectionManifest {
         }
     }
 
-    /// Encode the manifest to PMAN binary format.
+    /// Encode the manifest to PMAN binary format (version 2).
+    ///
+    /// Version 2 adds `slab_byte_offset` (u64 LE) and `slab_byte_len`
+    /// (u32 LE) per row group, enabling slab-backed reads via
+    /// `get_blob_range` instead of full `get_blob`.
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(PMAN_MAGIC);
-        buf.push(PMAN_VERSION);
+        buf.push(PMAN_VERSION); // v2
 
         // Schema
         buf.extend_from_slice(&(self.columns.len() as u16).to_le_bytes());
@@ -216,6 +233,10 @@ impl CollectionManifest {
                 }
                 buf.extend_from_slice(&col.null_count.to_le_bytes());
             }
+
+            // v2: slab byte offset + len (12 bytes per RG)
+            buf.extend_from_slice(&rg.slab_byte_offset.unwrap_or(0).to_le_bytes());
+            buf.extend_from_slice(&rg.slab_byte_len.unwrap_or(0).to_le_bytes());
         }
 
         // Optional: partition_spec
@@ -238,10 +259,15 @@ impl CollectionManifest {
     }
 
     /// Decode a PMAN binary blob into a CollectionManifest.
+    ///
+    /// Supports both v1 (no slab fields) and v2 (slab_byte_offset +
+    /// slab_byte_len per row group). v1 manifests decode with
+    /// `slab_byte_offset: None, slab_byte_len: None` for all RGs.
     pub fn decode(data: &[u8]) -> Option<Self> {
         if data.len() < 7 || &data[0..4] != PMAN_MAGIC {
             return None;
         }
+        let version = data[4];
         let mut pos = 5; // skip magic + version
 
         // Read schema
@@ -317,7 +343,30 @@ impl CollectionManifest {
 
             row_groups.push(RowGroupEntry {
                 key, blob_hash, n_rows, columns: col_stats,
+                slab_byte_offset: None,
+                slab_byte_len: None,
             });
+        }
+
+        // v2: read slab byte offset + len for each RG (12 bytes per RG)
+        if version >= PMAN_VERSION {
+            for rg in &mut row_groups {
+                if pos + 12 > data.len() { return None; }
+                let offset = u64::from_le_bytes([
+                    data[pos], data[pos+1], data[pos+2], data[pos+3],
+                    data[pos+4], data[pos+5], data[pos+6], data[pos+7],
+                ]);
+                pos += 8;
+                let len = u32::from_le_bytes([
+                    data[pos], data[pos+1], data[pos+2], data[pos+3],
+                ]);
+                pos += 4;
+                // offset=0 and len=0 means standalone blob (not slab-backed)
+                if offset != 0 || len != 0 {
+                    rg.slab_byte_offset = Some(offset);
+                    rg.slab_byte_len = Some(len);
+                }
+            }
         }
 
         // Optional fields (may not be present in older manifests)
@@ -382,6 +431,8 @@ mod tests {
                     min: None, max: None, null_count: 0,
                 },
             ],
+            slab_byte_offset: None,
+            slab_byte_len: None,
         });
 
         let encoded = manifest.encode();
@@ -413,6 +464,8 @@ mod tests {
                     null_count: 0,
                 },
             ],
+            slab_byte_offset: None,
+            slab_byte_len: None,
         };
 
         // age > 100 → should prune (max is 50)

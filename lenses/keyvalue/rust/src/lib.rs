@@ -71,7 +71,7 @@ impl KeyValueLens {
         let mut staged = self.staged.lock().unwrap();
         staged
             .entry(collection.to_string())
-            .or_insert_with(HashMap::new)
+            .or_default()
             .insert(key.to_string(), Some(value.clone()));
     }
 
@@ -80,7 +80,7 @@ impl KeyValueLens {
         let mut staged = self.staged.lock().unwrap();
         staged
             .entry(collection.to_string())
-            .or_insert_with(HashMap::new)
+            .or_default()
             .insert(key.to_string(), None);
     }
 

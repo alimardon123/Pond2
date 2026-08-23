@@ -327,6 +327,8 @@ fn try_crdt_merge_row_groups(
         blob_hash: new_hash,
         n_rows: live_rows.len() as u32,
         columns: col_stats,
+        slab_byte_offset: None,
+        slab_byte_len: None,
     })
 }
 

@@ -202,7 +202,8 @@ impl LakehouseLens {
         });
 
         // Collect results
-        let mut result_cols: HashMap<String, (u8, Vec<i64>, Vec<f64>, Vec<String>)> = HashMap::new();
+        type ColAccum = (u8, Vec<i64>, Vec<f64>, Vec<String>);
+        let mut result_cols: HashMap<String, ColAccum> = HashMap::new();
 
         for rg in &manifest.row_groups {
             let blob_data = self.storage.kernel().read_blob(&rg.blob_hash)

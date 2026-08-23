@@ -20,7 +20,7 @@
 
 use pond_kernel::PondKernel;
 use pond_storage::maintenance;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::HashMap;
 
 /// Collection-level indexer. Operates on any collection via the kernel.
@@ -43,10 +43,10 @@ impl<'a> SimpleIndex<'a> {
     ///   - index_name: Name for this index (e.g., "by_name", "by_email")
     ///   - rows: The rows to index (Vec<(rowid, row_data)>)
     ///   - extractor: Function that extracts index key(s) from a row.
-    ///                Can return a single key or multiple keys (multi-key index).
+    ///     Can return a single key or multiple keys (multi-key index).
     ///   - key_fields: The field name(s) being indexed. Single field: ["name"].
-    ///                 Composite key: ["status", "city"]. Stored as metadata
-    ///                 for automatic index acceleration.
+    ///     Composite key: ["status", "city"]. Stored as metadata
+    ///     for automatic index acceleration.
     ///
     /// Returns: index blob hash
     pub fn build_index(
@@ -274,6 +274,7 @@ pub struct IndexStats {
 mod tests {
     use super::*;
     use pond_storage::UnifiedStorage;
+    use serde_json::json;
 
     fn make_test_storage() -> (UnifiedStorage, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();

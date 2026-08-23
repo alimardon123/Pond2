@@ -64,11 +64,11 @@ pub fn read(
 ///
 /// Unlike [`read`] (which concatenates RG bytes), this preserves the
 /// per-RG boundary so callers can decode each PND2 blob independently.
-/// This is the correct API for analytics over multi-RG collections where
-/// each RG is a self-contained PND2 blob with its own column encoding.
 ///
-/// Uses `kernel.read_blob_batch` (parallel GET on S3) so the wall-clock
-/// cost is ~1 RTT (not N×RTT) for the multi-RG case.
+/// **Slab-aware**: if a RowGroupEntry has `slab_byte_offset` set, this
+/// function uses `kernel.read_blob_range()` to fetch ONLY the needed
+/// bytes from the slab (not the whole slab). For S3, this is a Range GET
+/// — typically 1000x smaller than a full GET for selective queries.
 pub fn read_all_row_groups(
     kernel: &PondKernel,
     collection: &str,
@@ -88,11 +88,105 @@ pub fn read_all_row_groups(
     if manifest.row_groups.is_empty() {
         return Err("Manifest has no row groups".to_string());
     }
-    let hashes: Vec<String> = manifest.row_groups.iter()
-        .map(|rg| rg.blob_hash.clone())
-        .collect();
-    kernel.read_blob_batch(&hashes)
-        .map_err(|e| format!("Failed to read data blobs: {}", e))
+
+    // Separate slab-backed RGs from standalone RGs
+    let mut standalone_hashes: Vec<String> = Vec::new();
+    let mut slab_ranges: Vec<(String, u64, u64)> = Vec::new(); // (slab_hash, start, end_exclusive)
+    let mut rg_order: Vec<RgSource> = Vec::new();
+
+    for rg in &manifest.row_groups {
+        if let (Some(offset), Some(len)) = (rg.slab_byte_offset, rg.slab_byte_len) {
+            slab_ranges.push((rg.blob_hash.clone(), offset, offset + len as u64));
+            rg_order.push(RgSource::Slab(slab_ranges.len() - 1));
+        } else {
+            standalone_hashes.push(rg.blob_hash.clone());
+            rg_order.push(RgSource::Standalone(standalone_hashes.len() - 1));
+        }
+    }
+
+    // Batch-read all standalone blobs (parallel on S3)
+    let standalone_results = if !standalone_hashes.is_empty() {
+        kernel.read_blob_batch(&standalone_hashes)
+            .map_err(|e| format!("Failed to read data blobs: {}", e))?
+    } else {
+        Vec::new()
+    };
+
+    // Range-read all slab RGs (parallel via std::thread::scope)
+    let slab_results = if !slab_ranges.is_empty() {
+        read_slab_ranges_parallel(kernel, &slab_ranges)?
+    } else {
+        Vec::new()
+    };
+
+    // Reassemble in manifest order
+    let mut result = Vec::with_capacity(rg_order.len());
+    for src in &rg_order {
+        match src {
+            RgSource::Standalone(idx) => result.push(standalone_results[*idx].clone()),
+            RgSource::Slab(idx) => result.push(slab_results[*idx].clone()),
+        }
+    }
+    Ok(result)
+}
+
+/// Internal enum tracking whether each RG comes from a standalone blob or a slab.
+enum RgSource {
+    Standalone(usize),
+    Slab(usize),
+}
+
+/// Parallel range-read multiple byte ranges from (possibly different) slabs.
+///
+/// Uses `std::thread::scope` for zero-overhead parallelism.
+/// On S3, each range-read is an HTTP Range GET (206 Partial Content).
+/// On LocalFS, each is a seek+read_exact (avoids loading the whole file).
+fn read_slab_ranges_parallel(
+    kernel: &PondKernel,
+    ranges: &[(String, u64, u64)],
+) -> Result<Vec<Vec<u8>>, String> {
+    use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+    use std::thread;
+    let n = ranges.len();
+    let results = Arc::new(Mutex::new(vec![Vec::new(); n]));
+    let failed = Arc::new(AtomicBool::new(false));
+    let error_msg = Arc::new(Mutex::new(None::<String>));
+
+    thread::scope(|s| {
+        for (i, (hash, start, end)) in ranges.iter().enumerate() {
+            let hash = hash.clone();
+            let start = *start;
+            let end = *end;
+            let results = Arc::clone(&results);
+            let failed = Arc::clone(&failed);
+            let error_msg = Arc::clone(&error_msg);
+            s.spawn(move || {
+                if failed.load(Ordering::Relaxed) { return; }
+                match kernel.read_blob_range(&hash, start, end) {
+                    Ok(data) => {
+                        if let Ok(mut r) = results.lock() {
+                            r[i] = data;
+                        }
+                    }
+                    Err(e) => {
+                        failed.store(true, Ordering::Relaxed);
+                        if let Ok(mut msg) = error_msg.lock() {
+                            *msg = Some(format!("Range read failed for slab {}: {:?}", hash, e));
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let err = error_msg.lock().unwrap();
+    match &*err {
+        Some(e) => Err(e.clone()),
+        None => {
+            let guard = results.lock().unwrap();
+            Ok(guard.clone())
+        }
+    }
 }
 
 /// Read data at a specific commit — SNAPSHOT ISOLATION.

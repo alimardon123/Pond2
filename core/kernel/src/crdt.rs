@@ -413,7 +413,7 @@ mod tests {
         let mut clock1 = HLC::new();
         let mut clock2 = HLC::new();
 
-        let v1 = clock1.tick();
+        let _v1 = clock1.tick();
         thread::sleep(Duration::from_millis(2));
         let v2 = clock2.tick();
 

@@ -427,7 +427,7 @@ mod tests {
         let h = kernel.write(b"check layout").unwrap();
         let expected = dir.path().join("blobs").join(&h[..2]).join(&h);
         assert!(expected.exists(), "blob should be at blobs/{}/{}, got: {}",
-                &h[..2], &h, expected.display());
+                &h[..2], h, expected.display());
     }
 
     #[test]

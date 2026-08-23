@@ -162,6 +162,55 @@ STORAGE_ENCODED = 2         # per-column-chunk encoded blobs (PND1 + compression
 FLAG_HAS_STATS_TREE = 0x01
 FLAG_HAS_BLOOM = 0x02
 FLAG_HAS_PARENT_MANIFEST = 0x04  # delta-manifest for O(1) appends
+FLAG_HAS_INLINE_BLOOM = 0x08  # bloom filter bitset embedded in manifest
+
+
+# ---------------------------------------------------------------------------
+# Bloom filter helpers (inline, zero-dependency)
+# ---------------------------------------------------------------------------
+
+def _bloom_build(keys: list[str], bits_per_key: int = 10) -> bytes:
+    """Build a Bloom filter bitset for the given keys.
+
+    Uses double hashing (SHA-256 split) with k=7 hash functions.
+    Returns a bytes object of length ceil(n_bits / 8).
+    """
+    import hashlib as _hl
+    n = len(keys)
+    if n == 0:
+        return b""
+    n_bits = max(n * bits_per_key, 64)
+    byte_len = (n_bits + 7) // 8
+    bitset = bytearray(byte_len)
+    for key in keys:
+        h = _hl.sha256(key.encode("utf-8")).digest()
+        h1 = int.from_bytes(h[:16], "little")
+        h2 = int.from_bytes(h[16:], "little")
+        for i in range(7):
+            idx = (h1 + i * h2) % n_bits
+            bitset[idx // 8] |= 1 << (idx % 8)
+    return bytes(bitset)
+
+
+def _bloom_check(bitset: bytes, key: str) -> bool:
+    """Check if a key might be in the Bloom filter.
+
+    Returns False if the key is DEFINITELY NOT in the set.
+    Returns True if the key MIGHT be in the set (may be false positive).
+    Uses the same k=7 double hashing as _bloom_build.
+    """
+    import hashlib as _hl
+    if not bitset:
+        return True  # empty bloom = match everything
+    n_bits = len(bitset) * 8
+    h = _hl.sha256(key.encode("utf-8")).digest()
+    h1 = int.from_bytes(h[:16], "little")
+    h2 = int.from_bytes(h[16:], "little")
+    for i in range(7):
+        idx = (h1 + i * h2) % n_bits
+        if not (bitset[idx // 8] & (1 << (idx % 8))):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +401,7 @@ class CollectionManifest:
         self._row_groups: list[RowGroupEntry] = []
         self._stats_tree_root: Optional[str] = None
         self._bloom_filter_ref: Optional[str] = None
+        self._inline_bloom: Optional[bytes] = None  # embedded bloom bitset
         self._parent_manifest_hash: Optional[str] = None
         # Hidden partitioning: partition spec stored in the manifest
         # (Iceberg-style). None = no partitioning.
@@ -407,6 +457,17 @@ class CollectionManifest:
         """Attach a bloom filter ref (for membership queries)."""
         self._bloom_filter_ref = ref
 
+    def set_inline_bloom(self, bloom_bits: bytes) -> None:
+        """Embed a bloom filter bitset directly in the manifest.
+
+        Unlike set_bloom_filter_ref (which stores a hash reference to an
+        external blob), this embeds the bitset inline — 0 extra GETs for
+        bloom membership checks. For 10K keys at 10 bits/key = ~12.5 KB
+        overhead. Negative lookups (key not in collection) skip the data
+        blob fetch entirely.
+        """
+        self._inline_bloom = bloom_bits
+
     def set_parent_manifest(self, parent_hash: str) -> None:
         """Set the parent manifest hash for delta-appends (O(1) at PB scale).
 
@@ -446,6 +507,8 @@ class CollectionManifest:
             flags |= FLAG_HAS_BLOOM
         if self._parent_manifest_hash:
             flags |= FLAG_HAS_PARENT_MANIFEST
+        if self._inline_bloom is not None:
+            flags |= FLAG_HAS_INLINE_BLOOM
 
         buf = bytearray()
         buf += _MANIFEST_MAGIC
@@ -473,6 +536,9 @@ class CollectionManifest:
             buf += bytes.fromhex(self._bloom_filter_ref)
         if self._parent_manifest_hash:
             buf += bytes.fromhex(self._parent_manifest_hash)
+        if self._inline_bloom is not None:
+            buf += struct.pack("<I", len(self._inline_bloom))
+            buf += self._inline_bloom
 
         # Row group entries
         if not self._stats_tree_root:
@@ -599,6 +665,9 @@ class CollectionManifest:
             manifest._bloom_filter_ref = data[pos:pos+32].hex(); pos += 32
         if flags & FLAG_HAS_PARENT_MANIFEST:
             manifest._parent_manifest_hash = data[pos:pos+32].hex(); pos += 32
+        if flags & FLAG_HAS_INLINE_BLOOM:
+            bloom_len = struct.unpack_from("<I", data, pos)[0]; pos += 4
+            manifest._inline_bloom = data[pos:pos+bloom_len]; pos += bloom_len
 
         # Row group entries
         for _ in range(n_row_groups):
@@ -723,24 +792,48 @@ class CollectionManifest:
         """The schema version (for schema evolution tracking)."""
         return self._schema_version
 
+    def row_group_index(self, rg: RowGroupEntry) -> Optional[int]:
+        """Return the index of `rg` in the row group list, or None."""
+        target_id = id(rg)
+        for i, r in enumerate(self._row_groups):
+            if id(r) == target_id:
+                return i
+        return None
+
     def find_row_group(self, key: str) -> Optional[RowGroupEntry]:
         """Find the row group whose key matches `key` (smallest key >= target).
 
         Used for point lookups — the row group with max_pk >= key contains
-        the row.
+        the row. Row groups are sorted by key, so we use binary search
+        (O(log N) instead of O(N) linear scan).
 
         At PB scale (stats_tree_root set), this is O(log N) via the
-        hierarchical stats tree. At small scale, it's an O(N) linear scan
-        (fine for N < 25K — the manifest fits in one blob).
+        hierarchical stats tree. At small scale, it's O(log N) via bisect.
+
+        The caller must format the key via `_format_rg_key()` before
+        calling this method (row group keys are formatted).
+
+        If an inline bloom filter is present, negative lookups (key not in
+        collection) return None immediately without scanning any row groups.
         """
+        # Bloom filter: negative lookup fast-path (0 data GETs)
+        if self._inline_bloom is not None:
+            if not _bloom_check(self._inline_bloom, key):
+                return None
+
         # PB-scale path: walk the stats tree top-down
         if self._stats_tree_root:
             return self._find_row_group_via_stats_tree(key)
-        # Small-scale path: linear scan
-        target = key
-        for rg in self._row_groups:
-            if rg.key >= target:
-                return rg
+        # O(log N) binary search — row groups are sorted by key
+        lo, hi = 0, len(self._row_groups)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._row_groups[mid].key < key:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo < len(self._row_groups):
+            return self._row_groups[lo]
         return None
 
     def _find_row_group_via_stats_tree(self, key: str) -> Optional[RowGroupEntry]:
@@ -756,11 +849,16 @@ class CollectionManifest:
         try:
             from stats_tree import StatsTreeReader, InternalChild
         except ImportError:
-            # Stats tree not available — fall back to linear scan
-            target = key
-            for rg in self._row_groups:
-                if rg.key >= target:
-                    return rg
+            # Stats tree not available — fall back to binary search
+            lo, hi = 0, len(self._row_groups)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if self._row_groups[mid].key < key:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            if lo < len(self._row_groups):
+                return self._row_groups[lo]
             return None
 
         reader = StatsTreeReader(self.kernel, self._stats_tree_root)

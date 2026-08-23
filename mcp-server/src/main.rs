@@ -291,10 +291,7 @@ fn dispatch(storage: &UnifiedStorage, request: &JsonValue) -> Option<RpcResponse
     let params = obj.get("params").cloned().unwrap_or(JsonValue::Null);
 
     // Notifications (no `id`) get no response, per spec.
-    let id = match id {
-        Some(id) => id,
-        None => return None,
-    };
+    let id = id?;
 
     match method {
         "initialize" => Some(handle_initialize(id, &params)),
@@ -849,7 +846,7 @@ fn main() -> io::Result<()> {
     let root = discover_root(root_arg.as_deref());
 
     let storage = UnifiedStorage::new_local(&root)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to open storage at {}: {}", root.display(), e)))?;
+        .map_err(|e| io::Error::other(format!("Failed to open storage at {}: {}", root.display(), e)))?;
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -1366,7 +1363,7 @@ mod tests {
         let root = discover_root(None);
         // Should be either the CWD (if a .pond/ exists somewhere up the
         // tree) or ".". Either way it must be a valid path.
-        assert!(root.is_absolute() || root == PathBuf::from("."));
+        assert!(root.is_absolute() || root.to_str() == Some("."));
     }
 
     #[test]

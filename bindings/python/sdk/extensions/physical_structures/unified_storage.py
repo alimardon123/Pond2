@@ -3497,6 +3497,28 @@ class UnifiedStorage:
                 ))
             new_manifest.add_row_group(rg)
 
+        # Build manifest LOCALLY (no I/O) — encode + hash only
+        new_manifest = CollectionManifest(self.kernel)
+        new_manifest.set_schema(
+            columns=schema, key_col=key_col,
+            row_group_size=rg_size, chunk_size=0,
+        )
+        for entry in manifest_entries:
+            rg = RowGroupEntry(
+                key=entry["rg_key"], blob_hash=entry["blob_hash"],
+                n_rows=entry["n_rows"], storage_mode=STORAGE_WHOLE_BLOB,
+            )
+            for col_name, vtype, mn, mx, null_count in entry["col_stats"]:
+                rg.columns.append(ColumnStatsEntry(
+                    name=col_name, value_type=vtype,
+                    min=mn, max=mx, null_count=null_count, chunks=[],
+                ))
+            new_manifest.add_row_group(rg)
+
+        # Carry forward the inline bloom filter from HEAD manifest
+        # so negative lookups still work after compaction.
+        if head_manifest and head_manifest._inline_bloom:
+            new_manifest.set_inline_bloom(head_manifest._inline_bloom)
         # Build stats tree (writer-side, P10 fix) BEFORE encoding
         try:
             from stats_tree import should_use_stats_tree, build_stats_tree
@@ -4355,6 +4377,19 @@ class UnifiedStorage:
                     null_count=null_count, chunks=[],
                 ))
             manifest_obj.add_row_group(rg)
+
+        # Build inline bloom filter for negative-lookup elimination.
+        # Contains ALL individual row keys (formatted). If the formatted
+        # lookup key is not in the bloom, the key definitely doesn't exist
+        # in this manifest → skip the data blob fetch entirely.
+        # Cost: ~12.5 KB per 10K rows. Saves 1 data GET per negative lookup.
+        if key_array:
+            from collection_manifest import _bloom_build
+            # Format each key the same way find_row_group does
+            formatted_keys = [_format_rg_key(k) for k in key_array]
+            bloom_bits = _bloom_build(formatted_keys)
+            manifest_obj.set_inline_bloom(bloom_bits)
+
         # Encode manifest locally — no I/O yet
         manifest_bytes, manifest_hash = self._encode_manifest_local(manifest_obj)
         new_manifest = manifest_obj
@@ -4383,14 +4418,25 @@ class UnifiedStorage:
             "index": commit_index,
         }
 
-        # INLINE DATA OPTIMIZATION:
-        # For single-row-group writes (the common case: point lookups, small
-        # collections, OLTP single-record writes), inline the PND2 data blob
-        # into the pack. This eliminates 1 GET on cold reads (3 GETs → 2 GETs).
-        # Threshold: only inline if the data blob is < 256KB (keeps pack size reasonable).
+        # INLINE DATA OPTIMIZATION (SuperPack):
+        # For writes whose total data fits in one pack, inline ALL PND2
+        # data blobs into the PondPack. This eliminates the separate data
+        # blob GET on cold reads, reducing point lookup from 2-3 GETs → 1 GET.
+        #
+        # Threshold: 4 MB. S3 GET cost is flat per-request (not per-byte),
+        # so a 4 MB pack costs the same RTT as a 1 KB pack. At 10K rows ×
+        # ~100 bytes/row = ~1 MB, most KV/lakehouse single-row-group
+        # writes are now inlined. Previously 256 KB — too small for real
+        # workloads, so the optimization rarely fired.
+        #
+        # Multi-row-group writes are also inlined if their TOTAL payload
+        # fits under the threshold. This is correct because the pack
+        # format supports multiple inline data blobs.
+        _SUPERPACK_INLINE_MAX = 4 * 1024 * 1024  # 4 MB
         inline_data = None
-        if n_groups == 1 and len(pnd2_payloads[0]) < 256 * 1024:
-            inline_data = [pnd2_payloads[0]]
+        total_payload_size = sum(len(p) for p in pnd2_payloads)
+        if total_payload_size < _SUPERPACK_INLINE_MAX:
+            inline_data = pnd2_payloads
 
         # Build the pack: commit JSON + manifest bytes + optional inline data
         pack_bytes = encode_pack(commit, manifest_bytes, inline_data=inline_data)
@@ -5233,10 +5279,16 @@ class UnifiedStorage:
                     if rg is None:
                         return None
 
-                    # Check if the data blob is inlined in the pack
+                    # Check if the data blob is inlined in the pack.
+                    # inline_data is ordered same as manifest row groups
+                    # (both sorted by key). Find the matching index.
                     if inline_data and len(inline_data) > 0:
-                        # Use the first (and only) inline data blob
-                        blob_bytes = inline_data[0]
+                        rg_idx = manifest.row_group_index(rg)
+                        if rg_idx is not None and rg_idx < len(inline_data):
+                            blob_bytes = inline_data[rg_idx]
+                        else:
+                            # Fallback: use first blob (single-RG compat)
+                            blob_bytes = inline_data[0]
                     else:
                         # Data not inlined — fetch separately (1 GET)
                         blob_bytes = self.kernel.read_blob(rg.blob_hash)
