@@ -7,6 +7,21 @@
 //   - Strings returned are heap-allocated. Caller MUST free with pond_string_free().
 //   - Data returned via out-params is heap-allocated. Caller MUST free with pond_data_free().
 //   - Handles must be freed with pond_kernel_free().
+//
+// # Safety
+// All functions in this module accept raw pointers from C callers. The caller
+// must ensure that:
+//   - Handle pointers are valid (returned by pond_kernel_new, not yet freed).
+//   - String/data pointers are valid and null-terminated (for strings) or
+//     valid for the specified length (for data pointers).
+//   - Out-param pointers are valid and writable.
+//   - No data races exist (each handle must not be used concurrently from
+//     multiple threads without external synchronization).
+//
+// We allow clippy::not_unsafe_ptr_arg_deref because these are C FFI functions
+// where safety is the caller's responsibility (documented above).
+
+#![allow(clippy::missing_safety_doc, clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_char, CStr, CString};
 use std::ptr;
@@ -67,7 +82,7 @@ pub extern "C" fn pond_kernel_read(
     };
     match handle.kernel.read(key) {
         Ok(data) => {
-            let mut boxed = data.into_boxed_slice();
+            let boxed = data.into_boxed_slice();
             let ptr = boxed.as_ptr();
             let len = boxed.len();
             std::mem::forget(boxed);

@@ -26,7 +26,7 @@
 use pond_kernel::PondKernel;
 use pond_storage::manifest::CollectionManifest;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, BinaryHeap, BTreeSet};
+use std::collections::{HashMap, HashSet};
 use std::cmp::Ordering;
 
 const METRIC_L2: u8 = 0;
@@ -70,7 +70,7 @@ impl<'a> HNSWIndex<'a> {
         }
 
         let n_dims = n_dimensions.unwrap_or(vectors[0].len());
-        let metric_code = match distance_metric {
+        let _metric_code = match distance_metric {
             "l2" => METRIC_L2,
             "cosine" => METRIC_COSINE,
             _ => return Err(format!("unknown metric: {}", distance_metric)),
@@ -354,6 +354,7 @@ fn build_graph(
 }
 
 /// Insert a single node into the HNSW graph.
+#[allow(clippy::too_many_arguments)]
 fn insert_node(
     node_idx: usize,
     vectors: &[Vec<f64>],
@@ -389,7 +390,7 @@ fn insert_node(
         // Add bidirectional connections
         graph[layer].insert(node_idx, selected.clone());
         for &n in &selected {
-            let entry = graph[layer].entry(n).or_insert_with(Vec::new);
+            let entry = graph[layer].entry(n).or_default();
             entry.push(node_idx);
             // Prune neighbor list if too long
             if entry.len() > m {

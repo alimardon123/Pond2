@@ -1,4 +1,4 @@
-// Integration tests for the pond_sql crate.
+#![allow(clippy::approx_constant)]
 //
 // Each test exercises one of the SQL features listed in the task spec:
 //   - SELECT * with WHERE

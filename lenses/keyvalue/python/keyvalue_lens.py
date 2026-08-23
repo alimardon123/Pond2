@@ -355,23 +355,18 @@ class KeyValueLens(PondLens):
                         schema_hint={"_key": "string", "value": "bytes"})
                     commit_hash = put_hash
                 else:
-                    # EXISTING collection — append via CRDT shard
+                    # EXISTING collection — append via CRDT shard,
+                    # then compact into HEAD so branch/merge/history work.
+                    # compact_shards has a fast manifest-level path:
+                    # O(shard_count) metadata GETs, ZERO data I/O.
                     put_hash = self._unified_storage.append(
                         collection, rows, key_col="_key",
                         row_group_size=10_000,
                         message=message or f"{collection} unified commit (puts)")
-                    # Compact shards into HEAD so branch/merge/history see
-                    # the latest data (append uses shards, but version
-                    # control needs HEAD to be current). Tombstones survive
-                    # compaction because delete_shard was called with keys=
-                    # (distinct rg_keys per tombstone).
-                    #
-                    # NOTE: this is O(N) per commit. For high-write workloads,
-                    # set compact_after_commit=False and compact periodically
-                    # via a background job. See VETERAN_ARCHITECT_REVIEW.md §3.7.
-                    if self._compact_after_commit:
-                        self._unified_storage.compact_shards(collection)
-                    if not commit_hash:
+                    compact_hash = self._unified_storage.compact_shards(collection)
+                    if compact_hash:
+                        commit_hash = compact_hash
+                    elif not commit_hash:
                         commit_hash = put_hash
 
             # Stamp metadata if this is a new collection (deletes-only on
@@ -399,17 +394,19 @@ class KeyValueLens(PondLens):
                     collection, lens_type="keyvalue", key_col="_key",
                     schema_hint={"_key": "string", "value": "bytes"})
             else:
-                # EXISTING collection — append via CRDT shard
-                commit_hash = self._unified_storage.append(
+                # EXISTING collection — append via CRDT shard,
+                # then compact into HEAD so branch/merge/history work.
+                # compact_shards has a fast manifest-level path:
+                # O(shard_count) metadata GETs, ZERO data I/O.
+                put_hash = self._unified_storage.append(
                     collection, rows, key_col="_key",
                     row_group_size=10_000,
                     message=message or f"{collection} unified commit")
-                # Compact shards into HEAD so branch/merge/history see
-                # the latest data (append uses shards, but version
-                # control needs HEAD to be current).
-                # See NOTE above about compact_after_commit flag.
-                if self._compact_after_commit:
-                    self._unified_storage.compact_shards(collection)
+                compact_hash = self._unified_storage.compact_shards(collection)
+                if compact_hash:
+                    commit_hash = compact_hash
+                else:
+                    commit_hash = put_hash
         else:
             commit_hash = ""
 
@@ -824,7 +821,15 @@ class KeylessLens(KeyValueLens):
             data = rest[0]
         else:
             raise TypeError(f"put() expects 1-3 args, got {len(rest)}")
-        return self.put_auto(collection, data)
+        # _resolve_collection already resolved the collection name.
+        # Pass only data to put_auto so it resolves via _default_collection
+        # without double-resolving (which would treat 'collection' as data
+        # when _default_collection is set — Bug: collection name stored
+        # as the value instead of actual data).
+        if self._default_collection is not None:
+            return self.put_auto(data)
+        else:
+            return self.put_auto(collection, data)
 
     def put_many(self, *args) -> list[str]:
         """Stage multiple rows, each with an auto-generated key.
@@ -834,7 +839,10 @@ class KeylessLens(KeyValueLens):
         """
         collection, rest = self._resolve_collection(*args)
         rows = rest[0]
-        return [self.put_auto(collection, row) for row in rows]
+        if self._default_collection is not None:
+            return [self.put_auto(row) for row in rows]
+        else:
+            return [self.put_auto(collection, row) for row in rows]
 
 
 # SemanticLens/OssieAdapter are in extensions/semantic/. CollectionIndexer is in

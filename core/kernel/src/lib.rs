@@ -28,8 +28,6 @@ pub use object_store::AsyncObjectStore;
 
 use std::io;
 use std::sync::{Arc, Mutex};
-use lru::LruCache;
-use std::num::NonZeroUsize;
 
 use sha2::{Digest, Sha256};
 
@@ -135,6 +133,22 @@ impl PondKernel {
         let results = self.store.get_blob_batch(hashes)?;
         self.stats.lock().unwrap().reads += results.len() as u64;
         Ok(results)
+    }
+
+    /// Read a byte range `[start, end)` from a content-addressed blob.
+    ///
+    /// Thin wrapper over `ObjectStore::get_blob_range` — delegates to the
+    /// backend's native range support (LocalFS seek+read, S3 `Range:`
+    /// header, CachingObjectStore disk-then-inner). This is the primitive
+    /// that PondSlab readers use to fetch the 12-byte tail, the footer,
+    /// and individual row-group byte ranges without fetching the whole slab.
+    ///
+    /// **Half-open interval**: `end` is exclusive. `end == 0` or
+    /// `start >= end` returns an empty Vec without an I/O round-trip.
+    pub fn read_blob_range(&self, h: &str, start: u64, end: u64) -> io::Result<Vec<u8>> {
+        let data = self.store.get_blob_range(h, start, end)?;
+        self.stats.lock().unwrap().reads += 1;
+        Ok(data)
     }
 
     // ------------------------------------------------------------------
@@ -436,6 +450,81 @@ mod tests {
         let content = std::fs::read_to_string(&ref_file).unwrap();
         assert!(content.contains(r#""hash":"#), "ref must store JSON, got: {}", content);
         assert!(content.contains(&h), "ref must contain the hash, got: {}", content);
+    }
+
+    #[test]
+    fn test_read_blob_range_full_window() {
+        // Range covering the whole blob should match get_blob.
+        let dir = tempdir().unwrap();
+        let kernel = PondKernel::new_local(dir.path()).unwrap();
+        let payload = b"0123456789ABCDEFGHIJKLMN"; // 24 bytes
+        let h = kernel.write(payload).unwrap();
+        let r = kernel.read_blob_range(&h, 0, payload.len() as u64).unwrap();
+        assert_eq!(r.as_slice(), payload);
+    }
+
+    #[test]
+    fn test_read_blob_range_partial_window() {
+        // Middle slice — LocalFS must seek, not load whole file.
+        let dir = tempdir().unwrap();
+        let kernel = PondKernel::new_local(dir.path()).unwrap();
+        let payload = b"0123456789ABCDEFGHIJKLMN"; // 24 bytes
+        let h = kernel.write(payload).unwrap();
+        let r = kernel.read_blob_range(&h, 5, 15).unwrap();
+        assert_eq!(r, b"56789ABCDE", "bytes [5,15) should be '56789ABCDE'");
+    }
+
+    #[test]
+    fn test_read_blob_range_end_past_size_clamps() {
+        // end > blob_len should be clamped (no error).
+        let dir = tempdir().unwrap();
+        let kernel = PondKernel::new_local(dir.path()).unwrap();
+        let payload = b"hello"; // 5 bytes
+        let h = kernel.write(payload).unwrap();
+        let r = kernel.read_blob_range(&h, 2, 100).unwrap();
+        assert_eq!(r, b"llo", "should return [2, 5) = 'llo'");
+    }
+
+    #[test]
+    fn test_read_blob_range_empty_returns_empty() {
+        // start >= end should return empty without I/O.
+        let dir = tempdir().unwrap();
+        let kernel = PondKernel::new_local(dir.path()).unwrap();
+        let h = kernel.write(b"some bytes here").unwrap();
+        let r = kernel.read_blob_range(&h, 5, 5).unwrap();
+        assert!(r.is_empty(), "[5,5) should be empty");
+        let r2 = kernel.read_blob_range(&h, 0, 0).unwrap();
+        assert!(r2.is_empty(), "[0,0) should be empty");
+    }
+
+    #[test]
+    fn test_read_blob_range_start_past_end_returns_empty() {
+        // start >= blob_len should return empty.
+        let dir = tempdir().unwrap();
+        let kernel = PondKernel::new_local(dir.path()).unwrap();
+        let h = kernel.write(b"abc").unwrap();
+        let r = kernel.read_blob_range(&h, 100, 200).unwrap();
+        assert!(r.is_empty(), "start past EOF should return empty");
+    }
+
+    #[test]
+    fn test_read_blob_range_tail_fetch_pattern() {
+        // Simulate the slab reader's step 1: fetch the last 12 bytes (the
+        // PSLB tail). This is the exact pattern the slab reader uses.
+        let dir = tempdir().unwrap();
+        let kernel = PondKernel::new_local(dir.path()).unwrap();
+        // Build a fake slab: header(10) + payload(20) + footer(8) + tail(12)
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"PSLB\x01\x01\x01\x00\x00\x00"); // header
+        blob.extend_from_slice(b"PAYLOAD_20_BYTES!!!");           // 20 bytes payload
+        blob.extend_from_slice(b"FOOTER8!");                      // 8 bytes footer
+        blob.extend_from_slice(b"PSLB");                          // tail magic
+        blob.extend_from_slice(&[0u8; 8]);                        // footer_offset
+        let total = blob.len();
+        let h = kernel.write(&blob).unwrap();
+        let tail = kernel.read_blob_range(&h, (total - 12) as u64, total as u64).unwrap();
+        assert_eq!(tail.len(), 12);
+        assert_eq!(&tail[0..4], b"PSLB", "tail must start with PSLB magic");
     }
 }
 

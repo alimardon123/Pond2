@@ -311,35 +311,28 @@ fn find_pond_marker() -> Option<std::path::PathBuf> {
         if pond_dir.is_dir() {
             return Some(pond_dir);
         }
-        match current.parent() {
-            Some(parent) => current = parent,
-            None => return None,
-        }
+        current = current.parent()?;
     }
 }
 
 /// Get a human-readable description of the storage connection for display.
 fn describe_storage(url: &str) -> String {
-    if url.starts_with("s3://") {
-        // Parse S3 URL for a friendly description
-        if let Some(bucket_end) = url[5..].find('/') {
-            let bucket = &url[5..5 + bucket_end];
-            let prefix = &url[6 + bucket_end..];
-            // Check if it's R2, MinIO, etc. from the endpoint param
-            let endpoint = url.split("endpoint=").nth(1).unwrap_or("");
-            let provider = if endpoint.contains("r2.cloudflarestorage.com") {
-                "Cloudflare R2"
-            } else if endpoint.contains("localhost") || endpoint.contains("127.0.0.1") {
-                "MinIO/Local"
-            } else if endpoint.is_empty() {
-                "AWS S3"
-            } else {
-                "S3-compatible"
-            };
-            format!("{} ({}: s3://{}/{})", provider, bucket, bucket, prefix)
+    if let Some(bucket) = url.strip_prefix("s3://") {
+        let bucket_end = bucket.find('/').unwrap_or(bucket.len());
+        let bucket_name = &bucket[..bucket_end];
+        let prefix = &bucket[bucket_end..];
+        // Check if it's R2, MinIO, etc. from the endpoint param
+        let endpoint = url.split("endpoint=").nth(1).unwrap_or("");
+        let provider = if endpoint.contains("r2.cloudflarestorage.com") {
+            "Cloudflare R2"
+        } else if endpoint.contains("localhost") || endpoint.contains("127.0.0.1") {
+            "MinIO/Local"
+        } else if endpoint.is_empty() {
+            "AWS S3"
         } else {
-            format!("S3: {}", url)
-        }
+            "S3-compatible"
+        };
+        format!("{} ({}: s3://{}/{})", provider, bucket_name, bucket_name, prefix)
     } else {
         let path = std::path::Path::new(url);
         let abs = if path.is_absolute() {
@@ -694,7 +687,7 @@ fn cmd_ls(storage: &UnifiedStorage) {
 fn cmd_cat(storage: &UnifiedStorage, hash: &str) {
     let kernel = storage.kernel();
     match kernel.read_blob(hash) {
-        Ok(data) => { io::stdout().write_all(&data).unwrap(); return; }
+        Ok(data) => { io::stdout().write_all(&data).unwrap(); }
         Err(_) if hash.len() < 64 => {
             let matches = kernel.list_blobs_prefix(hash);
             if matches.len() == 1 {
@@ -711,7 +704,6 @@ fn cmd_cat(storage: &UnifiedStorage, hash: &str) {
     }
 }
 
-use std::fs;
 
 /// Garbage collect — analyze reachability and optionally delete dead blobs.
 fn cmd_gc(storage: &UnifiedStorage, compute_size: bool, dry_run: bool) {
@@ -1168,10 +1160,7 @@ fn read_rows_as_json(
     if let Some(w) = where_filter {
         if !w.trim().is_empty() {
             let predicates = parse_where_clause(w)?;
-            all_rows = all_rows
-                .into_iter()
-                .filter(|r| predicates.iter().all(|(c, op, v)| eval_predicate(r, c, op, v)))
-                .collect();
+            all_rows.retain(|r| predicates.iter().all(|(c, op, v)| eval_predicate(r, c, op, v)));
         }
     }
 
@@ -1236,7 +1225,7 @@ fn parse_where_clause(s: &str) -> Result<Vec<(String, String, JsonValue)>, Strin
             let prefix = &s[start..i];
             let single_q = prefix.matches('\'').count();
             let double_q = prefix.matches('"').count();
-            if single_q % 2 == 0 && double_q % 2 == 0 {
+            if single_q.is_multiple_of(2) && double_q.is_multiple_of(2) {
                 parts.push(&s[start..i]);
                 start = i + 5;
                 i = start;
@@ -1310,8 +1299,8 @@ fn is_inside_quotes(s: &str, idx: usize) -> bool {
     let bytes = s.as_bytes();
     let mut in_single = false;
     let mut in_double = false;
-    for i in 0..idx {
-        match bytes[i] {
+    for &b in &bytes[..idx] {
+        match b {
             b'\'' if !in_double => in_single = !in_single,
             b'"' if !in_single => in_double = !in_double,
             _ => {}
@@ -1607,7 +1596,7 @@ fn cmd_shell(storage: UnifiedStorage, exec: Option<String>) {
         }
 
         // Strip trailing CR/LF.
-        let line = line.trim_end_matches(|c: char| c == '\n' || c == '\r');
+        let line = line.trim_end_matches(['\n', '\r']);
         let trimmed = line.trim();
 
         // Skip empty lines (don't add to buffer or history).

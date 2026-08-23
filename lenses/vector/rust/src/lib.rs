@@ -31,7 +31,7 @@
 //   let results = lens.search("vectors", &[0.15, 0.25, 0.35], 5).unwrap();
 //   // → [(distance, id), ...]
 
-use pond_core::{TypedColumn, VT_FLOAT64, VT_INT64};
+use pond_core::{TypedColumn, VT_INT64};
 use pond_storage::UnifiedStorage;
 use pond_storage::write as storage_write;
 use pond_storage::manifest::CollectionManifest;
@@ -40,12 +40,18 @@ use std::sync::Mutex;
 
 /// VectorLens — vector storage with auto-accelerated ANN search.
 ///
+/// Buffer entry: (id, vector, metadata_json).
+type BufferEntry = (String, Vec<f64>, String);
+
+/// Buffer map: collection → list of buffered entries.
+type BufferMap = HashMap<String, Vec<BufferEntry>>;
+
 /// This lens stores vectors as PND2 columns (id + dim_0, dim_1, ... as FLOAT64).
 /// Search automatically uses HNSW → IVF → linear scan, whichever is available.
 pub struct VectorLens {
     storage: UnifiedStorage,
-    // Buffer: collection → Vec<(id, vector, metadata_json)>
-    buffer: Mutex<HashMap<String, Vec<(String, Vec<f64>, String)>>>,
+    /// Buffer: collection → Vec<(id, vector, metadata_json)>
+    buffer: Mutex<BufferMap>,
 }
 
 /// A search result: (distance, vector_id).
@@ -71,7 +77,7 @@ impl VectorLens {
     pub fn insert(&self, collection: &str, id: &str, vector: &[f64], metadata: Option<&str>) {
         let should_flush = {
             let mut buf = self.buffer.lock().unwrap();
-            let entry = buf.entry(collection.to_string()).or_insert_with(Vec::new);
+            let entry = buf.entry(collection.to_string()).or_default();
             entry.push((id.to_string(), vector.to_vec(), metadata.unwrap_or("{}").to_string()));
             entry.len() >= 10000
         };
@@ -251,9 +257,7 @@ impl VectorLens {
             // Find metadata column
             let meta_col = cols.iter().find(|c| c.name.to_string_lossy() == "metadata");
 
-            let n_rows = ids.len();
-            for i in 0..n_rows {
-                let id = &ids[i];
+            for (i, id) in ids.iter().enumerate() {
                 let vector: Vec<f64> = dim_cols.iter()
                     .filter_map(|c| c.f64_data.get(i).copied())
                     .collect();

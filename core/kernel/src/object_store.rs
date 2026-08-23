@@ -70,6 +70,44 @@ pub trait ObjectStore: Send + Sync {
     /// Check if a blob exists (for dedup checks).
     fn blob_exists(&self, hash: &str) -> bool;
 
+    /// Read a byte range `[start, end)` from a content-addressed blob.
+    ///
+    /// This is the **range-read primitive** that enables slab-style layout
+    /// optimizations: a reader fetches only the bytes it needs (e.g. a single
+    /// row group's PND2 bytes out of a 128 MB slab) instead of the full blob.
+    /// On object storage this maps to the HTTP `Range:` header — a single
+    /// round-trip returning a partial payload, billed at the smaller size.
+    ///
+    /// **Default impl**: full `get_blob` + slice. This works on every backend
+    /// (no layout improvement) — backends with native range support (local
+    /// FS `seek+read`, S3 `Range:` header) should override to avoid the
+    /// full-object fetch.
+    ///
+    /// **Half-open interval**: `end` is exclusive. To fetch bytes 0..1023 of
+    /// a 1 KB blob, call `get_blob_range(hash, 0, 1024)`. If `end` exceeds
+    /// the blob length, the result is truncated to the available bytes
+    /// (no error). If `start >= end` or `start >= blob_len`, returns empty.
+    ///
+    /// **Use cases**:
+    ///   - Slab tail fetch: `get_blob_range(slab_hash, len-12, len)`
+    ///   - Slab footer fetch: `get_blob_range(slab_hash, footer_off, len-12)`
+    ///   - Per-RG fetch: `get_blob_range(slab_hash, rg_off, rg_off+rg_len)`
+    fn get_blob_range(&self, hash: &str, start: u64, end: u64) -> io::Result<Vec<u8>> {
+        // Default: read the whole blob and slice. This is correct on every
+        // backend but offers no performance benefit — the whole point of
+        // overriding is to avoid fetching bytes outside [start, end).
+        let full = self.get_blob(hash)?;
+        let len = full.len() as u64;
+        if start >= len {
+            return Ok(Vec::new());
+        }
+        let end_clamped = end.min(len);
+        if start >= end_clamped {
+            return Ok(Vec::new());
+        }
+        Ok(full[start as usize..end_clamped as usize].to_vec())
+    }
+
     /// Physically delete a blob from the object store (maintenance operation).
     ///
     /// This is NOT a kernel primitive — it's a Layer 0.5 maintenance operation
@@ -251,6 +289,43 @@ impl ObjectStore for LocalFSObjectStore {
 
     fn blob_exists(&self, hash: &str) -> bool {
         self.blob_path(hash).exists()
+    }
+
+    fn get_blob_range(&self, hash: &str, start: u64, end: u64) -> io::Result<Vec<u8>> {
+        // Native range read: open the file, seek to `start`, read up to
+        // `end - start` bytes. This avoids loading the whole blob into
+        // memory — critical for large slabs (100 MB+) where the caller
+        // only needs a few KB (e.g. the 12-byte tail or a single RG).
+        use std::io::{Read, Seek, SeekFrom};
+        let path = self.blob_path(hash);
+        if !path.exists() {
+            return Err(io::Error::new(io::ErrorKind::NotFound,
+                format!("Blob '{}' not found", hash)));
+        }
+        let mut f = std::fs::File::open(&path)?;
+        // File size — clamp end to it (caller may request past EOF).
+        let file_len = f.metadata()?.len();
+        if start >= file_len {
+            return Ok(Vec::new());
+        }
+        let end_clamped = end.min(file_len);
+        if start >= end_clamped {
+            return Ok(Vec::new());
+        }
+        let len = (end_clamped - start) as usize;
+        f.seek(SeekFrom::Start(start))?;
+        let mut buf = vec![0u8; len];
+        // read_exact ensures we got all requested bytes; if the file is
+        // shorter than metadata reported (race condition), error out.
+        match f.read_exact(&mut buf) {
+            Ok(()) => {
+                let mut s = self.stats.lock().unwrap();
+                s.gets += 1;
+                s.bytes_read += buf.len() as u64;
+                Ok(buf)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn delete_blob(&self, hash: &str) -> io::Result<bool> {

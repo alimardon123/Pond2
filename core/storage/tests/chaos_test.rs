@@ -155,7 +155,7 @@ fn test_concurrent_branch_merge_consistency() {
 
     std::thread::scope(|s| {
         for (i, bn) in branch_names.iter().enumerate() {
-            let kernel = kernel;
+            let kernel = &*kernel;
             let bn = bn.clone();
             s.spawn(move || {
                 // Skew: each thread's HLC starts at a different "physical time"
@@ -241,7 +241,7 @@ fn test_concurrent_writes_no_corruption() {
 
     std::thread::scope(|s| {
         for t in 0..n_threads {
-            let kernel = kernel;
+            let kernel = &*kernel;
             s.spawn(move || {
                 let mut hlc = HLC::new();
                 for j in 0..rows_per_thread {

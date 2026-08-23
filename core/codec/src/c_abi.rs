@@ -6,6 +6,13 @@
 //
 // All heap allocations across the FFI boundary are explicitly owned by the
 // caller; every `*_free` function documents its contract.
+//
+// # Safety
+// All functions in this module accept raw pointers from C callers. The caller
+// must ensure pointers are valid, properly aligned, and (for strings)
+// null-terminated. Safety is the caller's responsibility.
+
+#![allow(clippy::missing_safety_doc, clippy::not_unsafe_ptr_arg_deref)]
 
 // `c_char` is used directly in many `*const c_char` signatures below. `CString`
 // and `ptr` are imported (per the crate's documented FFI surface) even when

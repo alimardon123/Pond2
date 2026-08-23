@@ -15,7 +15,7 @@ use crate::parser::{
     SqlStatement, TableRef,
 };
 use crate::where_clause::WhereExpr;
-use pond_core::{pnd2_decode, PondColumn, TypedColumn, VT_BINARY, VT_FLOAT64, VT_INT64, VT_NULL,
+use pond_core::{pnd2_decode, PondColumn, TypedColumn, VT_BINARY, VT_FLOAT64, VT_INT64,
                 VT_STRING, VT_VARIANT};
 use pond_kernel::crdt::{uuidv7, HLC};
 use pond_storage::shard;
@@ -260,7 +260,7 @@ fn project_rows(rows: &[JsonValue], items: &[SelectItem], legacy_cols: &[String]
     if only_star {
         return rows
             .iter()
-            .map(|r| strip_crdt_meta(r))
+            .map(strip_crdt_meta)
             .collect();
     }
 
@@ -399,7 +399,7 @@ fn apply_group_by(
             let group_rows = buckets.get(key).unwrap();
             let mut out = serde_json::Map::new();
             // Include the GROUP BY columns.
-            for (_i, g) in groups.iter().enumerate() {
+            for g in groups.iter() {
                 if let Some(v) = group_rows.first().and_then(|r| lookup_col(r, g)) {
                     out.insert(g.clone(), v);
                 }
@@ -462,10 +462,8 @@ fn collect_aggregate_refs_inner(expr: &WhereExpr, out: &mut Vec<String>) {
         | WhereExpr::In { col, .. }
         | WhereExpr::Like { col, .. }
         | WhereExpr::IsNull { col, .. } => {
-            if is_aggregate_name(col) {
-                if !out.iter().any(|s| s == col) {
-                    out.push(col.clone());
-                }
+            if is_aggregate_name(col) && !out.iter().any(|s| s == col) {
+                out.push(col.clone());
             }
         }
     }
@@ -813,7 +811,7 @@ fn read_file_rows(path: &str) -> Result<Vec<JsonValue>, String> {
             return Err("CSV file is empty".to_string());
         }
 
-        let headers: Vec<String> = records[0].iter().cloned().collect();
+        let headers: Vec<String> = records[0].to_vec();
 
         for record in records.iter().skip(1) {
             if record.is_empty() { continue; }
@@ -859,7 +857,7 @@ fn read_file_rows(path: &str) -> Result<Vec<JsonValue>, String> {
 ///   - Utf8 / LargeUtf8
 ///   - Date32 / Date64            (rendered as ISO 8601 date strings)
 ///   - Timestamp(Second | Millisecond | Microsecond | Nanosecond, _)
-///                                 (rendered as ISO 8601 datetime strings)
+///     (rendered as ISO 8601 datetime strings)
 ///   - Null
 ///
 /// Null cells (regardless of the underlying type) are returned as
@@ -1153,7 +1151,7 @@ fn decode_cols_to_rows(cols: &[PondColumn], key_fields: &[String]) -> Vec<(Strin
                         serde_json::from_str::<JsonValue>(&s_str).ok()
                     })
                     .unwrap_or(JsonValue::Null),
-                VT_NULL | _ => JsonValue::Null,
+                _ => JsonValue::Null,
             };
             row_obj.insert(name, val);
         }

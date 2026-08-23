@@ -38,6 +38,8 @@
 
 use pond_kernel::PondKernel;
 use pond_storage::manifest::CollectionManifest;
+// std::collections::HashMap is available for future use
+#[allow(unused_imports)]
 use std::collections::HashMap;
 
 const PIVF_MAGIC: &[u8; 4] = b"PIVF";
@@ -330,8 +332,8 @@ impl<'a> IVFIndex<'a> {
         // Per-cluster data
         for c in 0..n_clusters {
             // Centroid
-            for d in 0..n_dims {
-                buf.extend_from_slice(&centroids[c][d].to_le_bytes());
+            for val in &centroids[c] {
+                buf.extend_from_slice(&val.to_le_bytes());
             }
 
             // n_assigned
@@ -490,8 +492,8 @@ fn kmeans(vectors: &[Vec<f64>], n_clusters: usize, n_dims: usize) -> Vec<Vec<f64
 
         for c in 0..n_clusters {
             if counts[c] > 0 {
-                for d in 0..n_dims {
-                    new_centroids[c][d] /= counts[c] as f64;
+                for val in &mut new_centroids[c] {
+                    *val /= counts[c] as f64;
                 }
             } else {
                 // Empty cluster — keep old centroid

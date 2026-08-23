@@ -424,7 +424,7 @@ impl S3ObjectStore {
             headers.push((k.clone(), v.clone()));
         }
         // Sort headers by lowercase name (required by SigV4)
-        headers.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        headers.sort_by_key(|h| h.0.to_lowercase());
 
         let canonical_request = build_canonical_request(
             method,
@@ -521,13 +521,12 @@ impl S3ObjectStore {
                 ureq::Error::Status(code, resp) => {
                     let status_text = resp.status_text().to_string();
                     let body = resp.into_string().unwrap_or_default();
-                    io::Error::new(
-                        io::ErrorKind::Other,
+                    io::Error::other(
                         format!("S3 returned {}: {} — {}", code, status_text, body),
                     )
                 }
                 ureq::Error::Transport(t) => {
-                    io::Error::new(io::ErrorKind::Other, format!("transport error: {}", t))
+                    io::Error::other(format!("transport error: {}", t))
                 }
             }
         })
@@ -578,7 +577,7 @@ impl S3ObjectStore {
         }
 
         req.send().await.map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("reqwest transport error: {}", e))
+            io::Error::other( format!("reqwest transport error: {}", e))
         })
         // Note: reqwest::Response doesn't error on 4xx/5xx by default —
         // callers must check .status() themselves. The sync path returns
@@ -622,11 +621,81 @@ impl ObjectStore for S3ObjectStore {
         let mut body = Vec::new();
         resp.into_reader()
             .read_to_end(&mut body)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         let mut s = self.stats.lock().unwrap();
         s.gets += 1;
         s.bytes_read += body.len() as u64;
         Ok(body)
+    }
+
+    /// Native S3 range read — uses the HTTP `Range:` header.
+    ///
+    /// `start` and `end` are the half-open interval `[start, end)`. S3's
+    /// Range header uses INCLUSIVE end (e.g. `bytes=0-1023` returns 1024
+    /// bytes), so we convert: `bytes={start}-{end-1}`. If `end == 0`
+    /// (caller asked for empty range), we return an empty Vec without a
+    /// round-trip.
+    ///
+    /// S3 returns `206 Partial Content` for valid ranges, `200 OK` for
+    /// malformed ranges (returning the full object), and `416 Range Not
+    /// Satisfiable` for ranges entirely outside the object. We handle all
+    /// three: 206 is the normal success path; 200 means S3 ignored the
+    /// Range header (rare — usually a misconfigured proxy) — we slice
+    /// client-side as a fallback; 416 is treated as NotFound for empty
+    /// ranges or propagated for genuinely invalid ranges.
+    fn get_blob_range(&self, hash: &str, start: u64, end: u64) -> io::Result<Vec<u8>> {
+        if start >= end {
+            return Ok(Vec::new());
+        }
+        // S3 Range end is inclusive: bytes=0-1023 returns bytes 0..=1023 (1024 bytes).
+        // Our API uses half-open [start, end), so end_inclusive = end - 1.
+        // saturating_sub guards against end == 0 (handled above, but defensive).
+        let end_inclusive = end.saturating_sub(1);
+        let range_value = format!("bytes={}-{}", start, end_inclusive);
+
+        let key = self.blob_key(hash);
+        let resp = self.s3_request("GET", &key, None, None,
+            &[("Range".to_string(), range_value)])?;
+
+        // Check status: 206 = Partial Content (success), 200 = full object
+        // (S3 ignored Range — slice client-side), 416 = unsatisfiable range.
+        let status = resp.status();
+        let mut body = Vec::new();
+        resp.into_reader()
+            .read_to_end(&mut body)
+            .map_err(io::Error::other)?;
+
+        if status == 206 {
+            // Normal success — body is exactly the requested range.
+            let mut s = self.stats.lock().unwrap();
+            s.gets += 1;
+            s.bytes_read += body.len() as u64;
+            Ok(body)
+        } else if status == 200 {
+            // S3 returned the full object (Range header was ignored).
+            // Slice client-side to honor the caller's request.
+            let len = body.len() as u64;
+            if start >= len {
+                return Ok(Vec::new());
+            }
+            let end_clamped = end.min(len);
+            if start >= end_clamped {
+                return Ok(Vec::new());
+            }
+            let sliced = body[start as usize..end_clamped as usize].to_vec();
+            let mut s = self.stats.lock().unwrap();
+            s.gets += 1;
+            s.bytes_read += sliced.len() as u64;
+            Ok(sliced)
+        } else if status == 416 {
+            // Range not satisfiable — caller asked for bytes past EOF.
+            // Treat as empty (matches the LocalFS behavior).
+            Ok(Vec::new())
+        } else {
+            Err(io::Error::other(format!(
+                "S3 get_blob_range returned unexpected status {}", status
+            )))
+        }
     }
 
     fn put_blob_batch(&self, items: &[Vec<u8>]) -> io::Result<Vec<String>> {
@@ -672,17 +741,13 @@ impl ObjectStore for S3ObjectStore {
                     .collect();
 
                 threads.into_iter()
-                    .map(|t| t.join().unwrap_or_else(|_| Some(io::Error::new(
-                        io::ErrorKind::Other, "thread panicked"
-                    ))))
+                    .map(|t| t.join().unwrap_or_else(|_| Some(io::Error::other("thread panicked"))))
                     .collect()
             });
 
             // Return the first error if any
-            for e in errors {
-                if let Some(e) = e {
-                    return Err(e);
-                }
+            if let Some(e) = errors.into_iter().flatten().next() {
+                return Err(e);
             }
         }
 
@@ -728,7 +793,7 @@ impl ObjectStore for S3ObjectStore {
                                     let mut body = Vec::new();
                                     match resp.into_reader().read_to_end(&mut body) {
                                         Ok(_) => Ok((global_idx, body)),
-                                        Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+                                        Err(e) => Err(io::Error::other( e)),
                                     }
                                 }
                                 Err(e) => Err(e),
@@ -738,9 +803,7 @@ impl ObjectStore for S3ObjectStore {
                     .collect();
 
                 threads.into_iter()
-                    .map(|t| t.join().unwrap_or_else(|_| Err(io::Error::new(
-                        io::ErrorKind::Other, "thread panicked"
-                    ))))
+                    .map(|t| t.join().unwrap_or_else(|_| Err(io::Error::other("thread panicked"))))
                     .collect()
             });
 
@@ -765,8 +828,7 @@ impl ObjectStore for S3ObjectStore {
         let mut results = Vec::with_capacity(n);
         let mut total_bytes: u64 = 0;
         for opt in slot_map {
-            let body = opt.ok_or_else(|| io::Error::new(
-                io::ErrorKind::Other,
+            let body = opt.ok_or_else(|| io::Error::other(
                 "missing result from parallel batch (should not happen)"
             ))?;
             total_bytes += body.len() as u64;
@@ -834,7 +896,7 @@ impl ObjectStore for S3ObjectStore {
 
             let resp = self.s3_request("GET", "", Some(&query), None, &[])?;
             let body = resp.into_string()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
 
             // Simple XML extraction: find all <Key>...</Key> values.
             // S3 ListObjectsV2 XML wraps keys in <Contents><Key>...</Key></Contents>.
@@ -960,8 +1022,7 @@ impl S3ObjectStore {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("S3 returned {}: {}", status, body),
             ));
         }
@@ -984,13 +1045,12 @@ impl S3ObjectStore {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("S3 returned {}: {}", status, body),
             ));
         }
         let body = resp.bytes().await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("read body: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("read body: {}", e)))?;
         let body = body.to_vec();
         let mut s = self.stats.lock().unwrap();
         s.gets += 1;
@@ -1009,8 +1069,7 @@ impl S3ObjectStore {
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("S3 returned {}: {}", status, body),
             ));
         }
@@ -1092,8 +1151,7 @@ impl S3ObjectStore {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("S3 returned {}: {}", status, body),
             ));
         }
@@ -1232,6 +1290,10 @@ use std::ffi::{c_char, CStr};
 ///
 /// The returned pointer can be passed to `pond_kernel_new_with_store()` (in pond_kernel's
 /// C ABI) to create a kernel backed by S3.
+//
+// # Safety
+// Caller must ensure `url` is a valid, null-terminated C string.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
 pub extern "C" fn pond_s3_store_new(url: *const c_char) -> *mut std::ffi::c_void {
     if url.is_null() {
@@ -1272,6 +1334,10 @@ pub extern "C" fn pond_s3_store_free(store: *mut std::ffi::c_void) {
 /// This is the S3 equivalent of `pond_storage_new()` — it produces the same
 /// handle type, just backed by S3 instead of local FS. Link against
 /// `libpond_s3.a` (in addition to `libpond_storage.a`) to use this.
+///
+/// # Safety
+/// Caller must ensure `url` is a valid, null-terminated C string.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 #[no_mangle]
 pub extern "C" fn pond_storage_new_s3(url: *const c_char) -> *mut pond_storage::PondStorageHandle {
     if url.is_null() {

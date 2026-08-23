@@ -291,7 +291,7 @@ fn decode_raw_string_or_binary(data: &[u8], vtype: u8, n_rows: usize) -> PondCol
     // Bitmap layout: bitmap_size = ceil(n_rows/8) bytes, then length-prefixed
     // values for non-null rows. Bitmap bit=1 means null (Arrow convention).
     if vals.len() < n_rows {
-        let bitmap_size = (n_rows + 7) / 8;
+        let bitmap_size = n_rows.div_ceil(8);
         if data.len() > bitmap_size {
             let bitmap = &data[..bitmap_size];
             let vals_data = &data[bitmap_size..];

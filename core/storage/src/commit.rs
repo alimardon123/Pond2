@@ -68,7 +68,7 @@ impl Commit {
 ///   4. Update the active branch's manifest ref
 pub fn write_commit(
     kernel: &PondKernel,
-    collection: &str,
+    _collection: &str,
     manifest_hash: &str,
     parent: Option<&str>,
     second_parent: Option<&str>,

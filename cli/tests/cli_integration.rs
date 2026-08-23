@@ -244,8 +244,7 @@ fn test_auto_discovery_from_subdir() {
     fs::create_dir_all(&subdir).unwrap();
 
     let mut cmd = Command::new(POND_BIN);
-    cmd.current_dir(&subdir).args(&["read", "users"]);
-    let output = cmd.output().unwrap();
+    let output = cmd.current_dir(&subdir).args(["read", "users"]).output().unwrap();
     assert!(output.status.success(),
         "auto-discovery failed: {}", String::from_utf8_lossy(&output.stderr));
     let out = String::from_utf8_lossy(&output.stdout);
@@ -253,8 +252,7 @@ fn test_auto_discovery_from_subdir() {
 
     // Also test `ls` from the subdirectory
     let mut cmd = Command::new(POND_BIN);
-    cmd.current_dir(&subdir).args(&["ls"]);
-    let output = cmd.output().unwrap();
+    let output = cmd.current_dir(&subdir).args(["ls"]).output().unwrap();
     assert!(output.status.success());
     let out = String::from_utf8_lossy(&output.stdout);
     assert!(out.contains("users"), "expected 'users' in ls output, got: {}", out);

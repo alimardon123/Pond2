@@ -7,7 +7,7 @@
 // Merge: O(conflicting) — identifies conflicting row groups, applies row-level
 //        CRDT merge only on those, writes a merge commit with two parents
 
-use crate::commit::{self, Commit};
+use crate::commit;
 use crate::manifest::CollectionManifest;
 use crate::{branch_ref, manifest_ref};
 use pond_kernel::PondKernel;

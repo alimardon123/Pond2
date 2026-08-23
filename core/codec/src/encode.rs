@@ -12,6 +12,9 @@
 
 use crate::constants::*;
 
+/// Type alias for an encoded column: (encoding, payload, optional min/max stats).
+type EncodedCol = (u8, Vec<u8>, Option<(i64, i64)>);
+
 /// Encode an array of f64 values into an uncompressed PND2 blob.
 ///
 /// Schema: 1 column named "v", type FLOAT64, encoding RAW, with stats.
@@ -287,7 +290,7 @@ pub fn encode_bitpack_i64(values: &[i64]) -> Vec<u8> {
     // Pack values
     let n_rows = values.len();
     let total_bits = n_rows * bitwidth as usize;
-    let n_bytes = (total_bits + 7) / 8;
+    let n_bytes = total_bits.div_ceil(8);
     let mut packed = vec![0u8; n_bytes];
 
     let mut bit_pos = 0usize;
@@ -369,7 +372,7 @@ pub fn encode_dict_i64(values: &[i64]) -> Vec<u8> {
     payload.push(code_bitwidth);
 
     let total_bits = codes.len() * code_bitwidth as usize;
-    let n_code_bytes = (total_bits + 7) / 8;
+    let n_code_bytes = total_bits.div_ceil(8);
     let mut packed_codes = vec![0u8; n_code_bytes];
 
     let mut bit_pos = 0usize;
@@ -454,7 +457,7 @@ pub fn encode_i64_auto(values: &[i64]) -> (u8, Vec<u8>) {
     let vmin = *values.iter().min().unwrap();
     let vmax = *values.iter().max().unwrap();
     let range = vmax - vmin;
-    if range >= 0 && range < (1i64 << 16) {
+    if (0..(1i64 << 16)).contains(&range) {
         return (ENC_BITPACK, encode_bitpack_i64(values));
     }
 
@@ -565,10 +568,14 @@ impl TypedColumn {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn encode_payload(&self) -> Vec<u8> {
         match self {
             TypedColumn::Int64(v) => {
-                let (enc, payload) = encode_i64_auto(v);
+                let (_enc, payload) = encode_i64_auto(v);
                 payload
             }
             TypedColumn::Float64(v) => encode_raw_f64_payload(v),
@@ -715,7 +722,7 @@ pub fn pnd2_encode_i64_auto(columns: &[(&str, &[i64])]) -> Vec<u8> {
     let mut inner = Vec::new();
 
     // Phase 1: Write ALL schemas (name_len + name + vtype + enc per column)
-    let mut encoded_cols: Vec<(u8, Vec<u8>, Option<(i64, i64)>)> = Vec::new();
+    let mut encoded_cols: Vec<EncodedCol> = Vec::new();
     for (name, values) in columns {
         let name_bytes = name.as_bytes();
         let (enc, payload) = encode_i64_auto(values);

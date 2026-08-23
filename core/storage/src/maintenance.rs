@@ -214,7 +214,6 @@ mod tests {
 //   - compute_size=False by default: skip reading dead blobs to compute size
 //   - Content-addressed: shared blobs are NEVER deleted (they're in live set)
 
-use pond_kernel::ObjectStore;
 use std::collections::HashSet;
 
 /// GC statistics (returned by collect()).
@@ -310,7 +309,7 @@ impl<'a> GarbageCollector<'a> {
     pub fn vacuum(
         &self,
         collections: Option<&[String]>,
-        preserve_days: u32,
+        _preserve_days: u32,
         dry_run: bool,
     ) -> VacuumResult {
         let live_set = self.build_live_set(collections.map(|v| v.to_vec()));

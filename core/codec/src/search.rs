@@ -398,6 +398,7 @@ fn row_column_text(row: &JsonValue, column: &str) -> String {
 ///
 /// If BOTH `vector_column` and `text_columns` are empty/None, returns an
 /// empty list (no modality to search).
+#[allow(clippy::too_many_arguments)]
 pub fn hybrid_search(
     rows: &[JsonValue],
     vector_column: &str,
@@ -409,6 +410,7 @@ pub fn hybrid_search(
     k: usize,
     metric: &str,
 ) -> Vec<SearchHit> {
+
     if k == 0 || rows.is_empty() {
         return Vec::new();
     }
@@ -421,7 +423,7 @@ pub fn hybrid_search(
 
     // Apply the optional WHERE filter up-front.
     let filtered: Vec<(usize, &JsonValue)> = match where_expr {
-        Some(f) => rows.iter().enumerate().filter(|(_, r)| f(*r)).collect(),
+        Some(f) => rows.iter().enumerate().filter(|(_, r)| f(r)).collect(),
         None => rows.iter().enumerate().collect(),
     };
     if filtered.is_empty() {

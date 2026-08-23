@@ -21,20 +21,17 @@
 //   Optional: bloom_filter_ref (u32 LE length + string)
 //   Optional: parent_manifest (u32 LE length + string)
 
-use std::io::{self, Read, Write};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 const PMAN_MAGIC: &[u8] = b"PMAN";
 const PMAN_VERSION: u8 = 1;
 
 // Value types (match pond_core)
 const VT_INT64: u8 = 1;
 const VT_FLOAT64: u8 = 2;
+#[allow(dead_code)]
 const VT_STRING: u8 = 3;
+#[allow(dead_code)]
 const VT_NULL: u8 = 4;
+#[allow(dead_code)]
 const VT_BINARY: u8 = 5;
 
 // ---------------------------------------------------------------------------

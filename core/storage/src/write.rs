@@ -11,7 +11,7 @@
 use crate::commit;
 use crate::manifest::{CollectionManifest, ColumnStatsEntry, RowGroupEntry};
 use crate::{branch_ref, manifest_ref};
-use pond_core::{pnd2_encode_multi, pnd2_encode_i64_auto, pnd2_encode_multi_typed, EncodeMultiColumn, TypedColumn, VT_INT64, VT_FLOAT64, VT_STRING, VT_BINARY};
+use pond_core::{pnd2_encode_i64_auto, pnd2_encode_multi_typed, TypedColumn, VT_INT64};
 use pond_kernel::PondKernel;
 
 /// Write raw bytes to a collection. Creates a new commit on the active branch.

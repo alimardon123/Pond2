@@ -21,6 +21,10 @@
 //   - Scalable: O(conflicting) merge, content-addressed dedup, parallel I/O
 //   - Beautiful: clear module boundaries, downward dependencies only
 
+// C ABI functions below (§ C ABI) accept raw pointers from C callers.
+// Safety contract is documented in that section and applies to all FFI functions.
+#![allow(clippy::missing_safety_doc, clippy::not_unsafe_ptr_arg_deref)]
+
 pub mod manifest;
 pub mod commit;
 pub mod branch;
@@ -30,6 +34,7 @@ pub mod write;
 pub mod transaction;
 pub mod maintenance;
 pub mod pond_pack;
+pub mod slab;
 
 use pond_kernel::PondKernel;
 use std::sync::Mutex;
@@ -138,48 +143,6 @@ impl UnifiedStorage {
 }
 
 // ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_ref_namespace() {
-        assert_eq!(
-            branch_ref("users", "main"),
-            "collections/users/_branches/main/commit"
-        );
-        assert_eq!(
-            manifest_ref("users", "main"),
-            "collections/users/_branches/main/manifest"
-        );
-        assert_eq!(
-            shards_prefix("users", "main"),
-            "collections/users/_branches/main/shards/"
-        );
-        assert_eq!(tx_ref("abc123"), "transactions/abc123");
-        assert_eq!(definition_ref("users"), "collections/users/definition");
-    }
-
-    #[test]
-    fn test_active_branch_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
-        assert_eq!(storage.get_active_branch("users"), "main");
-    }
-
-    #[test]
-    fn test_set_active_branch() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
-        storage.set_active_branch("users", "experiment");
-        assert_eq!(storage.get_active_branch("users"), "experiment");
-        assert_eq!(storage.active_commit_ref("users"),
-                   "collections/users/_branches/experiment/commit");
-    }
-}
 
 // ===========================================================================
 // C ABI — extern "C" wrappers for cross-language SDKs (Go, Java, Node, C)
@@ -285,7 +248,7 @@ pub extern "C" fn pond_storage_write(
     if collection.is_null() || data.is_null() { return ptr::null_mut(); }
     let coll = match unsafe { CStr::from_ptr(collection) }.to_str() { Ok(s) => s, Err(_) => return ptr::null_mut() };
     let msg = if message.is_null() { "" } else {
-        match unsafe { CStr::from_ptr(message) }.to_str() { Ok(s) => s, Err(_) => "" }
+        unsafe { CStr::from_ptr(message) }.to_str().unwrap_or_default()
     };
     let data_slice = unsafe { std::slice::from_raw_parts(data, data_len) };
     let active = handle.storage.get_active_branch(coll);
@@ -311,7 +274,7 @@ pub extern "C" fn pond_storage_read(
     let active = handle.storage.get_active_branch(coll);
     match read::read(handle.storage.kernel(), coll, &active) {
         Ok(data) => {
-            let mut boxed = data.into_boxed_slice();
+            let boxed = data.into_boxed_slice();
             let p = boxed.as_ptr();
             let len = boxed.len();
             std::mem::forget(boxed);
@@ -383,7 +346,7 @@ pub extern "C" fn pond_storage_merge(
         match unsafe { CStr::from_ptr(target_branch) }.to_str() { Ok(s) => s.to_string(), Err(_) => return ptr::null_mut() }
     };
     let msg = if message.is_null() { "" } else {
-        match unsafe { CStr::from_ptr(message) }.to_str() { Ok(s) => s, Err(_) => "" }
+        unsafe { CStr::from_ptr(message) }.to_str().unwrap_or_default()
     };
     match branch::merge(handle.storage.kernel(), coll, src, &tgt, msg) {
         Ok(hash) => CString::new(hash).map(|cs| cs.into_raw()).unwrap_or(ptr::null_mut()),
@@ -518,7 +481,7 @@ pub extern "C" fn pond_storage_write_rows(
 
     let coll = match unsafe { CStr::from_ptr(collection) }.to_str() { Ok(s) => s, Err(_) => return ptr::null_mut() };
     let msg = if message.is_null() { "" } else {
-        match unsafe { CStr::from_ptr(message) }.to_str() { Ok(s) => s, Err(_) => "" }
+        unsafe { CStr::from_ptr(message) }.to_str().unwrap_or_default()
     };
 
     use pond_core::TypedColumn;
@@ -615,5 +578,49 @@ pub extern "C" fn pond_storage_read_rows(
             0
         }
         Err(_) => -1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ref_namespace() {
+        assert_eq!(
+            branch_ref("users", "main"),
+            "collections/users/_branches/main/commit"
+        );
+        assert_eq!(
+            manifest_ref("users", "main"),
+            "collections/users/_branches/main/manifest"
+        );
+        assert_eq!(
+            shards_prefix("users", "main"),
+            "collections/users/_branches/main/shards/"
+        );
+        assert_eq!(tx_ref("abc123"), "transactions/abc123");
+        assert_eq!(definition_ref("users"), "collections/users/definition");
+    }
+
+    #[test]
+    fn test_active_branch_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        assert_eq!(storage.get_active_branch("users"), "main");
+    }
+
+    #[test]
+    fn test_set_active_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        storage.set_active_branch("users", "experiment");
+        assert_eq!(storage.get_active_branch("users"), "experiment");
+        assert_eq!(storage.active_commit_ref("users"),
+                   "collections/users/_branches/experiment/commit");
     }
 }

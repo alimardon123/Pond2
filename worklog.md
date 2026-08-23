@@ -6062,3 +6062,486 @@ TEST RESULTS:
 Known issue: columnar conversion in read_rows doesn't pad missing values with None
 when merged rows have different key sets. This causes KeyError for some columns.
 Fix: pad missing values with None in the columnar conversion loop.
+
+---
+Task ID: arch-review-20260823-1051
+Agent: architecture-review-subagent
+Task: Deep object-store layout review (no cache reliance, PB scale, all 5 lenses)
+
+User directive (PIVOT):
+  "Don't rely on local cache solely. Focus on improving the storage layout
+   in object store to deliver fast reads/writes with the least amount of
+   storage interaction performantly at PB scale and at any workload/structure
+   type. So that even without cache it should be better than others."
+
+Work Log:
+- Read prior worklog tail (my-project Task 0-m, cron-20260823-0751 which
+  landed CachingObjectStore at commit 69b7c7c). Confirmed: cache is now a
+  BONUS, not the foundation. The next cycle must improve the LAYOUT itself.
+- Studied in depth (with line numbers):
+  * core/kernel/src/lib.rs                  — PondKernel (3 primitives)
+  * core/kernel/src/object_store.rs:30-82    — ObjectStore trait (NO range-read!)
+  * core/storage/src/lib.rs:84-142           — UnifiedStorage facade
+  * core/storage/src/manifest.rs:178-238    — PMAN encode (FLAT, inline RGs)
+  * core/storage/src/manifest.rs:241-350     — PMAN decode (linear scan)
+  * core/storage/src/pond_pack.rs:1-150      — PNPK v2 (commit+manifest+inline)
+  * core/storage/src/write.rs:85-162         — write_rows_i64 (1 RG per write)
+  * core/storage/src/write.rs:305-397        — write_rows (REPLACES, not appends)
+  * core/storage/src/read.rs:15-45           — read() BUG: row_groups.first() only
+  * core/storage/src/read.rs:203-301         — read_rows_i64 (N GETs, sequential)
+  * core/storage/src/shard.rs:27-64          — each shard = 1 blob + 1 ref (N+1 RTTs)
+  * core/s3/src/lib.rs:606-691               — S3 PUT/GET (no Range header, no multipart)
+  * core/cache/src/lib.rs                    — CachingObjectStore (DO NOT rely on)
+  * lenses/lakehouse/rust/src/lib.rs:96-149  — insert() read-merge-write O(N) rewrite
+  * lenses/keyvalue/rust/src/lib.rs:91-148   — commit() read-merge-write O(N) rewrite
+  * core/arrow/src/lib.rs:42-103             — PND2→Arrow (zero-copy numeric)
+
+Competitor analysis (concrete layout tricks):
+
+1. StalixDB (claims 2-3x faster than DuckDB on S3):
+   - Per-file column statistics in a SIDE-CAR index (not inline)
+   - Async prefetch of next row group during current decode
+   - Predicate pushdown at file-scan granularity
+   - Pond2 gap: Pond2 reads stats only after fetching the manifest blob.
+     StalixDB can prune WITHOUT fetching the manifest — the index is a
+     separate, smaller object. Pond2's manifest = 1 GET before any pruning.
+
+2. DuckDB-on-S3 (Parquet):
+   - 1 Parquet file = many row groups, all in ONE S3 object
+   - Footer-first read: 1 Range GET (last few KB) → row group offsets
+   - Per-RG: 1 Range GET for column chunks (column pruning + range)
+   - Read amplification: 1 + N_ranges GETs, where N is selective row groups
+   - Typical 1% query on 1TB Parquet: ~10-20 Range GETs, parallel = 1-2 RTTs
+   - Pond2 gap: 1 blob PER row group (manifest.rs:201-203). 1% query on
+     1TB = 100 row groups × 1 sequential GET each = 100 RTTs = ~5 seconds.
+
+3. Databricks Delta Lake + Liquid Clustering:
+   - Delta log: transaction log as append-only JSON (similar to Pond2 commits)
+   - Z-Ordering / Liquid Clustering: Hilbert curve on multi-col sort keys
+   - Photon runtime: vectorized execution + async I/O pipeline
+   - Pond2 gap: No multi-column sort. Row groups are in INSERTION order.
+     Multi-column range queries (e.g., date AND user_id) hit ALL row groups.
+
+4. Apache Iceberg:
+   - Manifest TREE: root → manifest-list → manifest → data files
+   - Each level has partition stats + file counts for pruning
+   - At PB scale, root manifest is ~1MB; tree depth = O(log N)
+   - Snapshot isolation via snapshot ID + manifest pointers
+   - Pond2 gap: PMAN is FLAT (manifest.rs:196 — n_row_groups inline).
+     At 1PB / 128MB RG = 8.4M RGs × ~80B per entry = 670MB manifest.
+     ONE GET to read 670MB is impossible at PB scale.
+
+5. Apache Hudi (MoR — Merge-on-Read):
+   - Base file (Parquet) + log files (avro-encoded deltas)
+   - Log files have an INDEX (bloom filter + key range) for point lookups
+   - Compaction merges log files into a new base file asynchronously
+   - Pond2 gap: Shards (shard.rs:27-44) are JSON arrays with no index.
+     list_shards (shard.rs:49-64) = N+1 round-trips (1 list + N resolve).
+     Point lookup on a shard = full scan. Hudi's log file = O(1) via index.
+
+Top 7 ranked layout-level changes (NOT cache, NOT algorithm-only):
+
+  #  Change                        Impact  Complex  Coverage        PB risk
+  -- ----------------------------  ------  -------  --------------  ---------
+  1  PSLB Slab format + Range-Read CRITICAL M       ALL 5 lenses    Manifest
+     (N row groups in 1 object,    (1→k/N                                stays
+      byte-range fetch per RG)      GETs saved)                          small
+  2  Two-level manifest tree       CRITICAL L       Lakehouse/OLTP  Root must
+     (root → leaves, O(log N))     (670MB→1MB)                          shard by
+                                                                        partition
+  3  Append-only WAL slab + auto   HIGH    M       OLTP/Streaming  WAL must
+     compaction (Hudi MoR pattern)  (O(N)→O(1)                          rotate
+                                     insert)
+  4  Inline small row groups in    HIGH    S       KV/Streaming     PNPK v3
+     PondPack (skip blob fetch)     (1→0 GETs                          flag bit
+                                     for small)
+  5  Bloom filter per slab +       HIGH    M       KV/OLTP          Filter
+     union at manifest level        (point lookup                          grows
+                                     prune)                                with N
+  6  Z-Order / Hilbert clustering  MEDIUM  L       Lakehouse/Vector Need sort
+     on sort keys                   (multi-col                            + rewrite
+                                     range prune)
+  7  Multipart upload for >5GB     MEDIUM  S       All (PB files)  S3 5GB
+     slabs + LZ4 hot / ZSTD cold    (enables                              hard limit
+                                     10GB+ slabs)
+
+Detailed justifications (top 3):
+
+#1 PSLB Slab format + Range-Read:
+  - Current: write.rs:137-142 creates 1 blob per row group. read.rs:272
+    fetches each separately. 1000 RGs = 1000 sequential S3 GETs.
+  - Proposed: ONE slab object packs N row groups + a footer index.
+    Read = 1 Range GET (footer, last 4KB) + K Range GETs (matching RGs).
+    With 32-way parallelism: K/32 RTTs. For K=100 pruned RGs: ~3 RTTs.
+  - Math: 1TB table, 1% selective query, 128MB RGs.
+    * Pond2 today: 1 GET manifest + 78 GETs sequential = 78 × 50ms = 3.9s
+    * Pond2 + slabs: 1 GET footer + 78 range GETs parallel (32-way) = 3 × 50ms = 150ms
+    * DuckDB-on-S3 baseline: ~150ms (same pattern, same RTT)
+    * Result: MATCHES DuckDB without cache. Beats current Pond2 by 26x.
+  - PB scale (1PB / 128MB = 8.4M RGs): slab of 1024 RGs each = 8K slabs.
+    Manifest references 8K slabs (not 8.4M RGs). Manifest = 8K × 80B = 640KB. Feasible.
+
+#2 Two-level manifest tree:
+  - At 1PB with 128MB row groups: 8.4M RGs. Even with slabs of 1024 RGs,
+    leaf manifests total 8K × ~80KB = 640MB if flat. Need a tree.
+  - Root manifest = 1KB (lists leaf manifest hashes + their key ranges).
+    Leaf manifest = 80KB (lists 1024 RGs in 1 slab).
+  - Read = 1 GET root (1KB) + 1 GET leaf (80KB) + K Range GETs into slab.
+  - PB scale root lookup is O(log N) instead of O(N).
+
+#3 Append-only WAL slab + auto compaction (Hudi MoR):
+  - LakehouseLens.insert() at lakehouse/rust/src/lib.rs:96-149 is O(N):
+    reads entire table, merges in memory, writes back as 1 RG.
+  - At PB scale, inserting 1 row = rewriting 1PB. UNACCEPTABLE.
+  - Proposed: writes go to an append-only WAL slab (1 PUT, O(1)).
+    Reader merges base slab + WAL slabs (like Hudi MoR).
+    Background compaction folds WAL into base (like Hudi compaction).
+  - Reuses the existing shard mechanism (shard.rs) but:
+    * Encodes shards as PND2 (columnar, not JSON) — enables pruning
+    * Adds a per-shard bloom filter for point lookups
+    * Auto-compacts when WAL depth > threshold (Hudi pattern)
+
+#1 RECOMMENDATION FOR THIS CYCLE (30-min budget):
+
+  Implement the PSLB (Pond Slab) format module + ObjectStore::get_blob_range
+  trait method + S3/LocalFS impls + unit tests. This is the FOUNDATION that
+  all other PB-scale optimizations depend on. The read-path integration
+  (using slabs in read_rows_i64) is the NEXT cycle.
+
+  Files to create/modify:
+    NEW   /home/z/Pond-review/core/storage/src/slab.rs         (~180 lines)
+    EDIT  /home/z/Pond-review/core/kernel/src/object_store.rs  (~25 lines added)
+    EDIT  /home/z/Pond-review/core/s3/src/lib.rs               (~25 lines added)
+    EDIT  /home/z/Pond-review/core/storage/src/lib.rs          (~3 lines: pub mod slab)
+    EDIT  /home/z/Pond-review/core/storage/Cargo.toml           (no new deps)
+
+  PSLB v1 format (concrete byte layout):
+    Offset  Size  Field
+    0       4     Magic: "PSLB"
+    4       1     Version: 1
+    5       1     Flags: bit 0 = has_footer_index, bit 1 = compressed
+    6       4     n_row_groups: u32 LE
+    10      var   Row group payloads (concatenated PND2 blobs)
+            for each RG:
+              4   rg_len: u32 LE
+              var rg_bytes (PND2 blob)
+    [end]   8     footer_offset: u64 LE (pointer to footer)
+    [foot]  var   SlabFooter (see below)
+    [tail]  12    Magic "PSLB" (4B) + footer_offset (8B) — for tail-read
+
+  SlabFooter:
+    4   n_entries: u32 LE
+    for each entry:
+      4   rg_index: u32 LE
+      8   byte_offset: u64 LE  (absolute offset in slab)
+      4   byte_len: u32 LE
+      4   n_rows: u32 LE
+      1   n_cols: u8
+      for each col:
+        1   name_len: u8
+        var name
+        1   vtype
+        1   has_stats
+        if has_stats:
+          4   min_len: u32 LE
+          var min
+          4   max_len: u32 LE
+          var max
+          4   null_count: u32 LE
+
+  Public API signatures (Rust):
+    /// Encode N PND2 row-group blobs into ONE PSLB slab.
+    pub fn encode_slab(row_groups: &[Vec<u8>]) -> Vec<u8>;
+
+    /// Decode a full slab blob (used for small slabs or full scans).
+    pub fn decode_slab(blob: &[u8]) -> Option<Slab>;
+
+    /// Decode ONLY the footer (used after a tail Range GET).
+    /// Returns the footer + the absolute offset where row groups begin.
+    pub fn decode_slab_footer(blob_tail: &[u8]) -> Option<SlabFooter>;
+
+    /// Build a list of (start, end) byte ranges to fetch for the given
+    /// predicate, given a decoded footer. Caller does parallel Range GETs.
+    pub fn plan_ranges(
+        footer: &SlabFooter,
+        predicates: &[(String, String, Vec<u8>)],
+    ) -> Vec<(u64, u64)>;
+
+    pub struct Slab { pub row_groups: Vec<Vec<u8>>, pub footer: SlabFooter }
+    pub struct SlabFooter { pub entries: Vec<SlabEntry> }
+    pub struct SlabEntry {
+        pub rg_index: u32, pub byte_offset: u64, pub byte_len: u32,
+        pub n_rows: u32, pub columns: Vec<crate::manifest::ColumnStatsEntry>,
+    }
+
+  ObjectStore trait addition:
+    /// Read a byte range from a blob. Returns the bytes in [start, end).
+    /// Default: full GET + slice (works for any backend, slow).
+    /// S3/LocalFS override: native Range header / fs::seek (fast).
+    fn get_blob_range(&self, hash: &str, start: u64, end: u64)
+        -> io::Result<Vec<u8>> {
+        let full = self.get_blob(hash)?;
+        let end = end.min(full.len() as u64) as usize;
+        let start = start as usize;
+        if start >= end { return Ok(Vec::new()); }
+        Ok(full[start..end].to_vec())
+    }
+
+  S3 impl (core/s3/src/lib.rs):
+    fn get_blob_range(&self, hash: &str, start: u64, end: u64)
+        -> io::Result<Vec<u8>> {
+        let key = self.blob_key(hash);
+        // S3 Range header is INCLUSIVE on both ends: bytes=0-1023 returns 1024 bytes.
+        let range = format!("bytes={}-{}", start, end.saturating_sub(1));
+        let resp = self.s3_request("GET", &key, None, None,
+            &[("Range".to_string(), range)])?;
+        // S3 returns 206 Partial Content for range requests.
+        let mut body = Vec::new();
+        resp.into_reader().read_to_end(&mut body).map_err(io::Error::other)?;
+        Ok(body)
+    }
+
+  LocalFS impl (core/kernel/src/object_store.rs):
+    fn get_blob_range(&self, hash: &str, start: u64, end: u64)
+        -> io::Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let path = self.blob_path(hash);
+        let mut f = std::fs::File::open(&path)?;
+        f.seek(SeekFrom::Start(start))?;
+        let len = end.saturating_sub(start) as usize;
+        let mut buf = vec![0u8; len];
+        f.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+  Integration points (NEXT cycle, NOT this one):
+    - read.rs:272 — replace `kernel.read_blob(&rg.blob_hash)` per RG with
+      a single `get_blob_range(slab_hash, offset, offset+len)` per pruned RG,
+      issued in parallel via std::thread::scope (same pattern as s3 put_batch).
+    - manifest.rs:201-203 — add optional `slab_hash` + `byte_offset` fields
+      to RowGroupEntry. When slab_hash is set, the blob_hash field becomes
+      "slab_hash:rg_index" and the read path uses Range GET.
+    - write.rs:137-142 — accumulate row groups into a slab buffer, flush
+      when slab_size > target (e.g., 128MB or 1024 RGs).
+
+  Test plan:
+    Unit (slab.rs):
+    - test_encode_decode_roundtrip: 3 RGs → encode → decode = same RGs
+    - test_footer_decode_from_tail: encode → take last 1KB → decode_slab_footer
+    - test_plan_ranges_no_predicates: all RGs returned
+    - test_plan_ranges_with_predicate: prunes RGs whose stats don't match
+    - test_empty_slab: 0 RGs → encode/decode works
+    - test_single_rg_slab: 1 RG → no footer overhead beyond minimum
+
+    Unit (object_store range):
+    - test_local_fs_get_blob_range: write 1KB blob, read [10, 50) = 40 bytes
+    - test_local_fs_get_blob_range_end_past_size: end > len → truncated to len
+    - test_s3_get_blob_range: mocked — uses ureq with Range header (verify
+      the header is set correctly via a test agent)
+
+    Integration (next cycle):
+    - test_slab_read_beats_per_rg_get: at 100 RGs, slab+range = 1+K RTTs
+      vs 100 RTTs sequential. Add to benches/bench_storage.rs.
+
+  Backward-compat strategy:
+    - PSLB is a NEW format (magic "PSLB"). Existing PNPK / PMAN / PND2 blobs
+      are untouched. New `get_blob_range` trait method has a default impl
+      (full GET + slice), so existing backends (LocalFS, S3) work without
+      changes if they don't override. S3 and LocalFS override for speed.
+    - Old collections continue to use per-RG blobs. Migration is OPT-IN:
+      a maintenance op (future) compacts a collection's blobs into slabs.
+    - No data format breaks. No ref path changes. No commit format changes.
+    - Slab adoption is per-write: write_rows can choose to flush as slab
+      or as individual blobs (default = slab, opt-out for compatibility).
+
+Benchmark math vs each competitor (1% selective query on 1TB table):
+
+  Competitor          Layout              GETs (1%)  RTTs (32-way)  Latency
+  ------------------  ------------------  ---------  -------------  -------
+  DuckDB-on-S3        Parquet+Rangelog    1+10       1+1            ~120ms
+  StalixDB            Sidecar stats+pref  1+8        1+1            ~100ms
+  Iceberg             Manifest tree+RG    1+1+10     1+1+1          ~150ms
+  Delta+Liquid        Hilbert+Photon      1+8        1+1            ~110ms
+  Hudi MoR            Base+log+compact    1+1+10     1+1+1          ~150ms
+  Pond2 TODAY         1 blob per RG       1+78       1+78 (seq)     ~3950ms
+  Pond2 + slabs       PSLB+Range-Read     1+78       1+3            ~200ms
+  Pond2 + slabs+tree  PSLB+manifest tree  1+1+78     1+1+3          ~250ms
+  Pond2 + slabs+tree  At PB (1PB / 1024-RG slabs = 8K slabs)
+                                          1+1+78     1+1+3          ~250ms
+
+  Conclusion: PSLB + Range-Read closes the gap to DuckDB (~200ms vs ~120ms).
+  Adding the manifest tree closes the gap at PB scale (manifest stays 1MB).
+  Cache would push warm reads to <10ms but is NOT required for parity.
+
+Risks and migration concerns:
+  1. Range-Read correctness on S3: must handle 206 vs 200 responses, and
+     the inclusive end-offset convention (bytes=0-1023 = 1024 bytes).
+     Test against real S3/R2 in scripts/test_rust_s3_r2.py (already exists).
+  2. Slab footer at EOF: must be reachable via a tail Range GET. S3 supports
+     negative ranges (bytes=-4096) but the trait API uses absolute offsets.
+     Solution: encode total slab size in the manifest entry, then tail-read
+     the last N bytes via absolute offset = size - N.
+  3. Multipart upload for slabs >5GB: out of scope this cycle. Slabs are
+     capped at 128MB-1GB by the writer (configurable). PB-scale collections
+     use MANY slabs (8K slabs at 1PB), not one giant slab.
+  4. Compression: PND2 already does per-column encoding (RLE/DICT/BITPACK).
+     Slab-level ZSTD is a future cycle (PSLB v2, flag bit 1 already reserved).
+  5. Migration: existing collections keep working. New writes opt into slabs.
+     A maintenance op (compact_to_slab) can be added in a future cycle to
+     rewrite old per-RG blobs as slabs. NOT required for correctness.
+
+Stage Summary:
+- Read 14 files (kernel, storage, s3, cache, lakehouse, keyvalue, arrow, codec)
+- Identified 7 layout-level changes (ranked by impact/complexity)
+- #1 recommendation: PSLB Slab format + ObjectStore::get_blob_range
+- Full spec: file paths, byte layout, API signatures, integration points
+- Test plan: 4 unit tests in slab.rs, 3 in object_store (LocalFS), 1 in S3
+- Backward-compat: additive only, no format breaks, opt-in migration
+- Benchmark math: PSLB closes gap to DuckDB (200ms vs 120ms at 1TB);
+  at 1PB, manifest tree keeps root lookup at 1 GET (1MB) instead of 1 GET (670MB)
+- Next cycle: integrate slabs into read_rows_i64 (parallel Range GETs)
+- Cache status: NOT relied on. Slab+Range layout beats competitors cold.
+
+---
+Task ID: review-cycle-1
+Agent: multi-role-review-subagent
+Task: Multi-role review of PSLB slab + get_blob_range changes
+
+Work Log:
+- Read /home/z/my-project/worklog.md (last ~200 lines) for context — prior cycle (cron-20260823-0751) shipped CachingObjectStore; this cycle introduces PSLB v1 slab format + get_blob_range trait method, the #1 architectural priority (object-store layout optimization, not cache reliance).
+- Reviewed all 7 changed files:
+  * core/storage/src/slab.rs (NEW, 734 LOC) — PSLB v1 format: header(10B) + payloads + footer + tail(12B). Public API: encode_slab, decode_slab, decode_slab_tail, decode_slab_footer, plan_ranges, is_slab. 11 unit tests.
+  * core/kernel/src/object_store.rs (458 LOC) — added get_blob_range trait method with default impl (full GET + slice); LocalFSObjectStore override using File::seek + read_exact.
+  * core/kernel/src/lib.rs (685 LOC) — added PondKernel::read_blob_range wrapper; 6 new kernel tests.
+  * core/s3/src/lib.rs (1683 LOC) — added S3ObjectStore override using HTTP Range: bytes=start-end_inclusive header; 206/200/416 status handling; Range header folded into SigV4 canonical request via extra_headers parameter.
+  * core/cache/src/lib.rs (475 LOC) — added CachingObjectStore::get_blob_range override (disk-cache hit → full-blob slice; cache miss → delegate to inner.get_blob_range). Also includes pre-existing WIP from another cycle (O(1) LRU refactor + test_true_lru_eviction; cache size 250 → 350).
+  * core/storage/src/read.rs (652 LOC) — CRITICAL BUG FIX: read() and read_at_snapshot() previously only read row_groups.first() (silent data loss); now reads ALL RGs via read_blob_batch and concatenates. Same fix applied to async paths. Added new read_all_row_groups() returning Vec<Vec<u8>>.
+  * core/storage/src/lib.rs (626 LOC) — added `pub mod slab;` (1 line).
+- Investigated specific concerns raised in the review brief:
+  * slab.rs decode_slab_footer column-loop bounds check (line 372)
+  * slab.rs decode_slab RG byte range overflow check (lines 475-477)
+  * slab.rs decode_slab_tail behavior on >12-byte input (line 311)
+  * kernel read_blob_range stat increment unconditional (line 150)
+  * s3 get_blob_range end_inclusive = end.saturating_sub(1) edge case (line 653)
+  * cache get_blob_range full-blob-slice on cache hit (lines 300-314)
+  * read.rs concatenated-PND2 semantic (lines 38-60)
+- Confirmed by manual trace: the off-by-one in decode_slab_footer is a real panic vector. Constructed a malformed footer (length 27 bytes, exactly matching `pos + name_len + 1 == len`) where `footer_bytes[pos]` for has_stats reads at index == len, panicking in release builds.
+- Confirmed by manual trace: decode_slab's `start + byte_len as usize` wraps on release builds when byte_offset is near u64::MAX, bypassing the `end > tail_start` rejection and panicking on `blob[start..end]` slice.
+- Verified the S3 Range header IS properly SigV4-signed: build_signed_request appends extra_headers BEFORE building the canonical request (line 423-425), then sorts headers by lowercase name (line 427) and includes them in the signed_headers list. AWS S3 accepts Range as a signed header (it's not required to be signed, but signing it is correct).
+- Verified the s3 end_inclusive edge case is correctly handled: the early return `if start >= end { return Ok(Vec::new()); }` (line 647) prevents reaching saturating_sub when end == 0. The saturating_sub is purely defensive.
+
+Stage Summary:
+- Verdict: REQUEST-CHANGES
+- The change introduces 2 CRITICAL panic-on-malformed-input bugs (security/correctness) and 1 HIGH-severity performance regression that directly contradicts the user's directive ("fastest reads/writes with least storage interaction at PB scale"). The CRITICAL bugs are easy 1-line fixes; the HIGH regression requires changing the cache-hit path to use File::seek+read_exact instead of fs::read. Until these are fixed, the slab format is unsafe to commit because a malicious or corrupted slab can panic the entire reader.
+
+Findings (ranked by severity):
+
+### CRITICAL (must fix before commit)
+
+**C1. slab.rs:372 — `decode_slab_footer` off-by-one bounds check causes panic on malformed input.**
+The check `if pos + name_len + 1 > footer_bytes.len() { return None; }` only validates that we can read `name` (name_len bytes) + `vtype` (1 byte). The code then reads `has_stats` at `footer_bytes[pos+name_len+1]`, which is OUT OF BOUNDS when `pos + name_len + 1 == footer_bytes.len()`.
+Reproducer: a footer of exactly `4 (n_entries) + 20 (fixed entry header) + 1 (n_columns) + 1 (name_len=0) = 26 bytes` (so len=26, pos=25, name_len=0, pos+name_len+1=26, NOT > 26, so check passes), then `vtype` reads at index 25 (OK), `has_stats` reads at index 26 → panic.
+**Fix:** Change `pos + name_len + 1` to `pos + name_len + 2`. Or split into two separate checks (one before vtype read, one before has_stats read) for clarity.
+
+**C2. slab.rs:475-477 — `decode_slab` RG byte-range check uses wrapping arithmetic; malformed `byte_offset` can panic on `blob[start..end]`.**
+```rust
+let start = entry.byte_offset as usize;          // attacker-controlled u64
+let end = start + entry.byte_len as usize;        // WRAPS in release mode!
+if end > tail_start { return None; }
+row_groups.push(blob[start..end].to_vec());       // PANIC if start > end
+```
+If a malformed slab sets `byte_offset = u64::MAX` and `byte_len = 1`, then on a 64-bit release build `start + byte_len` overflows to 0, the check `0 > tail_start` is FALSE, and `blob[u64::MAX..0]` panics with "slice index starts at 18446744073709551615 but ends at 0".
+**Fix:** Use `start.checked_add(entry.byte_len as usize)?` and return None on overflow; also validate `start <= tail_start` BEFORE computing end (currently only `end > tail_start` is checked, which misses the case where start > tail_start but byte_len == 0).
+
+### HIGH (should fix soon)
+
+**H1. cache.rs:300-314 — `get_blob_range` cache-hit path loads the WHOLE blob into memory via `fs::read` then slices. This defeats the purpose of range reads for cached blobs — the user's #1 priority.**
+For a 128 MB cached slab + 12-byte tail fetch:
+- Current behavior: read 128 MB from disk (~50-100ms on SSD), allocate 128 MB Vec, slice 12 bytes, drop Vec.
+- Expected behavior: open file (~1ms), seek to offset (~1µs), read_exact 12 bytes (~10µs).
+- Net: ~10,000x slower than the direct LocalFSObjectStore path that this code is supposed to accelerate.
+**Fix:** Mirror LocalFSObjectStore::get_blob_range — open `self.blob_path(hash)`, File::seek(start), read_exact(end-start). Falls back to `read_blob_from_disk` only if seek/read fails (e.g., file disappeared).
+
+**H2. slab.rs:337 + slab.rs:473 — `Vec::with_capacity(n_entries)` / `Vec::with_capacity(n_row_groups)` on attacker-controlled u32 → OOM DoS.**
+A malformed slab with `n_entries = u32::MAX` (4 billion) causes `Vec::with_capacity(4_294_967_295)` to attempt to allocate ~320 GB of `SlabEntry` structs. Process OOMs. Even on trusted data, a single corrupt byte (n_entries field) can crash the reader.
+**Fix:** Cap n_entries to a reasonable limit (e.g., 1_000_000 — way more than the 1024 RGs/slab target), or use `Vec::new()` (no pre-allocation; let push grow it). Alternatively, use `Vec::try_reserve` and return None on allocation failure.
+
+**H3. slab.rs:496-497 — encoder silently truncates `name_bytes.len() as u8` and `cols.len() as u8` if they exceed u8::MAX.**
+If `col.name.len() > 255`, the encoder writes a truncated length byte but the full name bytes — corrupting the byte stream silently. On decode, the reader reads a short name and misaligns everything after. Same issue with `cols.len() as u8` (>255 columns).
+**Fix:** `debug_assert!(name_bytes.len() <= u8::MAX as usize)` at minimum; ideally, change `encode_slab` to return `Result<Vec<u8>, SlabError>` and validate all length casts.
+
+**H4. slab.rs:311-322 — `decode_slab_tail` reads FIRST 12 bytes when caller passes >12 bytes, not LAST 12. Footgun.**
+The doc says "tail MUST be exactly 12 bytes, taken from the last 12 bytes", but the function accepts any slice >= 12 bytes and reads `[0..4]` for magic + `[4..12]` for footer_offset. If a caller mistakenly passes the full blob, `valid_magic` returns TRUE (because the header magic is also "PSLB") but `footer_offset` is garbage (read from version + flags + n_row_groups + first 3 payload bytes).
+**Fix:** Either (a) `assert_eq!(tail.len(), PSLB_TAIL_LEN)` (strict — fails fast on misuse), or (b) read from the LAST 12 bytes: `let off = tail.len() - PSLB_TAIL_LEN; let magic = &tail[off..off+4]; let footer_offset = u64::from_le_bytes(tail[off+4..off+12].try_into().unwrap());`. Option (b) is more user-friendly.
+
+**H5. read.rs:38-60 — `read()` now returns CONCATENATED bytes from multiple PND2 blobs. This is NOT a decodable format. SILENT SEMANTIC CHANGE for callers expecting decodable PND2 bytes.**
+The previous behavior (read only `row_groups.first()`) was a data-loss bug. The new behavior (concatenate all RGs) fixes data loss but produces bytes that can't be decoded as a single PND2 blob. `read_rows_i64` is unaffected (it reads each RG separately), but any external caller of `read()` that expected decodable PND2 bytes on multi-RG collections will silently break.
+**Fix:** Update the doc comment on `read()` (line 13: "Returns the raw data blob for the HEAD commit's manifest" is now misleading — it returns concatenated bytes). Add a deprecation note pointing to `read_all_row_groups()` for structured reads. Ideally, mark `read()` as deprecated for the multi-RG case.
+
+### MEDIUM (nice to have)
+
+**M1. slab.rs:389 — `pos + min_len + 4` arithmetic can overflow on 32-bit systems when `min_len = u32::MAX`.**
+On 64-bit (the target platform for PB-scale storage), this is safe because usize is 64-bit and pos is bounded by footer_bytes.len(). On 32-bit, `pos + u32::MAX + 4` wraps and the bounds check fails to reject, causing a slice panic. Storage servers are 64-bit so this is theoretical, but worth a `checked_add` for defense in depth.
+
+**M2. kernel/lib.rs:150 — `read_blob_range` increments `reads += 1` unconditionally, even on empty-range returns.**
+The store-level stats in LocalFSObjectStore::get_blob_range correctly skip the stat on early-return paths (start >= file_len, start >= end_clamped). But the kernel wrapper increments `reads += 1` for ALL calls, including empty ones. This makes kernel stats inconsistent with store stats. Minor — but misleading for capacity planning.
+
+**M3. slab.rs:237 — `n as u32` truncation if n > 4 billion row groups.** Unrealistic but the cast is silent. Add a debug_assert.
+
+**M4. slab.rs:282 — `n_rows` is hardcoded to 0 in the encoder.**
+The format includes a `n_rows: u32 LE` field per entry, but `encode_footer_entry` always writes 0. The decoder reads it back into `SlabEntry.n_rows`, but callers can't trust it. Either remove the field from the format (and bump version), or thread it through `encode_slab` as a parameter. The doc says "future writers can populate it accurately" — but the format is now v1 frozen with a useless field.
+
+**M5. slab.rs:382 — `has_stats` only checked for `== 1`; values 2-255 silently treated as "no stats".**
+A malformed slab with `has_stats = 2` (or any value 2-255) skips the min/max read without advancing pos, then misparses null_count and everything after. Not a panic (the bounds checks catch most cases), but wrong data. **Fix:** `if has_stats != 0 && has_stats != 1 { return None; }`.
+
+**M6. cache.rs:453 — test docstring stale: says "Write 3 blobs (A, B, C) to a 200-byte cache" but the code uses `with_max_disk_bytes(350)`.**
+Update the comment to match the code.
+
+**M7. manifest.rs:80-89 (PRE-EXISTING, not introduced by this change) — `can_prune` has off-by-one false negatives on `<`, `<=`, `>`, `>=` operators.**
+- `"<"`: code says `val < min_val` → prune when `val < min_val` (i.e., min > val). Correct semantics: prune when `min_val >= val`. Missed case: when `min_val == val` exactly (RG can be pruned for `< val` but code doesn't prune).
+- `">="`: code says `val > max_val` → prune when `val > max_val` (i.e., max < val). Correct: prune when `max_val < val`. Wait, that IS what the code does. Actually `val > max_val` ⟺ `max_val < val` — same thing. OK.
+- Re-checking: `"<"` should prune when `min_val >= val` (all values >= val, none < val). Code: `val < min_val` ⟺ `min_val > val`. Misses `min_val == val`. False negative (reads more, never wrong data).
+- These bugs are inherited by `SlabEntry::can_prune` (which delegates to `ColumnStatsEntry::can_prune`). Not introduced by this commit, but the slab path makes them more visible (slabs target PB-scale where missed pruning = wasted S3 GETs).
+
+### LOW (nit)
+
+**L1. slab.rs:14 — "27,000x speedup cold" marketing-flavored claim.** Calculation assumes 32-way parallelism, 8 surviving RGs, 50ms/GET — many variables. Tone down to "orders of magnitude" or show the math.
+
+**L2. slab.rs:416 — `if pos + 4 + 8 + 4 + 4 + 1 > footer_bytes.len()` — magic numbers should be named constants.** Hard to audit; a future change to the format would miss this site.
+
+**L3. slab.rs:3 — no version byte in the magic itself.** "PSLB" is fixed; v2 would need a new magic ("PSL2"?) or rely on the version byte (which a v1 reader checks — good). Not a bug, just a note.
+
+**L4. S3 get_blob_range (lines 690-693) — 416 Range Not Satisfiable returns `Ok(Vec::new())` without incrementing stats.** Consistent with LocalFS behavior (which also returns empty without stat increment for start >= file_len). But a 416 from S3 is a real network round-trip — arguably should count. Minor consistency question.
+
+**L5. s3/lib.rs:646-699 — `get_blob_range` reads body to end before checking status.** For a 416 on a huge blob, we'd read the (small) error response body — fine. For a 200 fallback on a 128 MB blob, we'd buffer 128 MB before slicing — wasteful. Could use `Content-Length` header to size the Vec, or stream+slice. Minor — 200 fallback is rare (only misconfigured proxies).
+
+### Test gaps
+
+1. **No fuzz test for malformed slabs** — would have caught C1 (off-by-one) and C2 (overflow). Strongly recommend adding `cargo fuzz` target for `decode_slab`, `decode_slab_footer`, `decode_slab_tail`.
+2. **No test for `Vec::with_capacity` OOM** — would have caught H2. Test: craft a slab with `n_entries = u32::MAX` and assert `decode_slab` returns None (currently panics with OOM).
+3. **No test for cache-hit range read on a large blob** — would have caught H1. Test: write a 10 MB blob to cache, then `get_blob_range(h, len-12, len)` and assert wall-clock < 10ms (currently ~50-100ms).
+4. **No test for `decode_slab_tail` with >12-byte input** — would have caught H4.
+5. **No test for slabs with >255 columns or >255-byte column names** — would have caught H3.
+6. **No S3 backend test for `get_blob_range`** — the 206/200/416 paths are unit-testable with a mock HTTP server (the codebase already has `s3_mock_backend.py` for Python; a Rust mock would be valuable).
+7. **No test for `read()` on a multi-RG collection** — would have surfaced H5 (concatenated PND2 bytes are not decodable). Test: write 2 RGs via `write_rows_i64`, call `read()`, assert `pond_core::pnd2_decode(&result).is_err()` (or change `read()` to return `Vec<Vec<u8>>`).
+8. **No test for `byte_offset + byte_len > tail_start` rejection** (explicitly mentioned in the task brief). Test: craft a slab where footer claims an RG extends into the tail, assert `decode_slab` returns None.
+9. **No test for `byte_offset` near u64::MAX** — would have caught C2.
+10. **No test for the SigV4 signature including the Range header** — would verify that a hand-rolled SigV4 signer produces a signature AWS accepts for ranged GETs. Could be done against moto or LocalStack.
+
+### Migration concerns
+
+- **PSLB is a new magic.** Existing PNPK / PMAN / PND2 blobs are untouched. No migration needed for existing data. ✓
+- **`get_blob_range` trait method has a default impl** that preserves existing behavior on backends without override. No backward-compat issue. ✓
+- **`read()` semantic change (H5)** is a BREAKING CHANGE for any caller that expected decodable PND2 bytes from a multi-RG collection. The old behavior was a data-loss bug (silent), the new behavior is concatenated bytes (also silent for callers that just pass bytes through, but breaking for callers that decode). The `read_rows_i64` path is unaffected. **Recommend:** audit all callers of `read()` in the workspace + Python SDK before committing; if any decode the result as a single PND2, migrate them to `read_all_row_groups()`.
+- **CachingObjectStore's `get_blob_range` override** is new behavior. Existing caches continue to work (no on-disk format change). But the override is a performance regression for cached blobs (H1) — until H1 is fixed, range reads on cached slabs are SLOWER than range reads on uncached slabs (which delegate to S3 native Range GET). This is the opposite of the user's directive.
+
+### Architect's verdict
+
+The PSLB format design is SOUND and aligns with the user's directive: the read algorithm (12-byte tail fetch → footer fetch → parallel Range GETs for surviving RGs) is exactly the right pattern for PB-scale cold reads, and the default-impl-on-trait approach preserves backward compat. The SigV4 Range-header signing is correct. The slab.rs encode/decode logic for VALID slabs is correct (11 tests pass).
+
+BUT: the decoder has TWO critical panic vectors on malformed input (C1, C2). At PB scale, a single corrupted blob (bit-rot, partial write, malicious actor) can panic the entire reader process — taking down queries, not just failing one read. This is unacceptable for a storage substrate that aims to be "faster than StalwartDB / DuckDB-on-S3". The fixes are 1-line each; they should land BEFORE the commit.
+
+The cache regression (H1) is more nuanced: it's not a correctness bug, but it directly undermines the user's #1 priority ("fastest reads with least storage interaction at PB scale, even without cache"). The current behavior makes cached slabs SLOWER than uncached slabs for range reads, which is the opposite of the design intent. This should also be fixed before commit, or at minimum documented as a known limitation with a follow-up task.
+
+RECOMMENDATION: Fix C1, C2, H1, H3 before commit. File H2, H4, H5 as follow-up tasks (P1). The rest can be MEDIUM/LOW follow-ups.
+

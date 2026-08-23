@@ -4,7 +4,6 @@
 
 use crate::branch_ref;
 use crate::commit;
-use crate::commit::Commit;
 use crate::manifest::CollectionManifest;
 use crate::shard;
 use pond_kernel::PondKernel;
@@ -36,13 +35,64 @@ pub fn read(
     let manifest = CollectionManifest::decode(&manifest_bytes)
         .ok_or_else(|| "Failed to decode manifest".to_string())?;
 
-    // Read the first row group's blob (simplified — for v0.1, one row group)
-    if let Some(rg) = manifest.row_groups.first() {
-        return kernel.read_blob(&rg.blob_hash)
-            .map_err(|e| format!("Failed to read data blob: {}", e));
+    // Read ALL row groups' blobs (parallel via read_blob_batch) and
+    // concatenate the bytes. The previous implementation read only
+    // `row_groups.first()` — a silent data-loss bug for multi-RG
+    // collections (fixed Task 0-p, see worklog).
+    //
+    // For raw-byte writes (write() path, 1 RG), behavior is unchanged.
+    // For structured PND2 writes (write_rows_i64() with >1 RG), callers
+    // that need to decode individual PND2 blobs should use
+    // `read_all_row_groups()` which returns `Vec<Vec<u8>>` (one per RG).
+    if manifest.row_groups.is_empty() {
+        return Err("Manifest has no row groups".to_string());
     }
+    let hashes: Vec<String> = manifest.row_groups.iter()
+        .map(|rg| rg.blob_hash.clone())
+        .collect();
+    let blobs = kernel.read_blob_batch(&hashes)
+        .map_err(|e| format!("Failed to read data blobs: {}", e))?;
+    let total: usize = blobs.iter().map(|b| b.len()).sum();
+    let mut out = Vec::with_capacity(total);
+    for b in &blobs {
+        out.extend_from_slice(b);
+    }
+    Ok(out)
+}
 
-    Err("Manifest has no row groups".to_string())
+/// Read all row groups of a collection's HEAD as separate byte vectors.
+///
+/// Unlike [`read`] (which concatenates RG bytes), this preserves the
+/// per-RG boundary so callers can decode each PND2 blob independently.
+/// This is the correct API for analytics over multi-RG collections where
+/// each RG is a self-contained PND2 blob with its own column encoding.
+///
+/// Uses `kernel.read_blob_batch` (parallel GET on S3) so the wall-clock
+/// cost is ~1 RTT (not N×RTT) for the multi-RG case.
+pub fn read_all_row_groups(
+    kernel: &PondKernel,
+    collection: &str,
+    branch: &str,
+) -> Result<Vec<Vec<u8>>, String> {
+    let head = kernel.resolve(&branch_ref(collection, branch))
+        .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
+    let commit = commit::read_commit(kernel, &head)
+        .ok_or_else(|| "Failed to read HEAD commit".to_string())?;
+    if commit.manifest.is_empty() {
+        return Err("HEAD commit has no manifest".to_string());
+    }
+    let manifest_bytes = kernel.read_blob(&commit.manifest)
+        .map_err(|e| format!("Failed to read manifest: {}", e))?;
+    let manifest = CollectionManifest::decode(&manifest_bytes)
+        .ok_or_else(|| "Failed to decode manifest".to_string())?;
+    if manifest.row_groups.is_empty() {
+        return Err("Manifest has no row groups".to_string());
+    }
+    let hashes: Vec<String> = manifest.row_groups.iter()
+        .map(|rg| rg.blob_hash.clone())
+        .collect();
+    kernel.read_blob_batch(&hashes)
+        .map_err(|e| format!("Failed to read data blobs: {}", e))
 }
 
 /// Read data at a specific commit — SNAPSHOT ISOLATION.
@@ -66,12 +116,22 @@ pub fn read_at_snapshot(
     let manifest = CollectionManifest::decode(&manifest_bytes)
         .ok_or_else(|| "Failed to decode manifest".to_string())?;
 
-    if let Some(rg) = manifest.row_groups.first() {
-        return kernel.read_blob(&rg.blob_hash)
-            .map_err(|e| format!("Failed to read data blob: {}", e));
+    // Read ALL row groups (parallel via read_blob_batch) and concatenate.
+    // Previous impl only read the first RG — silent data loss for >1 RG.
+    if manifest.row_groups.is_empty() {
+        return Err("Manifest has no row groups".to_string());
     }
-
-    Err("Manifest has no row groups".to_string())
+    let hashes: Vec<String> = manifest.row_groups.iter()
+        .map(|rg| rg.blob_hash.clone())
+        .collect();
+    let blobs = kernel.read_blob_batch(&hashes)
+        .map_err(|e| format!("Failed to read data blobs: {}", e))?;
+    let total: usize = blobs.iter().map(|b| b.len()).sum();
+    let mut out = Vec::with_capacity(total);
+    for b in &blobs {
+        out.extend_from_slice(b);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -122,13 +182,18 @@ pub async fn read_rows_async(
     let manifest = CollectionManifest::decode(&manifest_bytes)
         .ok_or_else(|| "Failed to decode manifest".to_string())?;
 
-    // 4. Read the first row group's data blob async.
-    if let Some(rg) = manifest.row_groups.first() {
-        return kernel.read_blob_async(&rg.blob_hash).await
-            .map_err(|e| format!("Failed to read data blob: {}", e));
+    // 4. Read ALL row group blobs async (sequential — parallel async is a
+    // future optimization). Concatenate the bytes (matches sync `read`).
+    if manifest.row_groups.is_empty() {
+        return Err("Manifest has no row groups".to_string());
     }
-
-    Err("Manifest has no row groups".to_string())
+    let mut out = Vec::new();
+    for rg in &manifest.row_groups {
+        let blob = kernel.read_blob_async(&rg.blob_hash).await
+            .map_err(|e| format!("Failed to read data blob: {}", e))?;
+        out.extend_from_slice(&blob);
+    }
+    Ok(out)
 }
 
 /// Async variant of [`read_at_snapshot`]. Reads the data at a specific
@@ -152,12 +217,18 @@ pub async fn read_at_snapshot_async(
     let manifest = CollectionManifest::decode(&manifest_bytes)
         .ok_or_else(|| "Failed to decode manifest".to_string())?;
 
-    if let Some(rg) = manifest.row_groups.first() {
-        return kernel.read_blob_async(&rg.blob_hash).await
-            .map_err(|e| format!("Failed to read data blob: {}", e));
+    // Read ALL row groups async (sequential — parallel async is a future
+    // optimization). Concatenate the bytes (matches sync `read_at_snapshot`).
+    if manifest.row_groups.is_empty() {
+        return Err("Manifest has no row groups".to_string());
     }
-
-    Err("Manifest has no row groups".to_string())
+    let mut out = Vec::new();
+    for rg in &manifest.row_groups {
+        let blob = kernel.read_blob_async(&rg.blob_hash).await
+            .map_err(|e| format!("Failed to read data blob: {}", e))?;
+        out.extend_from_slice(&blob);
+    }
+    Ok(out)
 }
 
 /// Read the full collection data including shards (CRDT read path).
@@ -289,7 +360,7 @@ pub fn read_rows_i64(
 
             // Only collect INT64 columns
             if col.vtype == pond_core::VT_INT64 {
-                let entry = result_cols.entry(name.clone()).or_insert_with(Vec::new);
+                let entry = result_cols.entry(name.clone()).or_default();
                 entry.extend_from_slice(&col.i64_data);
             }
         }

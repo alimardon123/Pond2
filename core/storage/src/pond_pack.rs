@@ -83,10 +83,13 @@ pub fn encode_pack(
     buf
 }
 
+/// Type alias for inline row data (list of row-payload byte vectors).
+type InlineRows = Option<Vec<Vec<u8>>>;
+
 /// Decode a PNPK blob into (commit, manifest_bytes, inline_data).
 ///
 /// Returns None if the blob is not a valid PNPK pack.
-pub fn decode_pack(blob: &[u8]) -> Option<(Value, Vec<u8>, Option<Vec<Vec<u8>>>)> {
+pub fn decode_pack(blob: &[u8]) -> Option<(Value, Vec<u8>, InlineRows)> {
     if blob.len() < 10 || &blob[0..4] != PNPK_MAGIC {
         return None;
     }
