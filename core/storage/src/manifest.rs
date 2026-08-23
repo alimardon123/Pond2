@@ -26,7 +26,6 @@
 //   Optional: parent_manifest (u32 LE length + string)
 
 const PMAN_MAGIC: &[u8] = b"PMAN";
-const PMAN_VERSION_V1: u8 = 1;
 const PMAN_VERSION: u8 = 2;
 
 // Value types (match pond_core)
@@ -346,22 +345,17 @@ impl CollectionManifest {
                 slab_byte_offset: None,
                 slab_byte_len: None,
             });
-        }
 
-        // v2: read slab byte offset + len for each RG (12 bytes per RG)
-        if version >= PMAN_VERSION {
-            for rg in &mut row_groups {
-                if pos + 12 > data.len() { return None; }
+            // v2: read slab byte offset + len (12 bytes per RG)
+            if version >= 2 {
                 let offset = u64::from_le_bytes([
                     data[pos], data[pos+1], data[pos+2], data[pos+3],
                     data[pos+4], data[pos+5], data[pos+6], data[pos+7],
                 ]);
                 pos += 8;
-                let len = u32::from_le_bytes([
-                    data[pos], data[pos+1], data[pos+2], data[pos+3],
-                ]);
+                let len = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
                 pos += 4;
-                // offset=0 and len=0 means standalone blob (not slab-backed)
+                let rg = row_groups.last_mut().unwrap();
                 if offset != 0 || len != 0 {
                     rg.slab_byte_offset = Some(offset);
                     rg.slab_byte_len = Some(len);

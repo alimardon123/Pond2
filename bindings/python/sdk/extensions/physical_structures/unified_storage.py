@@ -3497,24 +3497,6 @@ class UnifiedStorage:
                 ))
             new_manifest.add_row_group(rg)
 
-        # Build manifest LOCALLY (no I/O) — encode + hash only
-        new_manifest = CollectionManifest(self.kernel)
-        new_manifest.set_schema(
-            columns=schema, key_col=key_col,
-            row_group_size=rg_size, chunk_size=0,
-        )
-        for entry in manifest_entries:
-            rg = RowGroupEntry(
-                key=entry["rg_key"], blob_hash=entry["blob_hash"],
-                n_rows=entry["n_rows"], storage_mode=STORAGE_WHOLE_BLOB,
-            )
-            for col_name, vtype, mn, mx, null_count in entry["col_stats"]:
-                rg.columns.append(ColumnStatsEntry(
-                    name=col_name, value_type=vtype,
-                    min=mn, max=mx, null_count=null_count, chunks=[],
-                ))
-            new_manifest.add_row_group(rg)
-
         # Carry forward the inline bloom filter from HEAD manifest
         # so negative lookups still work after compaction.
         if head_manifest and head_manifest._inline_bloom:

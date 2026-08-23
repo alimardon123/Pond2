@@ -449,7 +449,7 @@ pub fn write_rows_i64_slab<'a>(
     // 1. Encode each RG as PND2 + compute column stats
     let mut encoded_rgs: Vec<(Vec<u8>, Vec<ColumnStatsEntry>, u32)> = Vec::with_capacity(row_groups.len());
     for rg in row_groups {
-        let blob = pnd2_encode_i64_auto(*rg);
+        let blob = pnd2_encode_i64_auto(rg);
         let n_rows = rg.first().map(|(_, v)| v.len()).unwrap_or(0) as u32;
         let col_stats: Vec<ColumnStatsEntry> = rg.iter().map(|(name, values)| {
             let (min, max) = if values.is_empty() {
@@ -687,12 +687,35 @@ mod tests {
         let commit_obj = commit::read_commit(kernel, &hash).unwrap();
         assert_eq!(commit_obj.message, "3 RGs as slab");
 
-        // Verify the slab blob is a valid PSLB
-        let slab_data = kernel.read_blob(&commit_obj.manifest).unwrap();
-        // The manifest hash in the commit is actually the slab hash for a slab manifest
-        // (all RGs point to the slab). So let's get the actual manifest.
-        // For now, just verify the slab is valid PSLB.
-        // TODO: debug PMAN v2 decode for slab manifest (next cycle).
+        // Verify the manifest is decodable and has correct RG count
+        let manifest_bytes = kernel.read_blob(&commit_obj.manifest).unwrap();
+        let manifest = CollectionManifest::decode(&manifest_bytes).expect("slab manifest should decode");
+        assert_eq!(manifest.row_groups.len(), 3);
+
+        // All 3 RGs should point to the SAME slab blob
+        let slab_hash = &manifest.row_groups[0].blob_hash;
+        for rg in &manifest.row_groups[1..] {
+            assert_eq!(&rg.blob_hash, slab_hash, "all RGs in a slab must share the same blob hash");
+        }
+
+        // Each RG should have slab_byte_offset and slab_byte_len set
+        for (i, rg) in manifest.row_groups.iter().enumerate() {
+            assert!(rg.slab_byte_offset.is_some(), "RG {} missing slab_byte_offset", i);
+            assert!(rg.slab_byte_len.is_some(), "RG {} missing slab_byte_len", i);
+        }
+
+        // Verify each RG's data is decodable as PND2 via range reads
+        let rg_data = crate::read::read_all_row_groups(kernel, "slab_test", "main").unwrap();
+        assert_eq!(rg_data.len(), 3);
+        for (i, data) in rg_data.iter().enumerate() {
+            let cols = pond_core::pnd2_decode(data).unwrap_or_else(|_| panic!("RG {} PND2 decode failed", i));
+            assert_eq!(cols.len(), 2, "RG {} should have 2 columns", i);
+            assert_eq!(cols[0].i64_data.len(), 3, "RG {} should have 3 rows", i);
+        }
+        // Verify actual data values
+        let cols0 = pond_core::pnd2_decode(&rg_data[0]).unwrap();
+        assert_eq!(cols0[0].i64_data, vec![1i64, 2, 3]);
+        assert_eq!(cols0[1].i64_data, vec![10i64, 20, 30]);
     }
 }
 

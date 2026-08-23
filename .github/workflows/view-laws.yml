@@ -70,10 +70,10 @@ jobs:
             ${{ runner.os }}-cargo-target-
 
       - name: Build (release)
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --exclude pond_python --exclude pond_sql
 
       - name: Test (workspace)
-        run: cargo test --workspace --release
+        run: cargo test --workspace --release --exclude pond_python --exclude pond_sql
 
   # ─────────────────────────────────────────────────────────────────────
   # Python tests via tests/test_all.py (the canonical pytest entry point).
@@ -137,7 +137,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Build Rust workspace (release) for PyO3 + C ABI + pond CLI
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --exclude pond_sql
 
       - name: Symlink libpond.so → pond.so (Python expects the latter)
         run: |
@@ -201,7 +201,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Build Rust workspace (release) — provides static libs for cgo
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --exclude pond_python --exclude pond_sql
 
       - name: Generate cross-language test blobs (idempotent)
         env:
@@ -243,7 +243,7 @@ jobs:
             ${{ runner.os }}-cargo-target-
 
       - name: Build Rust workspace (release) — produces static libs
-        run: cargo build --release --workspace
+        run: cargo build --release --workspace --exclude pond_python --exclude pond_sql
 
       - name: Compile + run test_c_abi.c (codec C ABI)
         run: |

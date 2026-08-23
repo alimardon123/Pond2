@@ -35,11 +35,8 @@ pub fn read(
     let manifest = CollectionManifest::decode(&manifest_bytes)
         .ok_or_else(|| "Failed to decode manifest".to_string())?;
 
-    // Read ALL row groups' blobs (parallel via read_blob_batch) and
-    // concatenate the bytes. The previous implementation read only
-    // `row_groups.first()` — a silent data-loss bug for multi-RG
-    // collections (fixed Task 0-p, see worklog).
-    //
+    // Read ALL row groups (slab-aware) and concatenate.
+    // Previous impl only read the first RG — silent data loss for multi-RG.
     // For raw-byte writes (write() path, 1 RG), behavior is unchanged.
     // For structured PND2 writes (write_rows_i64() with >1 RG), callers
     // that need to decode individual PND2 blobs should use
@@ -47,11 +44,7 @@ pub fn read(
     if manifest.row_groups.is_empty() {
         return Err("Manifest has no row groups".to_string());
     }
-    let hashes: Vec<String> = manifest.row_groups.iter()
-        .map(|rg| rg.blob_hash.clone())
-        .collect();
-    let blobs = kernel.read_blob_batch(&hashes)
-        .map_err(|e| format!("Failed to read data blobs: {}", e))?;
+    let blobs = read_all_row_groups_from_manifest(kernel, &manifest)?;
     let total: usize = blobs.iter().map(|b| b.len()).sum();
     let mut out = Vec::with_capacity(total);
     for b in &blobs {
@@ -85,6 +78,17 @@ pub fn read_all_row_groups(
         .map_err(|e| format!("Failed to read manifest: {}", e))?;
     let manifest = CollectionManifest::decode(&manifest_bytes)
         .ok_or_else(|| "Failed to decode manifest".to_string())?;
+    read_all_row_groups_from_manifest(kernel, &manifest)
+}
+
+/// Slab-aware row group reader from an already-loaded manifest.
+///
+/// Separates slab-backed RGs (uses range reads) from standalone RGs
+/// (uses batch blob reads), then reassembles in manifest order.
+fn read_all_row_groups_from_manifest(
+    kernel: &PondKernel,
+    manifest: &CollectionManifest,
+) -> Result<Vec<Vec<u8>>, String> {
     if manifest.row_groups.is_empty() {
         return Err("Manifest has no row groups".to_string());
     }
@@ -189,6 +193,56 @@ fn read_slab_ranges_parallel(
     }
 }
 
+/// Slab-aware reader for a pre-selected set of surviving row groups.
+///
+/// Used by `read_rows_i64()` after predicate pruning. Separates slab-backed
+/// RGs (uses range reads) from standalone RGs (uses batch blob reads),
+/// then reassembles in the caller's order.
+///
+/// Architecture review G1 fix: without this, `read_rows_i64()` did a full
+/// GET per RG, transferring entire slabs (128 MB each) instead of just
+/// the needed RG bytes (~128 KB each) — a 1000x data transfer reduction.
+fn read_surviving_rgs_slab_aware(
+    kernel: &PondKernel,
+    surviving_rgs: &[&crate::manifest::RowGroupEntry],
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut standalone_hashes: Vec<String> = Vec::new();
+    let mut slab_ranges: Vec<(String, u64, u64)> = Vec::new();
+    let mut rg_order: Vec<RgSource> = Vec::new();
+
+    for rg in surviving_rgs {
+        if let (Some(offset), Some(len)) = (rg.slab_byte_offset, rg.slab_byte_len) {
+            slab_ranges.push((rg.blob_hash.clone(), offset, offset + len as u64));
+            rg_order.push(RgSource::Slab(slab_ranges.len() - 1));
+        } else {
+            standalone_hashes.push(rg.blob_hash.clone());
+            rg_order.push(RgSource::Standalone(standalone_hashes.len() - 1));
+        }
+    }
+
+    let standalone_results = if !standalone_hashes.is_empty() {
+        kernel.read_blob_batch(&standalone_hashes)
+            .map_err(|e| format!("Failed to read data blobs: {}", e))?
+    } else {
+        Vec::new()
+    };
+
+    let slab_results = if !slab_ranges.is_empty() {
+        read_slab_ranges_parallel(kernel, &slab_ranges)?
+    } else {
+        Vec::new()
+    };
+
+    let mut result = Vec::with_capacity(rg_order.len());
+    for src in &rg_order {
+        match src {
+            RgSource::Standalone(idx) => result.push(standalone_results[*idx].clone()),
+            RgSource::Slab(idx) => result.push(slab_results[*idx].clone()),
+        }
+    }
+    Ok(result)
+}
+
 /// Read data at a specific commit — SNAPSHOT ISOLATION.
 ///
 /// Reads ONLY the manifest at the given commit, ignoring any shards
@@ -210,16 +264,14 @@ pub fn read_at_snapshot(
     let manifest = CollectionManifest::decode(&manifest_bytes)
         .ok_or_else(|| "Failed to decode manifest".to_string())?;
 
-    // Read ALL row groups (parallel via read_blob_batch) and concatenate.
+    // Read ALL row groups (slab-aware) and concatenate.
     // Previous impl only read the first RG — silent data loss for >1 RG.
     if manifest.row_groups.is_empty() {
         return Err("Manifest has no row groups".to_string());
     }
-    let hashes: Vec<String> = manifest.row_groups.iter()
-        .map(|rg| rg.blob_hash.clone())
-        .collect();
-    let blobs = kernel.read_blob_batch(&hashes)
-        .map_err(|e| format!("Failed to read data blobs: {}", e))?;
+
+    // Use read_all_row_groups which handles slab-backed RGs via range reads
+    let blobs = read_all_row_groups_from_manifest(kernel, &manifest)?;
     let total: usize = blobs.iter().map(|b| b.len()).sum();
     let mut out = Vec::with_capacity(total);
     for b in &blobs {
@@ -413,46 +465,66 @@ pub fn read_rows_i64(
     use std::collections::HashMap;
     let mut result_cols: HashMap<String, Vec<i64>> = HashMap::new();
 
-    // Read each row group, applying predicate pruning
-    for rg in &manifest.row_groups {
-        // Predicate pruning: check if this row group can be skipped
-        if let Some(preds) = predicates {
-            let mut skip = false;
-            for (col_name, op, value) in preds {
-                // Find the column stats
-                let col_stats = rg.columns.iter().find(|c| c.name == *col_name);
-                if let Some(stats) = col_stats {
-                    // Check if the row group can be pruned
-                    if can_prune_row_group(stats, op, *value) {
-                        skip = true;
-                        break;
+    // Read each row group, applying predicate pruning, with slab-aware
+    // range reads for minimum S3 round-trips.
+    //
+    // Architecture review finding G1 (CRITICAL): the previous impl did a
+    // full kernel.read_blob() per RG, ignoring slab_byte_offset/slab_byte_len.
+    // For 82 surviving RGs in 8 slabs at PB scale, this transferred 1 GB
+    // instead of 10.5 MB. Fixed: now uses get_blob_range() for slab-backed RGs.
+    //
+    // Future: range coalescing (G5) can merge adjacent RG ranges in the
+    // same slab into a single Range GET, reducing 82 range reads to ~8.
+
+    // 1. Predicate pruning — collect surviving RGs
+    let surviving_rgs: Vec<&crate::manifest::RowGroupEntry> = manifest.row_groups.iter()
+        .filter(|rg| {
+            if let Some(preds) = predicates {
+                for (col_name, op, value) in preds {
+                    if let Some(stats) = rg.columns.iter().find(|c| c.name == *col_name) {
+                        if can_prune_row_group(stats, op, *value) {
+                            return false;
+                        }
                     }
                 }
             }
-            if skip {
-                continue; // Skip this row group entirely
+            true
+        })
+        .collect();
+
+    if surviving_rgs.is_empty() {
+        // All RGs pruned — return empty columns from schema
+        let mut result: Vec<(String, Vec<i64>)> = Vec::new();
+        for (name, vtype) in &manifest.columns {
+            if *vtype == pond_core::VT_INT64 {
+                if let Some(ref proj) = projection {
+                    if proj.contains(name.as_str()) {
+                        result.push((name.clone(), Vec::new()));
+                    }
+                } else {
+                    result.push((name.clone(), Vec::new()));
+                }
             }
         }
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        return Ok(result);
+    }
 
-        // Read and decode the PND2 blob
-        let blob_data = kernel.read_blob(&rg.blob_hash)
-            .map_err(|e| format!("Failed to read data blob: {}", e))?;
+    // 2. Read surviving RGs (slab-aware)
+    let blob_data_list = read_surviving_rgs_slab_aware(kernel, &surviving_rgs)?;
 
-        let cols = pond_core::pnd2_decode(&blob_data)
+    // 3. Decode each PND2 blob and project columns
+    for blob_data in &blob_data_list {
+        let cols = pond_core::pnd2_decode(blob_data)
             .map_err(|e| format!("Failed to decode PND2 blob: {}", e))?;
 
-        // Append decoded values to result columns (with projection)
         for col in &cols {
             let name = col.name.to_string_lossy().to_string();
-
-            // Skip if projection requested and this column is not in it
             if let Some(ref proj) = projection {
                 if !proj.contains(name.as_str()) {
                     continue;
                 }
             }
-
-            // Only collect INT64 columns
             if col.vtype == pond_core::VT_INT64 {
                 let entry = result_cols.entry(name.clone()).or_default();
                 entry.extend_from_slice(&col.i64_data);
