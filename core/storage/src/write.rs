@@ -9,7 +9,7 @@
 // Both paths create a commit and update branch refs identically.
 
 use crate::commit;
-use crate::manifest::{CollectionManifest, ColumnStatsEntry, RowGroupEntry};
+use crate::manifest::{CollectionManifest, ColumnStatsEntry, LeafEntry, MAX_LEAF_RGS, RootManifest, RowGroupEntry, compute_key_range};
 use crate::slab;
 use crate::{branch_ref, manifest_ref};
 use pond_core::{pnd2_encode_i64_auto, pnd2_encode_multi_typed, TypedColumn, VT_INT64};
@@ -672,6 +672,13 @@ impl<'a> SlabWriter<'a> {
 
     /// Final flush: write remaining buffered RGs as partial slab, then commit.
     ///
+    /// If the total RG count exceeds `MAX_LEAF_RGS` (1024), this produces a
+    /// PMAN v3 **root manifest** pointing to PMAN v2 **leaf manifests**.
+    /// Each leaf holds up to 1024 RGs. This prevents manifests from growing
+    /// beyond ~400 KB per leaf, keeping S3 GET latency bounded at PB scale.
+    ///
+    /// If ≤ 1024 RGs, produces a single PMAN v2 manifest (backward compatible).
+    ///
     /// Returns the commit hash. Consumes self (cannot write more after flush).
     pub fn flush(mut self, message: &str) -> Result<String, String> {
         self.flush_slab()?; // flush partial buffer
@@ -680,26 +687,98 @@ impl<'a> SlabWriter<'a> {
             return Err("SlabWriter: no data to flush".to_string());
         }
 
-        let schema = self.schema.unwrap();
-        let key_col = self.key_col.unwrap_or_default();
-        let mut manifest = CollectionManifest::new(schema, key_col);
-        for rg in self.completed_rgs.drain(..) {
-            manifest.add_row_group(rg);
+        let schema = self.schema.clone().unwrap();
+        let key_col = self.key_col.clone().unwrap_or_default();
+
+        // Determine manifest hash: v3 root if > MAX_LEAF_RGS, v2 leaf otherwise
+        let manifest_hash = if self.completed_rgs.len() > MAX_LEAF_RGS {
+            self.flush_as_tree(&schema, &key_col, message)?
+        } else {
+            self.flush_as_flat(&schema, &key_col, message)?
+        };
+
+        Ok(manifest_hash)
+    }
+
+    /// Flat flush: single PMAN v2 manifest (backward compatible, ≤1024 RGs).
+    fn flush_as_flat(
+        &self,
+        schema: &[(String, u8)],
+        key_col: &str,
+        message: &str,
+    ) -> Result<String, String> {
+        let mut manifest = CollectionManifest::new(schema.to_vec(), key_col.to_string());
+        for rg in &self.completed_rgs {
+            manifest.add_row_group(rg.clone());
         }
 
-        // Commit flow (same as write_rows_i64)
+        let manifest_bytes = manifest.encode();
+        let manifest_hash = self.kernel.write(&manifest_bytes)
+            .map_err(|e| format!("SlabWriter: failed to write manifest: {}", e))?;
+
+        let commit_hash = self.commit(&manifest_hash, message)?;
+        Ok(commit_hash)
+    }
+
+    /// Tree flush: PMAN v3 root + PMAN v2 leaves (>1024 RGs).
+    ///
+    /// Chunks completed_rgs into leaves of MAX_LEAF_RGS each, writes each
+    /// leaf as a PMAN v2 manifest, then writes a PMAN v3 root pointing to
+    /// all leaves. The root is tiny (~100 B/leaf) and stays under 1 MB even
+    /// at 8K leaves (8.2M RGs, 1 TB of data).
+    fn flush_as_tree(
+        &self,
+        schema: &[(String, u8)],
+        key_col: &str,
+        message: &str,
+    ) -> Result<String, String> {
+        let mut root = RootManifest::new(schema.to_vec(), key_col.to_string());
+
+        // Chunk RGs into leaves
+        for chunk in self.completed_rgs.chunks(MAX_LEAF_RGS) {
+            let mut leaf_manifest = CollectionManifest::new(schema.to_vec(), key_col.to_string());
+            for rg in chunk {
+                leaf_manifest.add_row_group(rg.clone());
+            }
+
+            let leaf_bytes = leaf_manifest.encode();
+            let leaf_hash = self.kernel.write(&leaf_bytes)
+                .map_err(|e| format!("SlabWriter: failed to write leaf manifest: {}", e))?;
+
+            // Compute key range for this leaf
+            let (key_min, key_max) = compute_key_range(chunk, key_col);
+            let total_data_bytes: u64 = chunk.iter()
+                .map(|rg| rg.slab_byte_len.unwrap_or(0) as u64)
+                .sum();
+
+            root.leaves.push(LeafEntry {
+                leaf_hash,
+                n_row_groups: chunk.len() as u32,
+                total_data_bytes,
+                key_min,
+                key_max,
+            });
+        }
+
+        // Write root manifest
+        let root_bytes = root.encode();
+        let root_hash = self.kernel.write(&root_bytes)
+            .map_err(|e| format!("SlabWriter: failed to write root manifest: {}", e))?;
+
+        let commit_hash = self.commit(&root_hash, message)?;
+        Ok(commit_hash)
+    }
+
+    /// Shared commit flow: write commit JSON + update branch refs.
+    fn commit(&self, manifest_hash: &str, message: &str) -> Result<String, String> {
         let parent = self.kernel.resolve(&branch_ref(self.collection, self.active_branch));
         let parent_index = parent.as_ref()
             .and_then(|p| commit::read_commit(self.kernel, p))
             .map(|c| c.index + 1)
             .unwrap_or(0);
 
-        let manifest_bytes = manifest.encode();
-        let manifest_hash = self.kernel.write(&manifest_bytes)
-            .map_err(|e| format!("SlabWriter: failed to write manifest: {}", e))?;
-
         let commit_hash = commit::write_commit(
-            self.kernel, self.collection, &manifest_hash,
+            self.kernel, self.collection, manifest_hash,
             parent.as_deref(), None,
             if message.is_empty() { "slab_write" } else { message },
             parent_index,
@@ -707,7 +786,7 @@ impl<'a> SlabWriter<'a> {
 
         self.kernel.reference(&branch_ref(self.collection, self.active_branch), &commit_hash)
             .map_err(|e| format!("SlabWriter: branch ref failed: {}", e))?;
-        self.kernel.reference(&manifest_ref(self.collection, self.active_branch), &manifest_hash)
+        self.kernel.reference(&manifest_ref(self.collection, self.active_branch), manifest_hash)
             .map_err(|e| format!("SlabWriter: manifest ref failed: {}", e))?;
         let _ = self.kernel.reference(self.collection, &commit_hash);
 
@@ -1003,6 +1082,79 @@ mod tests {
         let result = sw.flush("nothing");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no data"));
+    }
+
+    #[test]
+    fn test_slab_writer_v3_tree_e2e() {
+        // End-to-end: write 3 RGs, manually create a v3 root with 2 leaves,
+        // then read back via resolve_manifest and verify all data.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        // Write 3 RGs via SlabWriter (creates a v2 manifest since ≤1024 RGs)
+        let mut sw = SlabWriter::new(kernel, "tree_test", "main");
+        for i in 0..3 {
+            let ids = vec![(i * 3 + 1) as i64, (i * 3 + 2) as i64, (i * 3 + 3) as i64];
+            let vals = vec![(i * 30 + 10) as i64, (i * 30 + 20) as i64, (i * 30 + 30) as i64];
+            sw.write_rows_i64(&[("id", &ids), ("val", &vals)]).unwrap();
+        }
+        let _commit_hash = sw.flush("v2 baseline").unwrap();
+
+        // Now manually create a v3 tree: split the 3 RGs into 2 leaves
+        // Read the v2 manifest to get the RG entries
+        let head = kernel.resolve(&branch_ref("tree_test", "main")).unwrap();
+        let commit_obj = commit::read_commit(kernel, &head).unwrap();
+        let manifest_bytes = kernel.read_blob(&commit_obj.manifest).unwrap();
+        let v2_manifest = CollectionManifest::decode(&manifest_bytes).unwrap();
+        assert_eq!(v2_manifest.row_groups.len(), 3);
+
+        // Split: leaf 0 = RGs 0,1; leaf 1 = RG 2
+        let leaf0_rgs = &v2_manifest.row_groups[0..2];
+        let leaf1_rgs = &v2_manifest.row_groups[2..3];
+
+        // Create leaf manifests
+        let mut leaf0 = CollectionManifest::new(v2_manifest.columns.clone(), v2_manifest.key_col.clone());
+        for rg in leaf0_rgs { leaf0.add_row_group(rg.clone()); }
+        let leaf0_hash = kernel.write(&leaf0.encode()).unwrap();
+
+        let mut leaf1 = CollectionManifest::new(v2_manifest.columns.clone(), v2_manifest.key_col.clone());
+        for rg in leaf1_rgs { leaf1.add_row_group(rg.clone()); }
+        let leaf1_hash = kernel.write(&leaf1.encode()).unwrap();
+
+        // Create root manifest
+        let (key_min_0, key_max_0) = compute_key_range(leaf0_rgs, &v2_manifest.key_col);
+        let (key_min_1, key_max_1) = compute_key_range(leaf1_rgs, &v2_manifest.key_col);
+        let mut root = RootManifest::new(v2_manifest.columns.clone(), v2_manifest.key_col.clone());
+        root.leaves.push(LeafEntry {
+            leaf_hash: leaf0_hash.clone(), n_row_groups: 2, total_data_bytes: 0,
+            key_min: key_min_0, key_max: key_max_0,
+        });
+        root.leaves.push(LeafEntry {
+            leaf_hash: leaf1_hash.clone(), n_row_groups: 1, total_data_bytes: 0,
+            key_min: key_min_1, key_max: key_max_1,
+        });
+
+        // Write root and point commit at it
+        let root_hash = kernel.write(&root.encode()).unwrap();
+        let new_commit = commit::write_commit(
+            kernel, "tree_test", &root_hash, Some(&head), None,
+            "v3 tree commit", 1,
+        ).unwrap();
+        kernel.reference(&branch_ref("tree_test", "main"), &new_commit).unwrap();
+
+        // Now read back via the standard read path — it should transparently
+        // resolve the v3 root → fetch leaves → merge RGs → read data
+        let cols = crate::read::read_rows_i64(kernel, "tree_test", "main", None, None).unwrap();
+        let id_col = cols.iter().find(|(n, _)| n == "id").unwrap();
+        let val_col = cols.iter().find(|(n, _)| n == "val").unwrap();
+        assert_eq!(id_col.1.len(), 9, "should have 9 rows total");
+        assert_eq!(val_col.1.len(), 9);
+        // Verify first and last values
+        assert_eq!(id_col.1[0], 1);
+        assert_eq!(id_col.1[8], 9);
+        assert_eq!(val_col.1[0], 10);
+        assert_eq!(val_col.1[8], 90);
     }
 
 }

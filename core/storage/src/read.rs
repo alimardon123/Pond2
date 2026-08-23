@@ -4,7 +4,7 @@
 
 use crate::branch_ref;
 use crate::commit;
-use crate::manifest::CollectionManifest;
+use crate::manifest::{CollectionManifest, RootManifest, pman_version};
 use crate::shard;
 use pond_kernel::PondKernel;
 
@@ -29,11 +29,10 @@ pub fn read(
         return Err("HEAD commit has no manifest".to_string());
     }
 
-    // Load the manifest
+    // Load the manifest (handles both v2 flat and v3 tree)
     let manifest_bytes = kernel.read_blob(&commit.manifest)
         .map_err(|e| format!("Failed to read manifest: {}", e))?;
-    let manifest = CollectionManifest::decode(&manifest_bytes)
-        .ok_or_else(|| "Failed to decode manifest".to_string())?;
+    let manifest = resolve_manifest(kernel, &manifest_bytes)?;
 
     // Read ALL row groups (slab-aware) and concatenate.
     // Previous impl only read the first RG — silent data loss for multi-RG.
@@ -76,8 +75,7 @@ pub fn read_all_row_groups(
     }
     let manifest_bytes = kernel.read_blob(&commit.manifest)
         .map_err(|e| format!("Failed to read manifest: {}", e))?;
-    let manifest = CollectionManifest::decode(&manifest_bytes)
-        .ok_or_else(|| "Failed to decode manifest".to_string())?;
+    let manifest = resolve_manifest(kernel, &manifest_bytes)?;
     read_all_row_groups_from_manifest(kernel, &manifest)
 }
 
@@ -138,6 +136,70 @@ fn read_all_row_groups_from_manifest(
 enum RgSource {
     Standalone(usize),
     Slab(usize),
+}
+
+// ---------------------------------------------------------------------------
+// PMAN v3 — Two-level manifest tree read support
+// ---------------------------------------------------------------------------
+
+/// Resolve manifest bytes to a flat `CollectionManifest`, handling both v2 and v3.
+///
+/// For v2 manifests, decodes directly. For v3 root manifests, fetches all leaf
+/// manifests in parallel (via `read_blob_batch`) and merges their row groups
+/// into a single flat `CollectionManifest`.
+///
+/// This is the single entry point that all read paths use to go from
+/// manifest bytes → `CollectionManifest` with all RGs.
+fn resolve_manifest(
+    kernel: &PondKernel,
+    manifest_bytes: &[u8],
+) -> Result<CollectionManifest, String> {
+    match pman_version(manifest_bytes) {
+        Some(3) => {
+            // PMAN v3 root manifest — fetch leaves in parallel
+            let root = RootManifest::decode(manifest_bytes)
+                .ok_or_else(|| "Failed to decode PMAN v3 root manifest".to_string())?;
+
+            if root.leaves.is_empty() {
+                return Err("Root manifest has no leaves".to_string());
+            }
+
+            // Batch-fetch all leaf manifests in parallel
+            let leaf_hashes: Vec<String> = root.leaves.iter()
+                .map(|l| l.leaf_hash.clone())
+                .collect();
+            let leaf_blobs = kernel.read_blob_batch(&leaf_hashes)
+                .map_err(|e| format!("Failed to read leaf manifests: {}", e))?;
+
+            // Decode each leaf and merge row groups
+            let mut all_rgs = Vec::new();
+            let columns = root.columns.clone();
+            let key_col = root.key_col.clone();
+
+            for (i, leaf_bytes) in leaf_blobs.iter().enumerate() {
+                let leaf = CollectionManifest::decode(leaf_bytes)
+                    .ok_or_else(|| {
+                        format!("Failed to decode leaf manifest {} ({})",
+                                i, root.leaves[i].leaf_hash)
+                    })?;
+                all_rgs.extend(leaf.row_groups);
+            }
+
+            let mut flat = CollectionManifest::new(columns, key_col);
+            for rg in all_rgs {
+                flat.add_row_group(rg);
+            }
+            Ok(flat)
+        }
+        Some(1) | Some(2) => {
+            // PMAN v1 or v2 — decode directly
+            CollectionManifest::decode(manifest_bytes)
+                .ok_or_else(|| "Failed to decode PMAN manifest".to_string())
+        }
+        _ => {
+            Err("Unknown manifest format (not PMAN)".to_string())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -416,8 +478,7 @@ pub fn read_at_snapshot(
 
     let manifest_bytes = kernel.read_blob(&commit.manifest)
         .map_err(|e| format!("Failed to read manifest: {}", e))?;
-    let manifest = CollectionManifest::decode(&manifest_bytes)
-        .ok_or_else(|| "Failed to decode manifest".to_string())?;
+    let manifest = resolve_manifest(kernel, &manifest_bytes)?;
 
     // Read ALL row groups (slab-aware) and concatenate.
     // Previous impl only read the first RG — silent data loss for >1 RG.
@@ -480,8 +541,12 @@ pub async fn read_rows_async(
     // 3. Read the manifest blob async.
     let manifest_bytes = kernel.read_blob_async(&commit.manifest).await
         .map_err(|e| format!("Failed to read manifest: {}", e))?;
-    let manifest = CollectionManifest::decode(&manifest_bytes)
-        .ok_or_else(|| "Failed to decode manifest".to_string())?;
+    let kernel_clone1 = kernel.clone();
+    let mb_clone = manifest_bytes.clone();
+    let manifest = tokio::task::spawn_blocking(move || {
+        resolve_manifest(&kernel_clone1, &mb_clone)
+    }).await.map_err(|e| format!("join error: {}", e))?
+      .map_err(|e| e.to_string())?;
 
     // 4. Read ALL row groups (slab-aware) — delegates to sync reader
     // via spawn_blocking. The sync reader uses range reads for slab-backed
@@ -520,8 +585,12 @@ pub async fn read_at_snapshot_async(
 
     let manifest_bytes = kernel.read_blob_async(&commit.manifest).await
         .map_err(|e| format!("Failed to read manifest: {}", e))?;
-    let manifest = CollectionManifest::decode(&manifest_bytes)
-        .ok_or_else(|| "Failed to decode manifest".to_string())?;
+    let kernel_clone1 = kernel.clone();
+    let mb_clone = manifest_bytes.clone();
+    let manifest = tokio::task::spawn_blocking(move || {
+        resolve_manifest(&kernel_clone1, &mb_clone)
+    }).await.map_err(|e| format!("join error: {}", e))?
+      .map_err(|e| e.to_string())?;
 
     // Read ALL row groups (slab-aware) — delegates to sync reader
     // via spawn_blocking for range-read support.
@@ -622,9 +691,8 @@ pub fn read_rows_i64(
             .map_err(|e| format!("Failed to read manifest: {}", e))?
     };
 
-    // Decode manifest
-    let manifest = CollectionManifest::decode(&manifest_bytes)
-        .ok_or_else(|| "Failed to decode manifest".to_string())?;
+    // Decode manifest (handles v2 flat and v3 tree)
+    let manifest = resolve_manifest(kernel, &manifest_bytes)?;
 
     // Build projection set (which columns to decode)
     let projection: Option<std::collections::HashSet<&str>> = columns.map(|cols| {
