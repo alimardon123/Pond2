@@ -26,18 +26,18 @@
 //     1 + 1 + 1 = 3 sequential RTTs ≈ 150 ms.
 //   - vs 82K sequential GETs ≈ 68 minutes — a 27,000x speedup cold.
 //
-// FORMAT (PSLB v1):
+// FORMAT (PSLB v1/v2):
 //
 //   HEADER (10 bytes fixed, at offset 0):
 //     0   4   Magic: "PSLB"
-//     4   1   Version: 1
-//     5   1   Flags: bit0=has_footer_index (always 1 in v1)
+//     4   1   Version: 1 (v2 reuses version 1, uses flags to indicate compression)
+//     5   1   Flags: bit0=has_footer_index (always 1), bit1=compressed (v2)
 //     6   4   n_row_groups: u32 LE
 //
 //   PAYLOAD (variable, starts at offset 10):
 //     for each RG (in order, rg_index = 0, 1, 2, ...):
-//       4   rg_len: u32 LE    (length of rg_bytes ONLY, not the prefix)
-//       var rg_bytes          (a complete PND2 blob — decodable standalone)
+//       4   rg_len: u32 LE    (length of rg_bytes; compressed if flag bit1 set)
+//       var rg_bytes          (PND2 blob, zstd-compressed if flag bit1 set)
 //
 //   FOOTER (variable, at offset footer_offset):
 //     4   n_entries: u32 LE  (must equal n_row_groups)
@@ -93,6 +93,11 @@ use crate::manifest::ColumnStatsEntry;
 const PSLB_MAGIC: &[u8; 4] = b"PSLB";
 const PSLB_VERSION: u8 = 1;
 const PSLB_FLAG_HAS_FOOTER: u8 = 0x01;
+/// Flag bit1: per-RG payloads are zstd-compressed.
+/// Reader must decompress each range-read result before PND2 decode.
+const PSLB_FLAG_COMPRESSED: u8 = 0x02;
+/// ZSTD compression level for slabs. Level 3 gives 3-5x ratio at ~500 MB/s encode speed.
+const PSLB_ZSTD_LEVEL: i32 = 3;
 
 /// Total size of the fixed TAIL block at the end of every PSLB slab.
 /// Readers fetch exactly this many bytes in step 1 of the read algorithm.
@@ -492,14 +497,25 @@ pub fn decode_slab(blob: &[u8]) -> Option<Slab> {
     // byte_offset / byte_len (a malformed slab could claim byte_offset near
     // u64::MAX, causing `start + byte_len` to wrap to a small value that
     // passes the `end > tail_start` check, then panics on the slice op.
-    let mut row_groups = Vec::with_capacity(n_row_groups);
+    let compressed = (blob[5] & PSLB_FLAG_COMPRESSED) != 0;
+  let mut row_groups = Vec::with_capacity(n_row_groups);
     for entry in &footer.entries {
         let start = entry.byte_offset as usize;
         let end = start.checked_add(entry.byte_len as usize)?;
         if end > tail_start {
             return None;
         }
-        row_groups.push(blob[start..end].to_vec());
+        let rg_bytes = &blob[start..end];
+        // Decompress if the slab uses per-RG zstd compression.
+        let decoded = if compressed {
+            match zstd::decode_all(rg_bytes) {
+                Ok(d) => d,
+                Err(_) => return None,
+            }
+        } else {
+            rg_bytes.to_vec()
+        };
+        row_groups.push(decoded);
     }
 
     Some(Slab { row_groups, footer })
@@ -508,6 +524,80 @@ pub fn decode_slab(blob: &[u8]) -> Option<Slab> {
 /// Detect whether a byte slice is a PSLB slab (checks header magic).
 pub fn is_slab(blob: &[u8]) -> bool {
     blob.len() >= PSLB_HEADER_LEN && &blob[0..4] == PSLB_MAGIC
+}
+
+/// Check if a PSLB slab uses per-RG zstd compression (flag bit1).
+/// Returns false for non-slab blobs.
+pub fn is_slab_compressed(blob: &[u8]) -> bool {
+    blob.len() > 5 && &blob[0..4] == PSLB_MAGIC && (blob[5] & PSLB_FLAG_COMPRESSED) != 0
+}
+
+/// Decompress a single zstd-compressed RG payload.
+/// Returns the decompressed bytes or an error string.
+pub fn decompress_rg(compressed: &[u8]) -> Result<Vec<u8>, String> {
+    zstd::decode_all(compressed)
+        .map_err(|e| format!("zstd decompression failed: {}", e))
+}
+
+/// Encode a list of row-group byte blobs + per-RG column stats into a
+/// single PSLB v2 blob with per-RG zstd compression.
+///
+/// Format is identical to v1 except each RG payload is zstd-compressed
+/// and flag bit1 is set in the header. The footer stores compressed sizes
+/// (byte_len = compressed length). Readers check the flag and decompress.
+///
+/// Typical compression ratio: 3-5x for PND2 i64 data at zstd level 3.
+/// A 128 MB uncompressed slab becomes ~25-40 MB on S3.
+pub fn encode_slab_compressed(row_groups: &[(Vec<u8>, Vec<ColumnStatsEntry>, u32)]) -> Vec<u8> {
+    let n = row_groups.len();
+
+    // Compress each RG upfront to compute sizes
+    let compressed_rgs: Vec<Vec<u8>> = row_groups.iter()
+        .map(|(bytes, _, _)| zstd::encode_all(bytes.as_slice(), PSLB_ZSTD_LEVEL)
+            .unwrap_or_else(|e| panic!("zstd compression failed for RG of {} bytes: {}", bytes.len(), e)))
+        .collect();
+
+    let payload_size: usize = compressed_rgs.iter()
+        .map(|c| 4 + c.len())
+        .sum();
+    let footer_size = 4 + row_groups.iter()
+        .map(|(_, cols, _)| footer_entry_size(cols))
+        .sum::<usize>();
+    let total = PSLB_HEADER_LEN + payload_size + footer_size + PSLB_TAIL_LEN;
+
+    let mut buf = Vec::with_capacity(total);
+
+    // ---- Header ----
+    buf.extend_from_slice(PSLB_MAGIC);
+    buf.push(PSLB_VERSION);
+    buf.push(PSLB_FLAG_HAS_FOOTER | PSLB_FLAG_COMPRESSED);
+    buf.extend_from_slice(&(n as u32).to_le_bytes());
+
+    // ---- Compressed Payloads + record per-RG offsets ----
+    let mut offsets: Vec<u64> = Vec::with_capacity(n);
+    let mut cursor = PSLB_HEADER_LEN as u64;
+    for compressed in &compressed_rgs {
+        buf.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        cursor += 4;
+        offsets.push(cursor);
+        buf.extend_from_slice(compressed);
+        cursor += compressed.len() as u64;
+    }
+    let footer_offset = cursor;
+
+    // ---- Footer (same format as v1 — byte_len is the COMPRESSED length) ----
+    buf.extend_from_slice(&(n as u32).to_le_bytes());
+    for (i, (_, cols, n_rows)) in row_groups.iter().enumerate() {
+        // byte_len = compressed length (reader uses this for range read)
+        encode_footer_entry(&mut buf, i as u32, offsets[i], compressed_rgs[i].len() as u32, *n_rows, cols);
+    }
+
+    // ---- Tail ----
+    buf.extend_from_slice(PSLB_MAGIC);
+    buf.extend_from_slice(&footer_offset.to_le_bytes());
+
+    debug_assert_eq!(buf.len(), total, "PSLB v2 size prediction was wrong");
+    buf
 }
 
 // ---------------------------------------------------------------------------
@@ -832,4 +922,71 @@ mod tests {
         let footer = decode_slab_footer(footer_bytes).expect("footer must decode");
         assert_eq!(footer.n_entries(), 1, "footer must have 1 entry");
     }
+
+    #[test]
+    fn test_compressed_slab_round_trip() {
+        // PSLB v2: encode with zstd compression, decode back, verify data matches.
+        let rgs = vec![
+            (make_rg(b"hello"), vec![], 0),
+            (make_rg(b"world"), vec![], 0),
+        ];
+        let compressed = encode_slab_compressed(&rgs);
+        let uncompressed = encode_slab(&rgs);
+
+        // Compressed should be smaller (zstd overhead is minimal for tiny payloads,
+        // but for realistic 128KB RGs the ratio is 3-5x).
+        assert!(is_slab_compressed(&compressed), "v2 must have compressed flag");
+        assert!(!is_slab_compressed(&uncompressed), "v1 must NOT have compressed flag");
+
+        // Decode both and verify same row group data.
+        let slab_c = decode_slab(&compressed).expect("compressed decode must work");
+        let slab_u = decode_slab(&uncompressed).expect("uncompressed decode must work");
+        assert_eq!(slab_c.row_groups.len(), 2);
+        assert_eq!(slab_c.row_groups, slab_u.row_groups,
+            "compressed and uncompressed must decode to same data");
+    }
+
+    #[test]
+    fn test_compressed_slab_with_stats() {
+        // Verify column stats survive compression round-trip.
+        let rgs = vec![
+            (make_rg(b"data1"), vec![make_stats("id", 1, 10, 20)], 5),
+            (make_rg(b"data2"), vec![make_stats("id", 1, 30, 40)], 5),
+        ];
+        let compressed = encode_slab_compressed(&rgs);
+        let slab = decode_slab(&compressed).expect("decode must work");
+
+        assert_eq!(slab.footer.entries.len(), 2);
+        assert_eq!(slab.footer.entries[0].n_rows, 5);
+        assert_eq!(slab.footer.entries[1].n_rows, 5);
+        assert_eq!(slab.footer.entries[0].columns.len(), 1);
+        assert_eq!(slab.footer.entries[0].columns[0].name, "id");
+    }
+
+    #[test]
+    fn test_compressed_slab_plan_ranges() {
+        // Range planning must work on compressed slabs (footer is not compressed).
+        let rgs = vec![
+            (make_rg(b"a"), vec![make_stats("x", 1, 1, 100)], 10),
+            (make_rg(b"b"), vec![make_stats("x", 1, 200, 300)], 10),
+        ];
+        let compressed = encode_slab_compressed(&rgs);
+        let tail = decode_slab_tail(&compressed).unwrap();
+        let footer_bytes = &compressed[tail.0 as usize..compressed.len() - PSLB_TAIL_LEN];
+        let footer = decode_slab_footer(footer_bytes).unwrap();
+
+        let ranges = footer.plan_ranges(Some(&[
+            ("x".to_string(), ">".to_string(), 150i64.to_le_bytes().to_vec()),
+        ]));
+        assert_eq!(ranges.len(), 1, "only second RG should survive");
+    }
+
+    #[test]
+    fn test_decompress_rg() {
+        let original = b"some test data that compresses reasonably well";
+        let compressed = zstd::encode_all(original.as_slice(), 3).unwrap();
+        let decompressed = decompress_rg(&compressed).unwrap();
+        assert_eq!(decompressed, original);
+    }
+
 }

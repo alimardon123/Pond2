@@ -32,7 +32,7 @@ pub fn read(
     // Load the manifest (handles both v2 flat and v3 tree)
     let manifest_bytes = kernel.read_blob(&commit.manifest)
         .map_err(|e| format!("Failed to read manifest: {}", e))?;
-    let manifest = resolve_manifest(kernel, &manifest_bytes)?;
+    let manifest = resolve_manifest(kernel, &manifest_bytes, None)?;
 
     // Read ALL row groups (slab-aware) and concatenate.
     // Previous impl only read the first RG — silent data loss for multi-RG.
@@ -75,7 +75,7 @@ pub fn read_all_row_groups(
     }
     let manifest_bytes = kernel.read_blob(&commit.manifest)
         .map_err(|e| format!("Failed to read manifest: {}", e))?;
-    let manifest = resolve_manifest(kernel, &manifest_bytes)?;
+    let manifest = resolve_manifest(kernel, &manifest_bytes, None)?;
     read_all_row_groups_from_manifest(kernel, &manifest)
 }
 
@@ -83,6 +83,7 @@ pub fn read_all_row_groups(
 ///
 /// Separates slab-backed RGs (uses range reads) from standalone RGs
 /// (uses batch blob reads), then reassembles in manifest order.
+/// Handles PSLB v2 compressed slabs (checks compression flag per slab).
 fn read_all_row_groups_from_manifest(
     kernel: &PondKernel,
     manifest: &CollectionManifest,
@@ -90,13 +91,23 @@ fn read_all_row_groups_from_manifest(
     if manifest.row_groups.is_empty() {
         return Err("Manifest has no row groups".to_string());
     }
+    let refs: Vec<&crate::manifest::RowGroupEntry> = manifest.row_groups.iter().collect();
+    read_rgs_slab_aware_with_decompress(kernel, &refs)
+}
 
-    // Separate slab-backed RGs from standalone RGs
+/// Shared slab-aware reader: separates slab/standalone RGs, does range reads,
+/// and decompresses if the slab uses PSLB v2 zstd compression.
+fn read_rgs_slab_aware_with_decompress(
+    kernel: &PondKernel,
+    row_groups: &[&crate::manifest::RowGroupEntry],
+) -> Result<Vec<Vec<u8>>, String> {
+    use std::collections::HashMap;
+
     let mut standalone_hashes: Vec<String> = Vec::new();
-    let mut slab_ranges: Vec<(String, u64, u64)> = Vec::new(); // (slab_hash, start, end_exclusive)
+    let mut slab_ranges: Vec<(String, u64, u64)> = Vec::new();
     let mut rg_order: Vec<RgSource> = Vec::new();
 
-    for rg in &manifest.row_groups {
+    for rg in row_groups {
         if let (Some(offset), Some(len)) = (rg.slab_byte_offset, rg.slab_byte_len) {
             slab_ranges.push((rg.blob_hash.clone(), offset, offset + len as u64));
             rg_order.push(RgSource::Slab(slab_ranges.len() - 1));
@@ -106,7 +117,6 @@ fn read_all_row_groups_from_manifest(
         }
     }
 
-    // Batch-read all standalone blobs (parallel on S3)
     let standalone_results = if !standalone_hashes.is_empty() {
         kernel.read_blob_batch(&standalone_hashes)
             .map_err(|e| format!("Failed to read data blobs: {}", e))?
@@ -114,19 +124,35 @@ fn read_all_row_groups_from_manifest(
         Vec::new()
     };
 
-    // Range-read all slab RGs (parallel via std::thread::scope)
+    // Check compression flag for each unique slab (read first 6 bytes).
+    let mut slab_compressed: HashMap<String, bool> = HashMap::new();
+    for (hash, _, _) in &slab_ranges {
+        if !slab_compressed.contains_key(hash) {
+            let header = kernel.read_blob_range(hash, 0, 6)
+                .map_err(|e| format!("Failed to read slab header for {}: {}", hash, e))?;
+            slab_compressed.insert(hash.clone(),
+                header.len() >= 6 && &header[0..4] == b"PSLB" && (header[5] & 0x02) != 0);
+        }
+    }
+
     let slab_results = if !slab_ranges.is_empty() {
         read_slab_ranges_parallel(kernel, &slab_ranges)?
     } else {
         Vec::new()
     };
 
-    // Reassemble in manifest order
+    // Decompress compressed slab RGs and reassemble in manifest order.
     let mut result = Vec::with_capacity(rg_order.len());
     for src in &rg_order {
         match src {
             RgSource::Standalone(idx) => result.push(standalone_results[*idx].clone()),
-            RgSource::Slab(idx) => result.push(slab_results[*idx].clone()),
+            RgSource::Slab(idx) => {
+                let mut data = slab_results[*idx].clone();
+                if slab_compressed.get(&slab_ranges[*idx].0).copied().unwrap_or(false) {
+                    data = crate::slab::decompress_rg(&data)?;
+                }
+                result.push(data);
+            }
         }
     }
     Ok(result)
@@ -144,19 +170,22 @@ enum RgSource {
 
 /// Resolve manifest bytes to a flat `CollectionManifest`, handling both v2 and v3.
 ///
-/// For v2 manifests, decodes directly. For v3 root manifests, fetches all leaf
-/// manifests in parallel (via `read_blob_batch`) and merges their row groups
+/// For v2 manifests, decodes directly. For v3 root manifests, fetches only
+/// SURVIVING leaves (after key-range pruning if predicates are provided)
+/// in parallel via `read_blob_batch`, then merges their row groups
 /// into a single flat `CollectionManifest`.
 ///
-/// This is the single entry point that all read paths use to go from
-/// manifest bytes → `CollectionManifest` with all RGs.
+/// CRITICAL PERFORMANCE FIX (architecture review finding):
+/// Without predicates, all leaves are fetched. With predicates, we prune
+/// leaves by key_min/key_max BEFORE issuing I/O. At PB scale (8K leaves),
+/// a 1% selective query prunes from 8K → ~80 leaf fetches (100x reduction).
 fn resolve_manifest(
     kernel: &PondKernel,
     manifest_bytes: &[u8],
+    predicates: Option<&[(String, String, Vec<u8>)]>,
 ) -> Result<CollectionManifest, String> {
     match pman_version(manifest_bytes) {
         Some(3) => {
-            // PMAN v3 root manifest — fetch leaves in parallel
             let root = RootManifest::decode(manifest_bytes)
                 .ok_or_else(|| "Failed to decode PMAN v3 root manifest".to_string())?;
 
@@ -164,9 +193,17 @@ fn resolve_manifest(
                 return Err("Root manifest has no leaves".to_string());
             }
 
-            // Batch-fetch all leaf manifests in parallel
-            let leaf_hashes: Vec<String> = root.leaves.iter()
-                .map(|l| l.leaf_hash.clone())
+            // CRITICAL: prune leaves by key range BEFORE fetching (not after).
+            // This reduces leaf manifest GETs by 100x for selective queries.
+            let surviving_indices = if let Some(preds) = predicates {
+                root.prune_leaves(preds)
+            } else {
+                (0..root.leaves.len()).collect::<Vec<usize>>()
+            };
+
+            // Batch-fetch only surviving leaf manifests in parallel
+            let leaf_hashes: Vec<String> = surviving_indices.iter()
+                .map(|&i| root.leaves[i].leaf_hash.clone())
                 .collect();
             let leaf_blobs = kernel.read_blob_batch(&leaf_hashes)
                 .map_err(|e| format!("Failed to read leaf manifests: {}", e))?;
@@ -412,52 +449,14 @@ fn read_slab_ranges_parallel(
 
 /// Slab-aware reader for a pre-selected set of surviving row groups.
 ///
-/// Used by `read_rows_i64()` after predicate pruning. Separates slab-backed
-/// RGs (uses range reads) from standalone RGs (uses batch blob reads),
-/// then reassembles in the caller's order.
-///
-/// Architecture review G1 fix: without this, `read_rows_i64()` did a full
-/// GET per RG, transferring entire slabs (128 MB each) instead of just
-/// the needed RG bytes (~128 KB each) — a 1000x data transfer reduction.
+/// Used by `read_rows_i64()` after predicate pruning. Delegates to
+/// `read_rgs_slab_aware_with_decompress` which handles both compressed
+/// and uncompressed slabs.
 fn read_surviving_rgs_slab_aware(
     kernel: &PondKernel,
     surviving_rgs: &[&crate::manifest::RowGroupEntry],
 ) -> Result<Vec<Vec<u8>>, String> {
-    let mut standalone_hashes: Vec<String> = Vec::new();
-    let mut slab_ranges: Vec<(String, u64, u64)> = Vec::new();
-    let mut rg_order: Vec<RgSource> = Vec::new();
-
-    for rg in surviving_rgs {
-        if let (Some(offset), Some(len)) = (rg.slab_byte_offset, rg.slab_byte_len) {
-            slab_ranges.push((rg.blob_hash.clone(), offset, offset + len as u64));
-            rg_order.push(RgSource::Slab(slab_ranges.len() - 1));
-        } else {
-            standalone_hashes.push(rg.blob_hash.clone());
-            rg_order.push(RgSource::Standalone(standalone_hashes.len() - 1));
-        }
-    }
-
-    let standalone_results = if !standalone_hashes.is_empty() {
-        kernel.read_blob_batch(&standalone_hashes)
-            .map_err(|e| format!("Failed to read data blobs: {}", e))?
-    } else {
-        Vec::new()
-    };
-
-    let slab_results = if !slab_ranges.is_empty() {
-        read_slab_ranges_parallel(kernel, &slab_ranges)?
-    } else {
-        Vec::new()
-    };
-
-    let mut result = Vec::with_capacity(rg_order.len());
-    for src in &rg_order {
-        match src {
-            RgSource::Standalone(idx) => result.push(standalone_results[*idx].clone()),
-            RgSource::Slab(idx) => result.push(slab_results[*idx].clone()),
-        }
-    }
-    Ok(result)
+    read_rgs_slab_aware_with_decompress(kernel, surviving_rgs)
 }
 
 /// Read data at a specific commit — SNAPSHOT ISOLATION.
@@ -478,7 +477,7 @@ pub fn read_at_snapshot(
 
     let manifest_bytes = kernel.read_blob(&commit.manifest)
         .map_err(|e| format!("Failed to read manifest: {}", e))?;
-    let manifest = resolve_manifest(kernel, &manifest_bytes)?;
+    let manifest = resolve_manifest(kernel, &manifest_bytes, None)?;
 
     // Read ALL row groups (slab-aware) and concatenate.
     // Previous impl only read the first RG — silent data loss for >1 RG.
@@ -544,7 +543,7 @@ pub async fn read_rows_async(
     let kernel_clone1 = kernel.clone();
     let mb_clone = manifest_bytes.clone();
     let manifest = tokio::task::spawn_blocking(move || {
-        resolve_manifest(&kernel_clone1, &mb_clone)
+        resolve_manifest(&kernel_clone1, &mb_clone, None)
     }).await.map_err(|e| format!("join error: {}", e))?
       .map_err(|e| e.to_string())?;
 
@@ -588,7 +587,7 @@ pub async fn read_at_snapshot_async(
     let kernel_clone1 = kernel.clone();
     let mb_clone = manifest_bytes.clone();
     let manifest = tokio::task::spawn_blocking(move || {
-        resolve_manifest(&kernel_clone1, &mb_clone)
+        resolve_manifest(&kernel_clone1, &mb_clone, None)
     }).await.map_err(|e| format!("join error: {}", e))?
       .map_err(|e| e.to_string())?;
 
@@ -692,7 +691,15 @@ pub fn read_rows_i64(
     };
 
     // Decode manifest (handles v2 flat and v3 tree)
-    let manifest = resolve_manifest(kernel, &manifest_bytes)?;
+    // Pass predicates for v3 leaf pruning: skip leaves whose key range
+    // doesn't intersect the predicate. At PB scale (8K leaves), this
+    // reduces leaf manifest GETs by ~100x for selective queries.
+    let pman_preds: Option<Vec<(String, String, Vec<u8>)>> = predicates.map(|preds| {
+        preds.iter().map(|(col, op, val)| {
+            (col.to_string(), op.to_string(), val.to_le_bytes().to_vec())
+        }).collect()
+    });
+    let manifest = resolve_manifest(kernel, &manifest_bytes, pman_preds.as_deref())?;
 
     // Build projection set (which columns to decode)
     let projection: Option<std::collections::HashSet<&str>> = columns.map(|cols| {

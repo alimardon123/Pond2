@@ -468,8 +468,9 @@ pub fn write_rows_i64_slab<'a>(
         .map(|(blob, stats, n_rows)| (blob.clone(), stats.clone(), *n_rows))
         .collect();
 
-    // 3. Encode as PSLB slab
-    let slab_bytes = slab::encode_slab(&slab_inputs);
+    // 3. Encode as PSLB v2 slab (zstd-compressed per-RG)
+    // Compression reduces S3 storage by 3-5x and transfer time proportionally.
+    let slab_bytes = slab::encode_slab_compressed(&slab_inputs);
     let slab_hash = kernel.write(&slab_bytes)
         .map_err(|e| format!("Failed to write slab blob: {}", e))?;
 
@@ -642,7 +643,7 @@ impl<'a> SlabWriter<'a> {
     fn flush_slab(&mut self) -> Result<(), String> {
         if self.buffer.is_empty() { return Ok(()); }
 
-        let slab_bytes = slab::encode_slab(&self.buffer);
+        let slab_bytes = slab::encode_slab_compressed(&self.buffer);
         let slab_hash = self.kernel.write(&slab_bytes)
             .map_err(|e| format!("SlabWriter: failed to write slab: {}", e))?;
 

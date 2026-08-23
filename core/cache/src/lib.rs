@@ -46,7 +46,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use lru::LruCache;
@@ -59,6 +59,18 @@ use pond_kernel::ObjectStore;
 struct RefEntry {
     hash: String,
     inserted_at: Instant,
+}
+
+// ---------------------------------------------------------------------------
+// In-flight request coalescing — prevents thundering herd on hot blobs
+// ---------------------------------------------------------------------------
+
+/// A pending (in-flight) blob fetch. Multiple callers requesting the same
+/// hash concurrently will find this entry, wait on the condvar, and then
+/// read the result from `result` instead of issuing duplicate S3 GETs.
+struct InFlight {
+    /// None = still in progress; Some = completed (Ok or Err).
+    result: Option<io::Result<Vec<u8>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +100,12 @@ pub struct CachingObjectStore {
     /// Running total of bytes on disk. Updated on write/evict.
     disk_usage: Mutex<usize>,
     max_disk_bytes: usize,
+    #[allow(clippy::type_complexity)]
+    /// In-flight request coalescing: prevents thundering herd.
+    /// Maps hash → (Mutex<InFlight>, Condvar). The first requester inserts
+    /// an entry with result=None, does the S3 GET, sets result=Some(...),
+    /// and notifies. Subsequent requesters wait on the condvar.
+    in_flight: Mutex<std::collections::HashMap<String, Arc<(Mutex<InFlight>, Condvar)>>>,
 }
 
 impl CachingObjectStore {
@@ -107,6 +125,7 @@ impl CachingObjectStore {
             access_order: Mutex::new(LruCache::unbounded()),
             disk_usage: Mutex::new(0),
             max_disk_bytes: 1_000_000_000, // 1 GB default
+            in_flight: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -232,11 +251,53 @@ impl ObjectStore for CachingObjectStore {
             }
             return Ok(data);
         }
-        // Cache miss: fetch from inner store.
-        let data = self.inner.get_blob(hash)?;
-        // Populate disk cache.
-        let _ = self.write_blob_to_disk(hash, &data);
-        Ok(data)
+
+        // Request coalescing: check if another thread is already fetching this blob.
+        // If so, wait for it to complete and share the result. This eliminates
+        // thundering herd on hot manifests — 10 concurrent queries hitting
+        // the same manifest issue 1 S3 GET instead of 10.
+        {
+            let mut inflight_map = self.in_flight.lock().unwrap();
+            if let Some(entry) = inflight_map.get(hash) {
+                let (lock, cvar) = &**entry;
+                let mut inflight = lock.lock().unwrap();
+                while inflight.result.is_none() {
+                    inflight = cvar.wait(inflight).unwrap();
+                }
+                return match &inflight.result {
+                    Some(Ok(data)) => Ok(data.clone()),
+                    Some(Err(e)) => Err(io::Error::new(e.kind(), e.to_string())),
+                    None => unreachable!(),
+                };
+            }
+            // Register as the designated fetcher for this hash.
+            let entry = Arc::new((Mutex::new(InFlight { result: None }), Condvar::new()));
+            inflight_map.insert(hash.to_string(), Arc::clone(&entry));
+            // Drop inflight_map lock BEFORE S3 GET so others can wait.
+        }
+
+        // We are the designated fetcher. Do the S3 GET.
+        let fetch_result = self.inner.get_blob(hash);
+
+        // Populate disk cache on success.
+        if let Ok(ref data) = fetch_result {
+            let _ = self.write_blob_to_disk(hash, data);
+        }
+
+        // Wake up all waiters and clean up the in-flight entry.
+        {
+            let entry = {
+                let mut inflight_map = self.in_flight.lock().unwrap();
+                inflight_map.remove(hash).expect("our InFlight entry was removed")
+            };
+            let (lock, cvar) = &*entry;
+            let mut inflight = lock.lock().unwrap();
+            inflight.result = Some(fetch_result);
+            cvar.notify_all();
+        }
+
+        // Read from disk cache (populated above) or return error.
+        self.read_blob_from_disk(hash)
     }
 
     fn put_path(&self, path: &str, hash: &str) -> io::Result<()> {
