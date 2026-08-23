@@ -480,7 +480,7 @@ pub fn write_rows_i64_slab<'a>(
         .ok_or_else(|| "Failed to decode slab tail after encode".to_string())?;
     let footer_offset = tail.0 as usize;
     let footer_end = slab_bytes.len() - slab::PSLB_TAIL_LEN;
-    let footer = slab::decode_slab_footer(&slab_bytes[footer_offset..footer_end])
+    let footer = slab::decode_slab_footer(&slab_bytes[footer_offset..footer_end], false)
         .ok_or_else(|| "Failed to decode slab footer after encode".to_string())?;
 
     // 5. Get parent commit
@@ -651,7 +651,7 @@ impl<'a> SlabWriter<'a> {
         let tail = slab::decode_slab_tail(&slab_bytes)
             .ok_or_else(|| "SlabWriter: slab tail decode failed".to_string())?;
         let footer_end = slab_bytes.len() - slab::PSLB_TAIL_LEN;
-        let footer = slab::decode_slab_footer(&slab_bytes[tail.0 as usize..footer_end])
+        let footer = slab::decode_slab_footer(&slab_bytes[tail.0 as usize..footer_end], false)
             .ok_or_else(|| "SlabWriter: slab footer decode failed".to_string())?;
 
         for (i, (_, col_stats, n_rows)) in self.buffer.iter().enumerate() {

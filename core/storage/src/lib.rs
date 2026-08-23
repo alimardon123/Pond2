@@ -35,6 +35,7 @@ pub mod transaction;
 pub mod maintenance;
 pub mod pond_pack;
 pub mod slab;
+pub mod bloom;
 
 use pond_kernel::PondKernel;
 use std::sync::Mutex;

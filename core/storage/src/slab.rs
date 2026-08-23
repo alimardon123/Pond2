@@ -88,6 +88,7 @@
 //   one full-object GET, which is the same cost as today. Backends that
 //   override `get_blob_range` (LocalFS, S3) get the speedup.
 
+use crate::bloom::BloomFilter;
 use crate::manifest::ColumnStatsEntry;
 
 const PSLB_MAGIC: &[u8; 4] = b"PSLB";
@@ -96,6 +97,8 @@ const PSLB_FLAG_HAS_FOOTER: u8 = 0x01;
 /// Flag bit1: per-RG payloads are zstd-compressed.
 /// Reader must decompress each range-read result before PND2 decode.
 const PSLB_FLAG_COMPRESSED: u8 = 0x02;
+/// Flag bit2: slab footer includes a bloom filter section for point-lookup pruning.
+const PSLB_FLAG_HAS_BLOOM: u8 = 0x04;
 /// ZSTD compression level for slabs. Level 3 gives 3-5x ratio at ~500 MB/s encode speed.
 const PSLB_ZSTD_LEVEL: i32 = 3;
 
@@ -142,10 +145,15 @@ impl SlabEntry {
     }
 }
 
-/// The slab footer — a list of `SlabEntry` records.
+/// The slab footer — a list of `SlabEntry` records + optional bloom filter.
 #[derive(Debug, Clone)]
 pub struct SlabFooter {
     pub entries: Vec<SlabEntry>,
+    /// Optional bloom filter for point-lookup pruning (`=` and `in` predicates).
+    /// When present, `plan_ranges` checks the bloom filter BEFORE zone-map
+    /// pruning for equality predicates — a bloom miss is definitive and skips
+    /// the RG without needing min/max stats.
+    pub bloom: Option<BloomFilter>,
 }
 
 impl SlabFooter {
@@ -156,8 +164,12 @@ impl SlabFooter {
     /// Plan the byte ranges to fetch given optional predicates.
     ///
     /// Without predicates: returns ALL RG byte ranges (full scan).
-    /// With predicates: skips any entry whose zone-map stats prove it cannot
-    /// match — same `can_prune` logic as the existing manifest path.
+    /// With predicates: applies a three-level pruning cascade:
+    ///   1. **Bloom filter** (if present, for `=` / `in` ops): definitive negative test.
+    ///      A bloom miss means the value is NOT in ANY row group — skip all.
+    ///      A bloom hit is inconclusive (could be FP) — proceed to zone-map.
+    ///   2. **Zone-map pruning**: skip RGs whose min/max stats prove no match.
+    ///   3. **Row-level filtering**: done by the caller after decoding.
     ///
     /// Returns a Vec of `(byte_offset, byte_len)` tuples for the reader to
     /// fetch via `get_blob_range(slab_hash, byte_offset, byte_offset + byte_len)`.
@@ -169,10 +181,23 @@ impl SlabFooter {
             None => self.entries.iter()
                 .map(|e| (e.byte_offset, e.byte_len))
                 .collect(),
-            Some(preds) => self.entries.iter()
-                .filter(|e| !e.can_prune(preds))
-                .map(|e| (e.byte_offset, e.byte_len))
-                .collect(),
+            Some(preds) => {
+                // Bloom pre-filter: for each equality predicate, check the bloom
+                // filter. If bloom says "definitely not present", prune the entire
+                // slab (all RGs) — no need to check individual RGs.
+                if let Some(ref bloom) = self.bloom {
+                    for (col_name, op, value) in preds {
+                        if (op == "=" || op == "in") && !bloom.might_contain_col_value(col_name, value) {
+                            return Vec::new();
+                        }
+                    }
+                }
+                // Zone-map pruning per RG (existing logic).
+                self.entries.iter()
+                    .filter(|e| !e.can_prune(preds))
+                    .map(|e| (e.byte_offset, e.byte_len))
+                    .collect()
+            }
         }
     }
 }
@@ -341,12 +366,14 @@ pub fn decode_slab_tail(tail: &[u8]) -> Option<(u64, bool)> {
     Some((footer_offset, valid))
 }
 
-/// Decode the footer bytes (everything between `footer_offset` and
-/// `total_len - PSLB_TAIL_LEN`) into a `SlabFooter`.
+/// Decode the footer bytes into a `SlabFooter`.
 ///
 /// `footer_bytes` should be the exact bytes fetched via
 /// `get_blob_range(slab_hash, footer_offset, total_len - PSLB_TAIL_LEN)`.
-pub fn decode_slab_footer(footer_bytes: &[u8]) -> Option<SlabFooter> {
+///
+/// If `has_bloom_flag` is true and there are remaining bytes after all
+/// entries, a bloom filter section is parsed from the tail of the footer.
+pub fn decode_slab_footer(footer_bytes: &[u8], has_bloom_flag: bool) -> Option<SlabFooter> {
     if footer_bytes.len() < 4 {
         return None;
     }
@@ -450,7 +477,27 @@ pub fn decode_slab_footer(footer_bytes: &[u8]) -> Option<SlabFooter> {
         });
     }
 
-    Some(SlabFooter { entries })
+    // Parse optional bloom filter section (appended after all RG entries).
+    // Format: n_bits(4 u32 LE) + k(1 u8) + bit_bytes(ceil(n_bits/8) bytes).
+    let bloom = if has_bloom_flag && pos + 5 <= footer_bytes.len() {
+        let n_bits = u32::from_le_bytes([
+            footer_bytes[pos], footer_bytes[pos+1],
+            footer_bytes[pos+2], footer_bytes[pos+3],
+        ]) as u64;
+        pos += 4;
+        let k = footer_bytes[pos];
+        pos += 1;
+        let byte_len = n_bits.div_ceil(8) as usize;
+        if pos + byte_len <= footer_bytes.len() {
+            Some(BloomFilter::from_bytes(&footer_bytes[pos..pos + byte_len], n_bits, k as u32))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Some(SlabFooter { entries, bloom })
 }
 
 /// Fully decode a PSLB slab from its full bytes (header + payloads + footer + tail).
@@ -486,8 +533,9 @@ pub fn decode_slab(blob: &[u8]) -> Option<Slab> {
     }
 
     // Decode footer.
+    let has_bloom = (blob[5] & PSLB_FLAG_HAS_BLOOM) != 0;
     let footer_bytes = &blob[footer_offset as usize..tail_start];
-    let footer = decode_slab_footer(footer_bytes)?;
+    let footer = decode_slab_footer(footer_bytes, has_bloom)?;
     if footer.n_entries() != n_row_groups {
         return None;
     }
@@ -601,6 +649,105 @@ pub fn encode_slab_compressed(row_groups: &[(Vec<u8>, Vec<ColumnStatsEntry>, u32
 }
 
 // ---------------------------------------------------------------------------
+// Bloom filter helpers
+// ---------------------------------------------------------------------------
+
+/// Build a bloom filter from per-column raw value bytes.
+///
+/// `columns` is a list of `(column_name, &[raw_value_bytes])` tuples.
+/// Each `raw_value_bytes` is the LE-encoded value (e.g., 8 bytes for i64).
+///
+/// The bloom filter uses column-name-prefixed hashing (col_name + NUL + value)
+/// to prevent cross-column false positives.
+///
+/// The expected_elements is the total count across all columns.
+pub fn build_bloom(columns: &[(&str, &[Vec<u8>])]) -> BloomFilter {
+    let total: usize = columns.iter().map(|(_, vals)| vals.len()).sum();
+    let mut bloom = BloomFilter::new(total.max(1));
+    for (col_name, vals) in columns {
+        for val in *vals {
+            bloom.insert_col_value(col_name, val);
+        }
+    }
+    bloom
+}
+
+/// Serialize a bloom filter section for embedding in a slab footer.
+/// Format: n_bits(4 u32 LE) + k(1 u8) + bit_bytes(ceil(n_bits/8) bytes).
+fn encode_bloom_section(bloom: &BloomFilter) -> Vec<u8> {
+    let num_bits = bloom.num_bits();
+    let mut buf = Vec::with_capacity(5 + num_bits.div_ceil(8) as usize);
+    buf.extend_from_slice(&(num_bits as u32).to_le_bytes());
+    buf.push(bloom.k() as u8);
+    buf.extend_from_slice(&bloom.to_bytes());
+    buf
+}
+
+/// Encode a list of row-group byte blobs + per-RG column stats + bloom filter
+/// into a PSLB v2 blob with zstd compression and bloom.
+///
+/// Same as `encode_slab_compressed` but also embeds a bloom filter in the
+/// footer for point-lookup pruning. The header flag bit2 is set.
+pub fn encode_slab_compressed_with_bloom(
+    row_groups: &[(Vec<u8>, Vec<ColumnStatsEntry>, u32)],
+    bloom: &BloomFilter,
+) -> Vec<u8> {
+    let n = row_groups.len();
+
+    let compressed_rgs: Vec<Vec<u8>> = row_groups.iter()
+        .map(|(bytes, _, _)| zstd::encode_all(bytes.as_slice(), PSLB_ZSTD_LEVEL)
+            .unwrap_or_else(|e| panic!("zstd compression failed for RG of {} bytes: {}", bytes.len(), e)))
+        .collect();
+
+    let bloom_section = encode_bloom_section(bloom);
+
+    let payload_size: usize = compressed_rgs.iter().map(|c| 4 + c.len()).sum();
+    let entries_size: usize = row_groups.iter().map(|(_, cols, _)| footer_entry_size(cols)).sum();
+    let footer_size = 4 + entries_size + bloom_section.len();
+    let total = PSLB_HEADER_LEN + payload_size + footer_size + PSLB_TAIL_LEN;
+
+    let mut buf = Vec::with_capacity(total);
+
+    // ---- Header ----
+    buf.extend_from_slice(PSLB_MAGIC);
+    buf.push(PSLB_VERSION);
+    buf.push(PSLB_FLAG_HAS_FOOTER | PSLB_FLAG_COMPRESSED | PSLB_FLAG_HAS_BLOOM);
+    buf.extend_from_slice(&(n as u32).to_le_bytes());
+
+    // ---- Compressed Payloads ----
+    let mut offsets: Vec<u64> = Vec::with_capacity(n);
+    let mut cursor = PSLB_HEADER_LEN as u64;
+    for compressed in &compressed_rgs {
+        buf.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        cursor += 4;
+        offsets.push(cursor);
+        buf.extend_from_slice(compressed);
+        cursor += compressed.len() as u64;
+    }
+    let footer_offset = cursor;
+
+    // ---- Footer (entries + bloom section) ----
+    buf.extend_from_slice(&(n as u32).to_le_bytes());
+    for (i, (_, cols, n_rows)) in row_groups.iter().enumerate() {
+        encode_footer_entry(&mut buf, i as u32, offsets[i], compressed_rgs[i].len() as u32, *n_rows, cols);
+    }
+    buf.extend_from_slice(&bloom_section);
+
+    // ---- Tail ----
+    buf.extend_from_slice(PSLB_MAGIC);
+    buf.extend_from_slice(&footer_offset.to_le_bytes());
+
+    debug_assert_eq!(buf.len(), total, "PSLB v2+bloom size prediction was wrong");
+    buf
+}
+
+/// Check if a PSLB slab has an embedded bloom filter (flag bit2).
+/// Returns false for non-slab blobs.
+pub fn is_slab_has_bloom(blob: &[u8]) -> bool {
+    blob.len() > 5 && &blob[0..4] == PSLB_MAGIC && (blob[5] & PSLB_FLAG_HAS_BLOOM) != 0
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -667,7 +814,7 @@ mod tests {
 
         // Now fetch the footer (between footer_offset and total - 12).
         let footer_bytes = &blob[footer_offset as usize..total - PSLB_TAIL_LEN];
-        let footer = decode_slab_footer(footer_bytes).expect("footer decode");
+        let footer = decode_slab_footer(footer_bytes, false).expect("footer decode");
         assert_eq!(footer.n_entries(), 2);
         // byte_offset points to the rg_bytes start (AFTER the 4-byte length prefix).
         // First RG: header(10) + 4-byte length prefix → rg_bytes at offset 14.
@@ -919,7 +1066,7 @@ mod tests {
         // footer_offset must point to the actual footer, not garbage.
         let total = blob.len();
         let footer_bytes = &blob[footer_offset as usize..total - PSLB_TAIL_LEN];
-        let footer = decode_slab_footer(footer_bytes).expect("footer must decode");
+        let footer = decode_slab_footer(footer_bytes, false).expect("footer must decode");
         assert_eq!(footer.n_entries(), 1, "footer must have 1 entry");
     }
 
@@ -973,7 +1120,7 @@ mod tests {
         let compressed = encode_slab_compressed(&rgs);
         let tail = decode_slab_tail(&compressed).unwrap();
         let footer_bytes = &compressed[tail.0 as usize..compressed.len() - PSLB_TAIL_LEN];
-        let footer = decode_slab_footer(footer_bytes).unwrap();
+        let footer = decode_slab_footer(footer_bytes, false).unwrap();
 
         let ranges = footer.plan_ranges(Some(&[
             ("x".to_string(), ">".to_string(), 150i64.to_le_bytes().to_vec()),
@@ -987,6 +1134,136 @@ mod tests {
         let compressed = zstd::encode_all(original.as_slice(), 3).unwrap();
         let decompressed = decompress_rg(&compressed).unwrap();
         assert_eq!(decompressed, original);
+    }
+
+    // ---- Bloom filter integration tests ----
+
+    #[test]
+    fn test_bloom_slab_encode_decode_roundtrip() {
+        // Build a bloom filter with known values.
+        let values_id: Vec<Vec<u8>> = (0..100i64).map(|v| v.to_le_bytes().to_vec()).collect();
+        let values_name: Vec<Vec<u8>> = (0..100).map(|i| format!("user_{}", i).into_bytes()).collect();
+        let bloom = build_bloom(&[
+            ("id", &values_id),
+            ("name", &values_name),
+        ]);
+
+        let rgs = vec![
+            (make_rg(b"rg0"), vec![make_stats("id", 1, 0, 49)], 50),
+            (make_rg(b"rg1"), vec![make_stats("id", 1, 50, 99)], 50),
+        ];
+
+        let blob = encode_slab_compressed_with_bloom(&rgs, &bloom);
+
+        // Verify flags
+        assert!(is_slab(&blob));
+        assert!(is_slab_compressed(&blob));
+        assert!(is_slab_has_bloom(&blob));
+
+        // Full decode
+        let slab = decode_slab(&blob).expect("bloom slab must decode");
+        assert_eq!(slab.row_groups.len(), 2);
+        assert_eq!(slab.row_groups[0], b"rg0");
+        assert_eq!(slab.row_groups[1], b"rg1");
+
+        // Bloom filter must be present in footer
+        assert!(slab.footer.bloom.is_some(), "bloom must be in footer");
+    }
+
+    #[test]
+    fn test_bloom_slab_prunes_point_lookup_miss() {
+        // Build bloom with values 0..100 for column "id".
+        let values: Vec<Vec<u8>> = (0..100i64).map(|v| v.to_le_bytes().to_vec()).collect();
+        let bloom = build_bloom(&[("id", &values)]);
+
+        let rgs = vec![
+            (make_rg(b"rg0"), vec![make_stats("id", 1, 0, 49)], 50),
+            (make_rg(b"rg1"), vec![make_stats("id", 1, 50, 99)], 50),
+        ];
+
+        let blob = encode_slab_compressed_with_bloom(&rgs, &bloom);
+        let slab = decode_slab(&blob).unwrap();
+        let footer = &slab.footer;
+
+        // Value 999 is NOT in the bloom filter → entire slab pruned.
+        let ranges = footer.plan_ranges(Some(&[
+            ("id".to_string(), "=".to_string(), 999i64.to_le_bytes().to_vec()),
+        ]));
+        assert_eq!(ranges.len(), 0, "bloom miss should prune entire slab");
+
+        // Value 42 IS in the bloom filter → proceeds to zone-map (which passes).
+        let ranges = footer.plan_ranges(Some(&[
+            ("id".to_string(), "=".to_string(), 42i64.to_le_bytes().to_vec()),
+        ]));
+        assert_eq!(ranges.len(), 1, "bloom hit should proceed to zone-map (only RG0 contains 42)");
+    }
+
+    #[test]
+    fn test_bloom_slab_no_bloom_falls_back_to_zonemap() {
+        // Slab without bloom: zone-map pruning still works.
+        let rgs = vec![
+            (make_rg(b"rg0"), vec![make_stats("id", 1, 0, 49)], 50),
+            (make_rg(b"rg1"), vec![make_stats("id", 1, 50, 99)], 50),
+        ];
+
+        let blob = encode_slab_compressed(&rgs);
+        let slab = decode_slab(&blob).unwrap();
+
+        // No bloom filter → always None.
+        assert!(slab.footer.bloom.is_none());
+
+        // Zone-map pruning still works.
+        let ranges = slab.footer.plan_ranges(Some(&[
+            ("id".to_string(), ">".to_string(), 200i64.to_le_bytes().to_vec()),
+        ]));
+        assert_eq!(ranges.len(), 0, "zone-map should prune all RGs");
+    }
+
+    #[test]
+    fn test_bloom_slab_cross_column_isolation() {
+        // Value 42 in column "id" should NOT match column "age".
+        let id_values: Vec<Vec<u8>> = (0..10i64).map(|v| v.to_le_bytes().to_vec()).collect();
+        let bloom = build_bloom(&[("id", &id_values)]);
+
+        let rgs = vec![
+            (make_rg(b"rg0"), vec![make_stats("id", 1, 0, 9)], 10),
+        ];
+
+        let blob = encode_slab_compressed_with_bloom(&rgs, &bloom);
+        let slab = decode_slab(&blob).unwrap();
+
+        // Query for age=5 (value 5 is in bloom for "id", NOT for "age")
+        let ranges = slab.footer.plan_ranges(Some(&[
+            ("age".to_string(), "=".to_string(), 5i64.to_le_bytes().to_vec()),
+        ]));
+        assert_eq!(ranges.len(), 0, "cross-column bloom miss should prune entire slab");
+    }
+
+    #[test]
+    fn test_bloom_section_backward_compat() {
+        // A v2 compressed slab without bloom should still decode fine.
+        let rgs = vec![(make_rg(b"data"), vec![], 1)];
+        let blob = encode_slab_compressed(&rgs);
+
+        let slab = decode_slab(&blob).unwrap();
+        assert!(slab.footer.bloom.is_none());
+        assert_eq!(slab.row_groups[0], b"data");
+    }
+
+    #[test]
+    fn test_bloom_build_and_check() {
+        // Unit test for build_bloom helper.
+        let vals: Vec<Vec<u8>> = vec![
+            1i64.to_le_bytes().to_vec(),
+            2i64.to_le_bytes().to_vec(),
+            3i64.to_le_bytes().to_vec(),
+        ];
+        let bloom = build_bloom(&[("col", &vals)]);
+
+        assert!(bloom.might_contain_col_value("col", &1i64.to_le_bytes()));
+        assert!(bloom.might_contain_col_value("col", &2i64.to_le_bytes()));
+        assert!(bloom.might_contain_col_value("col", &3i64.to_le_bytes()));
+        assert!(!bloom.might_contain_col_value("col", &999i64.to_le_bytes()));
     }
 
 }
