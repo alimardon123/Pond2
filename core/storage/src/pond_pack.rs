@@ -30,7 +30,7 @@
 
 use serde_json::Value;
 
-const PNPK_MAGIC: &[u8; 4] = b"PNPK";
+pub const PNPK_MAGIC: &[u8; 4] = b"PNPK";
 const PNPK_VERSION: u8 = 2;
 
 const FLAG_HAS_INLINE_DATA: u8 = 0x01;

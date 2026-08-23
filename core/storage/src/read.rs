@@ -140,17 +140,133 @@ enum RgSource {
     Slab(usize),
 }
 
-/// Parallel range-read multiple byte ranges from (possibly different) slabs.
+// ---------------------------------------------------------------------------
+// G5: Range Coalescing
+// ---------------------------------------------------------------------------
+
+/// Maximum gap (bytes) to tolerate when coalescing ranges in the same slab
+/// into a single Range GET.
 ///
-/// Uses `std::thread::scope` for zero-overhead parallelism.
-/// On S3, each range-read is an HTTP Range GET (206 Partial Content).
-/// On LocalFS, each is a seek+read_exact (avoids loading the whole file).
+/// PSLB slabs pack RGs sequentially with a 4-byte `rg_len` prefix between
+/// them. Consecutive RGs in the manifest have a 4-byte gap between the end
+/// of one RG's data and the start of the next. Setting this ≥ 4 merges
+/// consecutive RGs into one Range GET.
+///
+/// **Full-scan impact**: 1024 RGs in one slab → 1 Range GET (vs 1024).
+/// **Selective impact**: surviving RGs separated by small pruned regions are
+/// also merged, trading bandwidth for fewer round-trips. 1 MB extra data on
+/// 10 Gbps costs ~0.8 ms vs 20-50 ms S3 RTT — a 25-60x win per merge.
+const COALESCE_GAP_TOLERANCE: u64 = 8;
+
+/// Result of coalescing multiple ranges from the same slab into one range.
+struct CoalescedRange {
+    /// The slab's content hash.
+    slab_hash: String,
+    /// Merged byte range: `[start, end)` (half-open, exclusive end).
+    start: u64,
+    end: u64,
+    /// Per-original-range split instructions: `(original_index, offset_within_coalesced, len)`.
+    /// After fetching the coalesced bytes, slice `data[offset..offset+len]` to
+    /// recover each original RG's bytes.
+    splits: Vec<(usize, usize, usize)>,
+}
+
+/// Coalesce byte ranges that share the same slab hash and are within
+/// `gap_tolerance` bytes of each other.
+///
+/// **Algorithm**:
+/// 1. Group ranges by slab hash.
+/// 2. Sort each group by start offset.
+/// 3. Merge consecutive ranges whose gap ≤ `gap_tolerance`.
+/// 4. Record split instructions to re-extract each original range later.
+///
+/// Returns the coalesced ranges. The caller issues one Range GET per
+/// coalesced range, then uses `CoalescedRange::splits` to recover per-RG
+/// byte blobs from the (larger) response.
+fn coalesce_ranges(
+    ranges: &[(String, u64, u64)],
+    gap_tolerance: u64,
+) -> Vec<CoalescedRange> {
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+
+    use std::collections::BTreeMap;
+
+    // Group by slab hash, preserving original indices.
+    let mut by_slab: BTreeMap<&str, Vec<(usize, u64, u64)>> = BTreeMap::new();
+    for (i, (hash, start, end)) in ranges.iter().enumerate() {
+        by_slab.entry(hash.as_str()).or_default().push((i, *start, *end));
+    }
+
+    let mut result = Vec::new();
+
+    for (hash, entries) in &by_slab {
+        // Sort by start offset within this slab.
+        let mut sorted: Vec<(usize, u64, u64)> = entries.clone();
+        sorted.sort_by_key(|e| e.1);
+
+        // Merge pass: walk sorted ranges, extending the current coalesced
+        // range as long as the next range starts within `gap_tolerance`.
+        let mut merge_start = sorted[0].1;
+        let mut merge_end = sorted[0].2;
+        let mut splits: Vec<(usize, usize, usize)> = Vec::new();
+
+        splits.push((
+            sorted[0].0,                                          // original index
+            0,                                                     // offset within coalesced range
+            (sorted[0].2 - sorted[0].1) as usize,                 // length
+        ));
+
+        for &(orig_idx, r_start, r_end) in &sorted[1..] {
+            if r_start <= merge_end + gap_tolerance {
+                // Coalesce: extend the current merged range and record split.
+                let offset_in_coalesced = (r_start - merge_start) as usize;
+                splits.push((orig_idx, offset_in_coalesced, (r_end - r_start) as usize));
+                merge_end = merge_end.max(r_end);
+            } else {
+                // Gap too large — emit current coalesced range, start new one.
+                result.push(CoalescedRange {
+                    slab_hash: hash.to_string(),
+                    start: merge_start,
+                    end: merge_end,
+                    splits: std::mem::take(&mut splits),
+                });
+                merge_start = r_start;
+                merge_end = r_end;
+                splits.push((orig_idx, 0, (r_end - r_start) as usize));
+            }
+        }
+
+        // Emit the last coalesced range for this slab.
+        result.push(CoalescedRange {
+            slab_hash: hash.to_string(),
+            start: merge_start,
+            end: merge_end,
+            splits,
+        });
+    }
+
+    result
+}
+
 /// Max parallel range reads. 32 saturates a 10 Gbps link to S3 without
 /// hitting rate limits or exhausting connection pools. Prevents thread exhaustion
 /// at PB scale where thousands of slab ranges could otherwise spawn thousands
 /// of threads simultaneously.
 const MAX_PARALLEL_RANGE_READS: usize = 32;
 
+/// Parallel range-read multiple byte ranges from (possibly different) slabs.
+///
+/// **G5 range coalescing**: before issuing any I/O, adjacent ranges in the
+/// same slab are merged into single Range GETs. For a full-scan of 1024 RGs
+/// in one slab, this turns 1024 Range GETs into 1. For selective queries,
+/// surviving RGs separated by small gaps (≤ `COALESCE_GAP_TOLERANCE`) are
+/// also merged, trading minimal bandwidth for fewer RTTs.
+///
+/// Uses `std::thread::scope` for zero-overhead parallelism.
+/// On S3, each range-read is an HTTP Range GET (206 Partial Content).
+/// On LocalFS, each is a seek+read_exact (avoids loading the whole file).
 fn read_slab_ranges_parallel(
     kernel: &PondKernel,
     ranges: &[(String, u64, u64)],
@@ -162,7 +278,11 @@ fn read_slab_ranges_parallel(
     let n = ranges.len();
     if n == 0 { return Ok(Vec::new()); }
 
-    let results = Arc::new(Mutex::new(vec![Vec::new(); n]));
+    // --- G5: coalesce adjacent ranges in the same slab ---
+    let coalesced = coalesce_ranges(ranges, COALESCE_GAP_TOLERANCE);
+    let n_coalesced = coalesced.len();
+
+    let coalesced_results = Arc::new(Mutex::new(vec![Vec::new(); n_coalesced]));
     let failed = Arc::new(AtomicBool::new(false));
     let error_msg = Arc::new(Mutex::new(None::<String>));
 
@@ -177,14 +297,14 @@ fn read_slab_ranges_parallel(
     let tx = Arc::new(tx);
 
     thread::scope(|s| {
-        for (i, (hash, start, end)) in ranges.iter().enumerate() {
+        for (i, cr) in coalesced.iter().enumerate() {
             if failed.load(Ordering::Relaxed) { break; }
             // Acquire a permit (blocks if 32 threads already running).
             rx.recv().expect("permit channel closed unexpectedly");
-            let hash = hash.clone();
-            let start = *start;
-            let end = *end;
-            let results = Arc::clone(&results);
+            let hash = cr.slab_hash.clone();
+            let start = cr.start;
+            let end = cr.end;
+            let results = Arc::clone(&coalesced_results);
             let failed = Arc::clone(&failed);
             let error_msg = Arc::clone(&error_msg);
             let tx = Arc::clone(&tx);
@@ -215,8 +335,15 @@ fn read_slab_ranges_parallel(
     match &*err {
         Some(e) => Err(e.clone()),
         None => {
-            let guard = results.lock().unwrap();
-            Ok(guard.clone())
+            let guard = coalesced_results.lock().unwrap();
+            // --- G5: split coalesced results back into per-RG blobs ---
+            let mut results = vec![Vec::new(); n];
+            for (cr, cr_data) in coalesced.iter().zip(guard.iter()) {
+                for &(orig_idx, offset, len) in &cr.splits {
+                    results[orig_idx] = cr_data[offset..offset + len].to_vec();
+                }
+            }
+            Ok(results)
         }
     }
 }
@@ -466,18 +593,24 @@ pub fn read_rows_i64(
     let head = kernel.resolve(&branch_ref(collection, branch))
         .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
 
-    // Check if HEAD is a PondPack blob
-    let head_data = kernel.read_blob(&head)
-        .map_err(|e| format!("Failed to read HEAD: {}", e))?;
+    // Check if HEAD is a PondPack blob.
+    // Optimization (G6): first fetch only 4 bytes to check the magic,
+    // avoiding a full GET for the common case (plain commit JSON,
+    // typically ~200 bytes). PondPack blobs have PNPK magic at offset 0.
+    let head_magic = kernel.read_blob_range(&head, 0, 4)
+        .map_err(|e| format!("Failed to read HEAD magic: {}", e))?;
+    let is_pack = head_magic.len() >= 4 && &head_magic[..4] == b"PNPK";
 
-    let manifest_bytes = if crate::pond_pack::is_pack(&head_data) {
-        // PondPack — extract manifest from the pack
+    let manifest_bytes = if is_pack {
+        // PondPack — need the full HEAD blob to extract manifest
+        let head_data = kernel.read_blob(&head)
+            .map_err(|e| format!("Failed to read HEAD: {}", e))?;
         let (commit, manifest_bytes, _inline) = crate::pond_pack::decode_pack(&head_data)
             .ok_or_else(|| "Failed to decode PondPack".to_string())?;
         let _ = commit; // commit metadata not needed for read
         manifest_bytes
     } else {
-        // Old format — read commit, then manifest separately
+        // Plain commit — read commit JSON (typically ~200 bytes), then manifest
         let commit = commit::read_commit(kernel, &head)
             .ok_or_else(|| "Failed to read HEAD commit".to_string())?;
 
@@ -510,8 +643,9 @@ pub fn read_rows_i64(
     // For 82 surviving RGs in 8 slabs at PB scale, this transferred 1 GB
     // instead of 10.5 MB. Fixed: now uses get_blob_range() for slab-backed RGs.
     //
-    // Future: range coalescing (G5) can merge adjacent RG ranges in the
-    // same slab into a single Range GET, reducing 82 range reads to ~8.
+    // G5 (range coalescing): adjacent RGs in the same slab are merged into a
+    // single Range GET before I/O, then split apart after. For a full-scan of
+    // 1024 RGs in one slab this turns 1024 Range GETs into 1.
 
     // 1. Predicate pruning — collect surviving RGs
     let surviving_rgs: Vec<&crate::manifest::RowGroupEntry> = manifest.row_groups.iter()
@@ -519,7 +653,7 @@ pub fn read_rows_i64(
             if let Some(preds) = predicates {
                 for (col_name, op, value) in preds {
                     if let Some(stats) = rg.columns.iter().find(|c| c.name == *col_name) {
-                        if can_prune_row_group(stats, op, *value) {
+                        if stats.can_prune(op, value.to_le_bytes().as_ref()) {
                             return false;
                         }
                     }
@@ -575,38 +709,6 @@ pub fn read_rows_i64(
     Ok(result)
 }
 
-/// Check if a row group can be pruned based on column stats + predicate.
-///
-/// Returns true if the row group CANNOT match the predicate (should be skipped).
-fn can_prune_row_group(
-    stats: &crate::manifest::ColumnStatsEntry,
-    op: &str,
-    value: i64,
-) -> bool {
-    let (min, max) = match (&stats.min, &stats.max) {
-        (Some(m), Some(x)) if m.len() >= 8 && x.len() >= 8 => {
-            let min_val = i64::from_le_bytes([
-                m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]
-            ]);
-            let max_val = i64::from_le_bytes([
-                x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]
-            ]);
-            (min_val, max_val)
-        }
-        _ => return false, // No stats — can't prune
-    };
-
-    match op {
-        "=" | "==" => value < min || value > max,
-        "<" => min >= value,
-        "<=" => min > value,
-        ">" => max <= value,
-        ">=" => max < value,
-        "!=" | "<>" => false, // Can't prune != (row group might have other values)
-        _ => false,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -616,6 +718,130 @@ mod tests {
     use super::*;
     use crate::UnifiedStorage;
     use crate::write;
+
+    // ------------------------------------------------------------------
+    // G5 coalesce_ranges unit tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_coalesce_empty() {
+        let ranges: Vec<(String, u64, u64)> = Vec::new();
+        let coalesced = coalesce_ranges(&ranges, 8);
+        assert!(coalesced.is_empty());
+    }
+
+    #[test]
+    fn test_coalesce_single_range() {
+        let ranges = vec![
+            ("h1".to_string(), 100, 200),
+        ];
+        let coalesced = coalesce_ranges(&ranges, 8);
+        assert_eq!(coalesced.len(), 1);
+        assert_eq!(coalesced[0].slab_hash, "h1");
+        assert_eq!(coalesced[0].start, 100);
+        assert_eq!(coalesced[0].end, 200);
+        assert_eq!(coalesced[0].splits, vec![(0, 0, 100)]);
+    }
+
+    #[test]
+    fn test_coalesce_adjacent_ranges_same_slab() {
+        // Two consecutive RGs in a PSLB slab: RG0=[14,114), RG1=[118,218)
+        // Gap = 4 bytes (the rg_len prefix). With tolerance=8, should merge.
+        let ranges = vec![
+            ("slab_a".to_string(), 14, 114),
+            ("slab_a".to_string(), 118, 218),
+        ];
+        let coalesced = coalesce_ranges(&ranges, 8);
+        assert_eq!(coalesced.len(), 1, "two adjacent RGs should coalesce into 1");
+        assert_eq!(coalesced[0].start, 14);
+        assert_eq!(coalesced[0].end, 218);
+        // RG0: offset 0, len 100. RG1: offset 104 (118-14), len 100.
+        assert_eq!(coalesced[0].splits, vec![(0, 0, 100), (1, 104, 100)]);
+    }
+
+    #[test]
+    fn test_coalesce_many_adjacent_ranges() {
+        // 1024 consecutive RGs packed in one slab with 4-byte gaps.
+        // Each RG is 100 bytes. Offsets: 14, 118, 222, 326, ...
+        let mut ranges = Vec::new();
+        let rg_len: u64 = 100;
+        let header_len: u64 = 10;
+        for i in 0..1024u64 {
+            let offset = header_len + 4 + i * (4 + rg_len); // first RG at 14
+            ranges.push(("big_slab".to_string(), offset, offset + rg_len));
+        }
+        let coalesced = coalesce_ranges(&ranges, 8);
+        assert_eq!(coalesced.len(), 1, "1024 adjacent RGs should coalesce into 1 Range GET");
+        assert_eq!(coalesced[0].splits.len(), 1024);
+        // Verify first and last splits.
+        assert_eq!(coalesced[0].splits[0], (0, 0, 100));
+        let last_offset = (1023 * (4 + rg_len)) as usize; // 1023 * 104 = 106392
+        assert_eq!(coalesced[0].splits[1023], (1023, last_offset, 100));
+    }
+
+    #[test]
+    fn test_coalesce_different_slabs_not_merged() {
+        // Ranges from different slabs must NOT coalesce.
+        let ranges = vec![
+            ("slab_x".to_string(), 14, 114),
+            ("slab_y".to_string(), 14, 114),
+        ];
+        let coalesced = coalesce_ranges(&ranges, 8);
+        assert_eq!(coalesced.len(), 2, "different slabs must stay separate");
+    }
+
+    #[test]
+    fn test_coalesce_large_gap_not_merged() {
+        // Two RGs in the same slab separated by a large gap (e.g., a pruned RG).
+        // Gap = 500 bytes. Tolerance = 8. Should NOT merge.
+        let ranges = vec![
+            ("slab_a".to_string(), 14, 114),
+            ("slab_a".to_string(), 614, 714),  // gap = 500 bytes
+        ];
+        let coalesced = coalesce_ranges(&ranges, 8);
+        assert_eq!(coalesced.len(), 2, "large gap should prevent coalescing");
+    }
+
+    #[test]
+    fn test_coalesce_large_gap_with_high_tolerance() {
+        // Same as above but with tolerance=1000 — should merge.
+        let ranges = vec![
+            ("slab_a".to_string(), 14, 114),
+            ("slab_a".to_string(), 614, 714),  // gap = 500 bytes
+        ];
+        let coalesced = coalesce_ranges(&ranges, 1000);
+        assert_eq!(coalesced.len(), 1, "tolerance=1000 should bridge the 500-byte gap");
+        assert_eq!(coalesced[0].start, 14);
+        assert_eq!(coalesced[0].end, 714);
+        assert_eq!(coalesced[0].splits[0], (0, 0, 100));
+        assert_eq!(coalesced[0].splits[1], (1, 600, 100)); // offset 614-14=600
+    }
+
+    #[test]
+    fn test_coalesce_preserves_original_order_in_splits() {
+        // Ranges arrive out of order (e.g., from scattered surviving RGs).
+        // Coalescing must still map each split back to the correct original index.
+        let ranges = vec![
+            ("s".to_string(), 100, 200),  // orig idx 0
+            ("s".to_string(), 300, 400),  // orig idx 1
+            ("s".to_string(), 200, 300),  // orig idx 2 — between 0 and 1
+        ];
+        let coalesced = coalesce_ranges(&ranges, 8);
+        // After sorting by offset: 100-200, 200-300, 300-400. All adjacent → 1 coalesced.
+        assert_eq!(coalesced.len(), 1);
+        assert_eq!(coalesced[0].splits.len(), 3);
+        // Verify each split maps to the right original index.
+        let split_origins: Vec<usize> = coalesced[0].splits.iter().map(|(i,_,_)| *i).collect();
+        assert_eq!(split_origins, vec![0, 2, 1]); // sorted by offset
+        // Verify offsets are correct.
+        assert_eq!(coalesced[0].splits[0], (0, 0, 100));      // [100,200) → offset 0
+        assert_eq!(coalesced[0].splits[1], (2, 100, 100));     // [200,300) → offset 100
+        assert_eq!(coalesced[0].splits[2], (1, 200, 100));     // [300,400) → offset 200
+    }
+
+    // ------------------------------------------------------------------
+    // Existing read-path tests
+    // ------------------------------------------------------------------
 
     #[test]
     fn test_read_returns_head_data() {
