@@ -189,21 +189,22 @@ pub struct Slab {
 /// single PSLB v1 blob.
 ///
 /// `row_groups[i].0` is the PND2 bytes; `row_groups[i].1` is the per-column
-/// stats (can be empty if stats are not available — reader won't prune).
+/// stats (can be empty if stats are not available — reader won't prune);
+/// `row_groups[i].2` is the row count for that RG.
 ///
 /// Returns the full slab bytes (header + payloads + footer + tail). The
 /// caller should `kernel.write(&slab_bytes)` to get a content-addressed hash.
-pub fn encode_slab(row_groups: &[(Vec<u8>, Vec<ColumnStatsEntry>)]) -> Vec<u8> {
+pub fn encode_slab(row_groups: &[(Vec<u8>, Vec<ColumnStatsEntry>, u32)]) -> Vec<u8> {
     let n = row_groups.len();
 
     // Pre-compute total size to avoid reallocations.
     // Payload = 4-byte length prefix + RG bytes (NO footer entry here —
     // footer entries are appended after all payloads, see below).
     let payload_size: usize = row_groups.iter()
-        .map(|(bytes, _)| 4 + bytes.len())
+        .map(|(bytes, _, _)| 4 + bytes.len())
         .sum();
     let footer_size = 4 + row_groups.iter()
-        .map(|(_, cols)| footer_entry_size(cols))
+        .map(|(_, cols, _)| footer_entry_size(cols))
         .sum::<usize>();
     let total = PSLB_HEADER_LEN + payload_size + footer_size + PSLB_TAIL_LEN;
 
@@ -219,7 +220,7 @@ pub fn encode_slab(row_groups: &[(Vec<u8>, Vec<ColumnStatsEntry>)]) -> Vec<u8> {
     // We need the offset of each rg_bytes (the byte AFTER the 4-byte length prefix).
     let mut offsets: Vec<u64> = Vec::with_capacity(n);
     let mut cursor = PSLB_HEADER_LEN as u64;
-    for (bytes, _) in row_groups {
+    for (bytes, _, _) in row_groups {
         // rg_len prefix
         buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         cursor += 4;
@@ -232,8 +233,8 @@ pub fn encode_slab(row_groups: &[(Vec<u8>, Vec<ColumnStatsEntry>)]) -> Vec<u8> {
 
     // ---- Footer ----
     buf.extend_from_slice(&(n as u32).to_le_bytes());
-    for (i, (bytes, cols)) in row_groups.iter().enumerate() {
-        encode_footer_entry(&mut buf, i as u32, offsets[i], bytes.len() as u32, cols);
+    for (i, (bytes, cols, n_rows)) in row_groups.iter().enumerate() {
+        encode_footer_entry(&mut buf, i as u32, offsets[i], bytes.len() as u32, *n_rows, cols);
     }
 
     // ---- Tail ----
@@ -268,15 +269,13 @@ fn encode_footer_entry(
     rg_index: u32,
     byte_offset: u64,
     byte_len: u32,
+    n_rows: u32,
     cols: &[ColumnStatsEntry],
 ) {
     buf.extend_from_slice(&rg_index.to_le_bytes());
     buf.extend_from_slice(&byte_offset.to_le_bytes());
     buf.extend_from_slice(&byte_len.to_le_bytes());
-    // n_rows is NOT known at encode time (callers may pass 0 — readers
-    // compute row count from the decoded PND2 if they need it). We store
-    // 0 as a placeholder; future writers can populate it accurately.
-    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&n_rows.to_le_bytes());
     // Validate n_columns fits in u8 — names > 255 cols are rejected loudly
     // (silent truncation would produce a corrupt slab).
     assert!(cols.len() <= u8::MAX as usize,
@@ -539,9 +538,9 @@ mod tests {
     #[test]
     fn test_encode_decode_roundtrip_3_rgs() {
         let rgs = vec![
-            (make_rg(b"rg0-data"), vec![make_stats("id", 1, 0, 100)]),
-            (make_rg(b"rg1-bytes-here"), vec![make_stats("id", 1, 101, 200)]),
-            (make_rg(b"rg2"), vec![make_stats("id", 1, 201, 300)]),
+            (make_rg(b"rg0-data"), vec![make_stats("id", 1, 0, 100)], 10),
+            (make_rg(b"rg1-bytes-here"), vec![make_stats("id", 1, 101, 200)], 20),
+            (make_rg(b"rg2"), vec![make_stats("id", 1, 201, 300)], 5),
         ];
         let blob = encode_slab(&rgs);
         assert!(is_slab(&blob));
@@ -565,8 +564,8 @@ mod tests {
     #[test]
     fn test_tail_decode_yields_footer_offset() {
         let rgs = vec![
-            (make_rg(b"first-rg"), vec![]),
-            (make_rg(b"second-rg"), vec![]),
+            (make_rg(b"first-rg"), vec![], 0),
+            (make_rg(b"second-rg"), vec![], 0),
         ];
         let blob = encode_slab(&rgs);
         let total = blob.len();
@@ -592,12 +591,17 @@ mod tests {
     #[test]
     fn test_plan_ranges_no_predicates() {
         let rgs = vec![
-            (make_rg(b"a"), vec![make_stats("id", 1, 0, 100)]),
-            (make_rg(b"b"), vec![make_stats("id", 1, 101, 200)]),
-            (make_rg(b"c"), vec![make_stats("id", 1, 201, 300)]),
+            (make_rg(b"a"), vec![make_stats("id", 1, 0, 100)], 50),
+            (make_rg(b"b"), vec![make_stats("id", 1, 101, 200)], 50),
+            (make_rg(b"c"), vec![make_stats("id", 1, 201, 300)], 50),
         ];
         let blob = encode_slab(&rgs);
         let slab = decode_slab(&blob).unwrap();
+
+        // Verify n_rows is preserved in footer
+        assert_eq!(slab.footer.entries[0].n_rows, 50);
+        assert_eq!(slab.footer.entries[1].n_rows, 50);
+        assert_eq!(slab.footer.entries[2].n_rows, 50);
 
         let ranges = slab.footer.plan_ranges(None);
         assert_eq!(ranges.len(), 3, "no predicates → all 3 RGs");
@@ -609,9 +613,9 @@ mod tests {
         // Predicate id = 150 should prune RG 0 (id<101) and RG 2 (id>200),
         // leaving only RG 1.
         let rgs = vec![
-            (make_rg(b"a"), vec![make_stats("id", 1, 0, 100)]),
-            (make_rg(b"b"), vec![make_stats("id", 1, 101, 200)]),
-            (make_rg(b"c"), vec![make_stats("id", 1, 201, 300)]),
+            (make_rg(b"a"), vec![make_stats("id", 1, 0, 100)], 100),
+            (make_rg(b"b"), vec![make_stats("id", 1, 101, 200)], 100),
+            (make_rg(b"c"), vec![make_stats("id", 1, 201, 300)], 100),
         ];
         let blob = encode_slab(&rgs);
         let slab = decode_slab(&blob).unwrap();
@@ -633,9 +637,9 @@ mod tests {
     fn test_plan_ranges_with_range_predicate() {
         // Predicate id >= 150 should prune only RG 0 ([0,100]).
         let rgs = vec![
-            (make_rg(b"a"), vec![make_stats("id", 1, 0, 100)]),
-            (make_rg(b"b"), vec![make_stats("id", 1, 101, 200)]),
-            (make_rg(b"c"), vec![make_stats("id", 1, 201, 300)]),
+            (make_rg(b"a"), vec![make_stats("id", 1, 0, 100)], 100),
+            (make_rg(b"b"), vec![make_stats("id", 1, 101, 200)], 100),
+            (make_rg(b"c"), vec![make_stats("id", 1, 201, 300)], 100),
         ];
         let blob = encode_slab(&rgs);
         let slab = decode_slab(&blob).unwrap();
@@ -650,7 +654,7 @@ mod tests {
 
     #[test]
     fn test_empty_slab() {
-        let rgs: Vec<(Vec<u8>, Vec<ColumnStatsEntry>)> = vec![];
+        let rgs: Vec<(Vec<u8>, Vec<ColumnStatsEntry>, u32)> = vec![];
         let blob = encode_slab(&rgs);
         assert!(is_slab(&blob));
 
@@ -666,7 +670,7 @@ mod tests {
     #[test]
     fn test_single_rg_slab() {
         let rgs = vec![
-            (make_rg(b"only-rg"), vec![make_stats("v", 1, 42, 42)]),
+            (make_rg(b"only-rg"), vec![make_stats("v", 1, 42, 42)], 1),
         ];
         let blob = encode_slab(&rgs);
 
@@ -689,7 +693,7 @@ mod tests {
     #[test]
     fn test_decode_rejects_wrong_magic_in_tail() {
         // Build a valid slab, then corrupt the tail magic.
-        let rgs = vec![(make_rg(b"x"), vec![])];
+        let rgs = vec![(make_rg(b"x"), vec![], 0)];
         let mut blob = encode_slab(&rgs);
         let total = blob.len();
         // Corrupt the last 12 bytes' magic.
@@ -717,12 +721,14 @@ mod tests {
                     null_count: 5,
                 },
                 make_stats("score", 2, 0, 100),  // f64 stored as bytes
-            ]),
+            ], 15),
         ];
         let blob = encode_slab(&rgs);
         let slab = decode_slab(&blob).expect("decode failed");
 
         assert_eq!(slab.footer.entries[0].columns.len(), 3);
+        // Verify n_rows is preserved
+        assert_eq!(slab.footer.entries[0].n_rows, 15);
         assert_eq!(slab.footer.entries[0].columns[0].name, "id");
         assert!(slab.footer.entries[0].columns[0].min.is_some());
         assert_eq!(slab.footer.entries[0].columns[1].name, "name");
@@ -738,9 +744,9 @@ mod tests {
         // the slab, exactly match the original RG bytes. This is the
         // invariant the production read path depends on.
         let rgs = vec![
-            (make_rg(b"\x00\x01\x02\x03PND2 header bytes here"), vec![]),
-            (make_rg(b"\xff\xfe\xfdmore bytes"), vec![]),
-            (make_rg(b"third"), vec![]),
+            (make_rg(b"\x00\x01\x02\x03PND2 header bytes here"), vec![], 0),
+            (make_rg(b"\xff\xfe\xfdmore bytes"), vec![], 0),
+            (make_rg(b"third"), vec![], 0),
         ];
         let blob = encode_slab(&rgs);
         let slab = decode_slab(&blob).unwrap();
@@ -760,7 +766,7 @@ mod tests {
         // Regression test for C1: a malformed slab whose footer is truncated
         // mid-column-name must NOT panic — it must return None.
         let rgs = vec![
-            (make_rg(b"x"), vec![make_stats("id", 1, 0, 100)]),
+            (make_rg(b"x"), vec![make_stats("id", 1, 0, 100)], 0),
         ];
         let blob = encode_slab(&rgs);
 
@@ -786,7 +792,7 @@ mod tests {
         // Regression test for C2: a slab claiming byte_offset = u64::MAX
         // must NOT cause integer overflow in `start + byte_len`. Must return
         // None instead of panicking.
-        let rgs = vec![(make_rg(b"x"), vec![])];
+        let rgs = vec![(make_rg(b"x"), vec![], 0)];
         let mut blob = encode_slab(&rgs);
 
         // Locate the footer (single entry) and corrupt its byte_offset to u64::MAX.
@@ -813,7 +819,7 @@ mod tests {
         // Regression test for H4: if caller passes more than 12 bytes to
         // decode_slab_tail, it must use the LAST 12 bytes (where the tail
         // actually lives), not the first 12.
-        let rgs = vec![(make_rg(b"x"), vec![])];
+        let rgs = vec![(make_rg(b"x"), vec![], 0)];
         let blob = encode_slab(&rgs);
 
         // Pass the whole blob to decode_slab_tail.

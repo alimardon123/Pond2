@@ -68,6 +68,15 @@ pub struct PondKernel {
     stats: Mutex<KernelStats>,
 }
 
+impl Clone for PondKernel {
+    fn clone(&self) -> Self {
+        Self {
+            store: Arc::clone(&self.store),
+            stats: Mutex::new(self.stats.lock().unwrap().clone()),
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct KernelStats {
     pub writes: u64,

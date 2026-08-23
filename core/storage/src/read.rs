@@ -145,27 +145,54 @@ enum RgSource {
 /// Uses `std::thread::scope` for zero-overhead parallelism.
 /// On S3, each range-read is an HTTP Range GET (206 Partial Content).
 /// On LocalFS, each is a seek+read_exact (avoids loading the whole file).
+/// Max parallel range reads. 32 saturates a 10 Gbps link to S3 without
+/// hitting rate limits or exhausting connection pools. Prevents thread exhaustion
+/// at PB scale where thousands of slab ranges could otherwise spawn thousands
+/// of threads simultaneously.
+const MAX_PARALLEL_RANGE_READS: usize = 32;
+
 fn read_slab_ranges_parallel(
     kernel: &PondKernel,
     ranges: &[(String, u64, u64)],
 ) -> Result<Vec<Vec<u8>>, String> {
-    use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread;
+
     let n = ranges.len();
+    if n == 0 { return Ok(Vec::new()); }
+
     let results = Arc::new(Mutex::new(vec![Vec::new(); n]));
     let failed = Arc::new(AtomicBool::new(false));
     let error_msg = Arc::new(Mutex::new(None::<String>));
 
+    // Bounded parallelism via sync_channel as a semaphore.
+    // Pre-fill the channel with MAX_PARALLEL_RANGE_READS permits.
+    // Each thread acquires a permit (recv, blocks if 32 running),
+    // does the range read, then sends the permit back (unblocks next).
+    let (tx, rx) = std::sync::mpsc::sync_channel::<()>(MAX_PARALLEL_RANGE_READS);
+    for _ in 0..MAX_PARALLEL_RANGE_READS {
+        tx.send(()).unwrap();
+    }
+    let tx = Arc::new(tx);
+
     thread::scope(|s| {
         for (i, (hash, start, end)) in ranges.iter().enumerate() {
+            if failed.load(Ordering::Relaxed) { break; }
+            // Acquire a permit (blocks if 32 threads already running).
+            rx.recv().expect("permit channel closed unexpectedly");
             let hash = hash.clone();
             let start = *start;
             let end = *end;
             let results = Arc::clone(&results);
             let failed = Arc::clone(&failed);
             let error_msg = Arc::clone(&error_msg);
+            let tx = Arc::clone(&tx);
             s.spawn(move || {
-                if failed.load(Ordering::Relaxed) { return; }
+                if failed.load(Ordering::Relaxed) {
+                    let _ = tx.send(()); // release permit
+                    return;
+                }
                 match kernel.read_blob_range(&hash, start, end) {
                     Ok(data) => {
                         if let Ok(mut r) = results.lock() {
@@ -179,6 +206,7 @@ fn read_slab_ranges_parallel(
                         }
                     }
                 }
+                let _ = tx.send(()); // release permit for next thread
             });
         }
     });
@@ -328,16 +356,21 @@ pub async fn read_rows_async(
     let manifest = CollectionManifest::decode(&manifest_bytes)
         .ok_or_else(|| "Failed to decode manifest".to_string())?;
 
-    // 4. Read ALL row group blobs async (sequential — parallel async is a
-    // future optimization). Concatenate the bytes (matches sync `read`).
+    // 4. Read ALL row groups (slab-aware) — delegates to sync reader
+    // via spawn_blocking. The sync reader uses range reads for slab-backed
+    // RGs (1000x less data transfer on S3) and batch reads for standalone.
     if manifest.row_groups.is_empty() {
         return Err("Manifest has no row groups".to_string());
     }
+    let kernel_clone = kernel.clone();
+    let manifest_clone = manifest.clone();
+    let blobs = tokio::task::spawn_blocking(move || {
+        read_all_row_groups_from_manifest(&kernel_clone, &manifest_clone)
+    }).await.map_err(|e| format!("join error: {}", e))?
+      .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    for rg in &manifest.row_groups {
-        let blob = kernel.read_blob_async(&rg.blob_hash).await
-            .map_err(|e| format!("Failed to read data blob: {}", e))?;
-        out.extend_from_slice(&blob);
+    for b in &blobs {
+        out.extend_from_slice(b);
     }
     Ok(out)
 }
@@ -363,16 +396,20 @@ pub async fn read_at_snapshot_async(
     let manifest = CollectionManifest::decode(&manifest_bytes)
         .ok_or_else(|| "Failed to decode manifest".to_string())?;
 
-    // Read ALL row groups async (sequential — parallel async is a future
-    // optimization). Concatenate the bytes (matches sync `read_at_snapshot`).
+    // Read ALL row groups (slab-aware) — delegates to sync reader
+    // via spawn_blocking for range-read support.
     if manifest.row_groups.is_empty() {
         return Err("Manifest has no row groups".to_string());
     }
+    let kernel_clone = kernel.clone();
+    let manifest_clone = manifest.clone();
+    let blobs = tokio::task::spawn_blocking(move || {
+        read_all_row_groups_from_manifest(&kernel_clone, &manifest_clone)
+    }).await.map_err(|e| format!("join error: {}", e))?
+      .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    for rg in &manifest.row_groups {
-        let blob = kernel.read_blob_async(&rg.blob_hash).await
-            .map_err(|e| format!("Failed to read data blob: {}", e))?;
-        out.extend_from_slice(&blob);
+    for b in &blobs {
+        out.extend_from_slice(b);
     }
     Ok(out)
 }

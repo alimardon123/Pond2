@@ -463,9 +463,9 @@ pub fn write_rows_i64_slab<'a>(
         encoded_rgs.push((blob, col_stats, n_rows));
     }
 
-    // 2. Build slab entries for encode_slab
-    let slab_inputs: Vec<(Vec<u8>, Vec<ColumnStatsEntry>)> = encoded_rgs.iter()
-        .map(|(blob, stats, _)| (blob.clone(), stats.clone()))
+    // 2. Build slab entries for encode_slab (now includes n_rows)
+    let slab_inputs: Vec<(Vec<u8>, Vec<ColumnStatsEntry>, u32)> = encoded_rgs.iter()
+        .map(|(blob, stats, n_rows)| (blob.clone(), stats.clone(), *n_rows))
         .collect();
 
     // 3. Encode as PSLB slab
@@ -526,6 +526,203 @@ pub fn write_rows_i64_slab<'a>(
     let _ = kernel.reference(collection, &commit_hash);
 
     Ok(commit_hash)
+}
+
+
+
+// ---------------------------------------------------------------------------
+// SlabWriter — stateful buffer that accumulates row groups into PSLB slabs
+// ---------------------------------------------------------------------------
+
+/// Target number of row groups per slab. At ~128 KB per RG, 1024 RGs ≈ 128 MB
+/// — the sweet spot for S3 multipart upload + Range-Read efficiency.
+const SLAB_TARGET_RG_COUNT: usize = 1024;
+
+/// Target byte size per slab (128 MB). Triggers auto-flush even if
+/// SLAB_TARGET_RG_COUNT hasn't been reached yet.
+const SLAB_TARGET_BYTES: usize = 128 * 1024 * 1024;
+
+/// A stateful buffer that accumulates row groups and flushes them as PSLB slabs.
+///
+/// This is the production write path for high-throughput workloads. Instead of
+/// creating N separate S3 objects (one per `write_rows_i64` call), SlabWriter
+/// buffers K row groups and writes ONE slab blob, reducing S3 PUTs from K to 1
+/// and enabling HTTP Range-Read on the read side (3 RTTs instead of K×RTTs).
+///
+/// # Example
+/// ```ignore
+/// let mut sw = SlabWriter::new(kernel, "events", "main");
+/// for batch in data_stream {
+///     sw.write_rows_i64(&[("id", &ids), ("val", &vals)])?;
+/// }
+/// let commit_hash = sw.flush("load complete")?;
+/// // Result: data_stream.len() RGs packed into ceil(len/1024) slab blobs
+/// ```
+pub struct SlabWriter<'a> {
+    kernel: &'a PondKernel,
+    collection: &'a str,
+    active_branch: &'a str,
+    /// Buffered RGs for the current (in-progress) slab.
+    /// Each entry: (pnd2_bytes, col_stats, n_rows)
+    buffer: Vec<(Vec<u8>, Vec<ColumnStatsEntry>, u32)>,
+    buffer_bytes: usize,
+    /// Completed RG entries from previous auto-flushed slabs.
+    completed_rgs: Vec<RowGroupEntry>,
+    /// Schema (set on first write, validated on subsequent).
+    schema: Option<Vec<(String, u8)>>,
+    key_col: Option<String>,
+}
+
+impl<'a> SlabWriter<'a> {
+    /// Create a new SlabWriter. Does not write anything until `flush()`.
+    pub fn new(kernel: &'a PondKernel, collection: &'a str, active_branch: &'a str) -> Self {
+        Self {
+            kernel,
+            collection,
+            active_branch,
+            buffer: Vec::with_capacity(SLAB_TARGET_RG_COUNT),
+            buffer_bytes: 0,
+            completed_rgs: Vec::new(),
+            schema: None,
+            key_col: None,
+        }
+    }
+
+    /// Buffer one row group as PND2. Auto-flushes when K RGs or 128 MB reached.
+    ///
+    /// All calls must have the same schema (same column names, same order).
+    /// Returns an error on schema mismatch.
+    pub fn write_rows_i64(&mut self, columns: &[(&str, &[i64])]) -> Result<(), String> {
+        let n_rows = columns.first().map(|(_, v)| v.len()).unwrap_or(0) as u32;
+        let blob = pnd2_encode_i64_auto(columns);
+
+        // Set/validate schema on first write
+        let schema: Vec<(String, u8)> = columns.iter()
+            .map(|(name, _)| (name.to_string(), VT_INT64))
+            .collect();
+        match &self.schema {
+            None => {
+                self.schema = Some(schema.clone());
+                self.key_col = columns.first().map(|(n, _)| n.to_string());
+            }
+            Some(expected) if expected != &schema => {
+                return Err(format!(
+                    "SlabWriter: schema mismatch. Expected {:?}, got {:?}",
+                    expected, schema
+                ));
+            }
+            _ => {}
+        }
+
+        // Compute column stats
+        let col_stats: Vec<ColumnStatsEntry> = columns.iter().map(|(name, values)| {
+            let (min, max) = if values.is_empty() {
+                (None, None)
+            } else {
+                (Some(values.iter().copied().min().unwrap().to_le_bytes().to_vec()),
+                 Some(values.iter().copied().max().unwrap().to_le_bytes().to_vec()))
+            };
+            ColumnStatsEntry { name: name.to_string(), value_type: VT_INT64,
+                min, max, null_count: 0 }
+        }).collect();
+
+        self.buffer_bytes += blob.len();
+        self.buffer.push((blob, col_stats, n_rows));
+
+        // Auto-flush if threshold reached
+        if self.buffer.len() >= SLAB_TARGET_RG_COUNT
+            || self.buffer_bytes >= SLAB_TARGET_BYTES
+        {
+            self.flush_slab()?;
+        }
+        Ok(())
+    }
+
+    /// Encode buffered RGs as one PSLB slab, write it, record RG entries.
+    fn flush_slab(&mut self) -> Result<(), String> {
+        if self.buffer.is_empty() { return Ok(()); }
+
+        let slab_bytes = slab::encode_slab(&self.buffer);
+        let slab_hash = self.kernel.write(&slab_bytes)
+            .map_err(|e| format!("SlabWriter: failed to write slab: {}", e))?;
+
+        // Decode footer for exact byte offsets
+        let tail = slab::decode_slab_tail(&slab_bytes)
+            .ok_or_else(|| "SlabWriter: slab tail decode failed".to_string())?;
+        let footer_end = slab_bytes.len() - slab::PSLB_TAIL_LEN;
+        let footer = slab::decode_slab_footer(&slab_bytes[tail.0 as usize..footer_end])
+            .ok_or_else(|| "SlabWriter: slab footer decode failed".to_string())?;
+
+        for (i, (_, col_stats, n_rows)) in self.buffer.iter().enumerate() {
+            let entry = &footer.entries[i];
+            self.completed_rgs.push(RowGroupEntry {
+                key: format!("rg_{:010}", self.completed_rgs.len()),
+                blob_hash: slab_hash.clone(),
+                n_rows: *n_rows,
+                columns: col_stats.clone(),
+                slab_byte_offset: Some(entry.byte_offset),
+                slab_byte_len: Some(entry.byte_len),
+            });
+        }
+
+        self.buffer.clear();
+        self.buffer_bytes = 0;
+        Ok(())
+    }
+
+    /// Final flush: write remaining buffered RGs as partial slab, then commit.
+    ///
+    /// Returns the commit hash. Consumes self (cannot write more after flush).
+    pub fn flush(mut self, message: &str) -> Result<String, String> {
+        self.flush_slab()?; // flush partial buffer
+
+        if self.completed_rgs.is_empty() {
+            return Err("SlabWriter: no data to flush".to_string());
+        }
+
+        let schema = self.schema.unwrap();
+        let key_col = self.key_col.unwrap_or_default();
+        let mut manifest = CollectionManifest::new(schema, key_col);
+        for rg in self.completed_rgs.drain(..) {
+            manifest.add_row_group(rg);
+        }
+
+        // Commit flow (same as write_rows_i64)
+        let parent = self.kernel.resolve(&branch_ref(self.collection, self.active_branch));
+        let parent_index = parent.as_ref()
+            .and_then(|p| commit::read_commit(self.kernel, p))
+            .map(|c| c.index + 1)
+            .unwrap_or(0);
+
+        let manifest_bytes = manifest.encode();
+        let manifest_hash = self.kernel.write(&manifest_bytes)
+            .map_err(|e| format!("SlabWriter: failed to write manifest: {}", e))?;
+
+        let commit_hash = commit::write_commit(
+            self.kernel, self.collection, &manifest_hash,
+            parent.as_deref(), None,
+            if message.is_empty() { "slab_write" } else { message },
+            parent_index,
+        ).map_err(|e| format!("SlabWriter: commit failed: {}", e))?;
+
+        self.kernel.reference(&branch_ref(self.collection, self.active_branch), &commit_hash)
+            .map_err(|e| format!("SlabWriter: branch ref failed: {}", e))?;
+        self.kernel.reference(&manifest_ref(self.collection, self.active_branch), &manifest_hash)
+            .map_err(|e| format!("SlabWriter: manifest ref failed: {}", e))?;
+        let _ = self.kernel.reference(self.collection, &commit_hash);
+
+        Ok(commit_hash)
+    }
+
+    /// Returns the number of row groups currently buffered (not yet flushed).
+    pub fn buffered_count(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Returns the total number of completed (flushed) row groups.
+    pub fn completed_count(&self) -> usize {
+        self.completed_rgs.len()
+    }
 }
 
 #[cfg(test)]
@@ -668,16 +865,16 @@ mod tests {
 
         // 3 row groups, each with 2 columns (id, val), 3 rows each
         let rg1: Vec<(&str, &[i64])> = vec![
-            ("id", &[1i64, 2, 3].as_slice()),
-            ("val", &[10i64, 20, 30].as_slice()),
+            ("id", &[1i64, 2, 3]),
+            ("val", &[10i64, 20, 30]),
         ];
         let rg2: Vec<(&str, &[i64])> = vec![
-            ("id", &[4i64, 5, 6].as_slice()),
-            ("val", &[40i64, 50, 60].as_slice()),
+            ("id", &[4i64, 5, 6]),
+            ("val", &[40i64, 50, 60]),
         ];
         let rg3: Vec<(&str, &[i64])> = vec![
-            ("id", &[7i64, 8, 9].as_slice()),
-            ("val", &[70i64, 80, 90].as_slice()),
+            ("id", &[7i64, 8, 9]),
+            ("val", &[70i64, 80, 90]),
         ];
         let rgs: Vec<&[(&str, &[i64])]> = vec![&rg1, &rg2, &rg3];
 
@@ -717,5 +914,95 @@ mod tests {
         assert_eq!(cols0[0].i64_data, vec![1i64, 2, 3]);
         assert_eq!(cols0[1].i64_data, vec![10i64, 20, 30]);
     }
-}
+    #[test]
+    fn test_slab_writer_single_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
 
+        let ids = vec![1i64, 2, 3, 4, 5];
+        let vals = vec![10i64, 20, 30, 40, 50];
+
+        let mut sw = SlabWriter::new(kernel, "sw_test", "main");
+        sw.write_rows_i64(&[("id", &ids), ("val", &vals)]).unwrap();
+        let commit_hash = sw.flush("single batch").unwrap();
+
+        // Verify commit exists
+        let commit = commit::read_commit(kernel, &commit_hash).unwrap();
+        assert_eq!(commit.message, "single batch");
+
+        // Verify manifest has 1 RG with slab offsets
+        let manifest_bytes = kernel.read_blob(&commit.manifest).unwrap();
+        let manifest = CollectionManifest::decode(&manifest_bytes).unwrap();
+        assert_eq!(manifest.row_groups.len(), 1);
+        assert!(manifest.row_groups[0].slab_byte_offset.is_some());
+        assert!(manifest.row_groups[0].slab_byte_len.is_some());
+
+        // Verify data is readable via range reads
+        let cols = crate::read::read_rows_i64(kernel, "sw_test", "main", None, None).unwrap();
+        let id_col = cols.iter().find(|(n, _)| n == "id").unwrap();
+        assert_eq!(id_col.1, ids);
+    }
+
+    #[test]
+    fn test_slab_writer_multiple_batches_auto_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        // Write 5 small batches — should all fit in one slab (well under 128 MB)
+        let mut sw = SlabWriter::new(kernel, "multi_batch", "main");
+        for i in 0..5 {
+            let ids = vec![i * 10i64, i * 10 + 1, i * 10 + 2];
+            let vals = vec![i * 100i64, i * 100 + 1, i * 100 + 2];
+            sw.write_rows_i64(&[("id", &ids), ("val", &vals)]).unwrap();
+        }
+        assert_eq!(sw.buffered_count(), 5);
+        assert_eq!(sw.completed_count(), 0);
+        let commit_hash = sw.flush("5 batches").unwrap();
+
+        // Verify manifest has 5 RGs all pointing to the same slab
+        let commit = commit::read_commit(kernel, &commit_hash).unwrap();
+        let manifest_bytes = kernel.read_blob(&commit.manifest).unwrap();
+        let manifest = CollectionManifest::decode(&manifest_bytes).unwrap();
+        assert_eq!(manifest.row_groups.len(), 5);
+
+        let slab_hash = &manifest.row_groups[0].blob_hash;
+        for rg in &manifest.row_groups[1..] {
+            assert_eq!(&rg.blob_hash, slab_hash, "all RGs must share the same slab");
+        }
+
+        // All 15 rows should be readable
+        let cols = crate::read::read_rows_i64(kernel, "multi_batch", "main", None, None).unwrap();
+        let id_col = cols.iter().find(|(n, _)| n == "id").unwrap();
+        assert_eq!(id_col.1.len(), 15);
+    }
+
+    #[test]
+    fn test_slab_writer_schema_mismatch_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        let mut sw = SlabWriter::new(kernel, "schema_test", "main");
+        sw.write_rows_i64(&[("id", &[1i64, 2])]).unwrap();
+
+        // Different schema — should fail
+        let result = sw.write_rows_i64(&[("name", &[1i64])]);
+        assert!(result.is_err(), "schema mismatch should be rejected");
+        assert!(result.unwrap_err().contains("schema mismatch"));
+    }
+
+    #[test]
+    fn test_slab_writer_empty_flush_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        let sw = SlabWriter::new(kernel, "empty_test", "main");
+        let result = sw.flush("nothing");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("no data"));
+    }
+
+}
