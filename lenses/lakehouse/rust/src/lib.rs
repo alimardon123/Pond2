@@ -34,10 +34,8 @@
 //   // → vec![("id", TypedColumn::Int64(vec![1, 2, 3])), ...]
 
 use pond_core::{TypedColumn, VT_INT64, VT_FLOAT64, VT_STRING};
-use pond_kernel::PondKernel;
 use pond_storage::UnifiedStorage;
-use pond_storage::{write as storage_write, read as storage_read, branch as storage_branch,
-                    commit as storage_commit};
+use pond_storage::{write as storage_write, commit as storage_commit};
 use pond_storage::manifest::CollectionManifest;
 use std::collections::HashMap;
 

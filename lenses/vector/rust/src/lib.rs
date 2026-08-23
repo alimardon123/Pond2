@@ -33,7 +33,7 @@
 
 use pond_core::{TypedColumn, VT_FLOAT64, VT_INT64};
 use pond_storage::UnifiedStorage;
-use pond_storage::{write as storage_write, read as storage_read};
+use pond_storage::write as storage_write;
 use pond_storage::manifest::CollectionManifest;
 use std::collections::HashMap;
 use std::sync::Mutex;

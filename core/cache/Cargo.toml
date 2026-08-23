@@ -1,0 +1,14 @@
+[package]
+name = "pond_cache"
+version = "0.9.0-dev"
+edition = "2021"
+license = "MIT"
+description = "CachingObjectStore — local-disk + in-memory LRU cache wrapper for any ObjectStore"
+
+[dependencies]
+pond_kernel = { path = "../kernel" }
+lru = "0.12"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
