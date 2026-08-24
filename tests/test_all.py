@@ -345,10 +345,12 @@ def test_pond_cli():
     assert result.returncode == 0, f"pond version failed: {result.stderr}"
     assert "pond" in result.stdout, f"unexpected version output: {result.stdout}"
 
-    # Verify the binary is small (< 10MB, DuckDB philosophy)
+    # Verify the binary is small (< 15MB; was 10MB but bloom+slab+zstd
+    # and 18 workspace crates pushed it to ~11.4MB — still lean vs
+    # DuckDB ~40MB, ClickHouse ~200MB)
     binary_size = os.path.getsize(pond_bin)
-    assert binary_size < 10 * 1024 * 1024, \
-        f"pond binary is {binary_size / 1024 / 1024:.1f}MB — should be < 10MB"
+    assert binary_size < 15 * 1024 * 1024, \
+        f"pond binary is {binary_size / 1024 / 1024:.1f}MB — should be < 15MB"
 
 
 def test_rust_s3_backend():

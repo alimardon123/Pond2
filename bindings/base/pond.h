@@ -40,6 +40,7 @@ extern "C" {
  * ============================================================= */
 
 typedef struct PondKernel PondKernel;
+typedef struct PondResult PondResult;
 
 PondKernel* pond_kernel_new(const char* base_dir);
 void        pond_kernel_free(PondKernel* k);
@@ -109,7 +110,6 @@ PondResult* pond_storage_read_rows(PondStorageHandle* s, const char* collection)
  * Layer 3: Codec (PND2 — encode, decode, all encodings/vtypes)
  * ============================================================= */
 
-typedef struct PondResult PondResult;
 typedef struct PondEncoder PondEncoder;
 
 PondResult* pond_pnd2_decode(const uint8_t* blob, size_t blob_len);

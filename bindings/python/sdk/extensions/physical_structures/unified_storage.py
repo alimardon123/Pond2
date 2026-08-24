@@ -3497,10 +3497,55 @@ class UnifiedStorage:
                 ))
             new_manifest.add_row_group(rg)
 
-        # Carry forward the inline bloom filter from HEAD manifest
-        # so negative lookups still work after compaction.
-        if head_manifest and head_manifest._inline_bloom:
-            new_manifest.set_inline_bloom(head_manifest._inline_bloom)
+        # Rebuild the inline bloom filter from the merged row group entries.
+        #
+        # BUGFIX (cron-20260824-2321): The previous code carried forward
+        # HEAD's bloom verbatim. That bloom only contained HEAD's keys —
+        # keys appended via shards were NOT in it. After compaction,
+        # point_lookup for any shard-key returned None (bloom false negative).
+        #
+        # Correct fix: rebuild the bloom from the merged row groups' key
+        # column stats. For row groups where key_col min == max (single
+        # distinct key — the common KV case of 1 row per commit), we add
+        # that key to the bloom without any data I/O. For multi-key row
+        # groups (min != max), we cannot enumerate individual keys without
+        # reading the data blob — in that case we skip the bloom entirely
+        # (set to None) to avoid false negatives. Skipping is safe: the
+        # bloom is a negative-lookup optimization only.
+        try:
+            key_col_name = (head_manifest.key_col if head_manifest else "") or ""
+            bloom_keys: list[str] = []
+            can_build_bloom = True
+            for rg in new_manifest.row_groups:
+                if not key_col_name:
+                    can_build_bloom = False
+                    break
+                key_col_stats = None
+                for c in rg.columns:
+                    if c.name == key_col_name:
+                        key_col_stats = c
+                        break
+                if key_col_stats is None:
+                    can_build_bloom = False
+                    break
+                # Single-distinct-key row group (min == max): add the key.
+                # Multi-distinct-key (min != max): can't enumerate without
+                # reading data — bail out to no bloom.
+                if key_col_stats.min is None or key_col_stats.max is None:
+                    # No stats (e.g., all-null column) — can't determine key.
+                    can_build_bloom = False
+                    break
+                if key_col_stats.min != key_col_stats.max:
+                    can_build_bloom = False
+                    break
+                bloom_keys.append(_format_rg_key(key_col_stats.min))
+            if can_build_bloom and bloom_keys:
+                from collection_manifest import _bloom_build
+                new_manifest.set_inline_bloom(_bloom_build(bloom_keys))
+            # else: leave _inline_bloom as None (safe — no false negatives)
+        except Exception:
+            # Best-effort: any failure leaves bloom unset (safe).
+            pass
         # Build stats tree (writer-side, P10 fix) BEFORE encoding
         try:
             from stats_tree import should_use_stats_tree, build_stats_tree

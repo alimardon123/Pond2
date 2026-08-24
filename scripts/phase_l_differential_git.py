@@ -413,7 +413,7 @@ def test_merge_commit_topology():
         p.kernel.reference("refs/heads/dev", dev_p)
 
         # Merge dev into main (no conflict — different files)
-        subprocess.run(["git", "-C", g.path, "checkout", "-q", "master"],
+        subprocess.run(["git", "-C", g.path, "checkout", "-q", "main"],
                        check=True)
         subprocess.run(
             ["git", "-C", g.path, "merge", "-q", "--no-ff", "-m", "merge", "dev"],

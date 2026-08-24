@@ -173,14 +173,20 @@ def _bloom_build(keys: list[str], bits_per_key: int = 10) -> bytes:
     """Build a Bloom filter bitset for the given keys.
 
     Uses double hashing (SHA-256 split) with k=7 hash functions.
-    Returns a bytes object of length ceil(n_bits / 8).
+    Returns a bytes object whose length * 8 == n_bits exactly
+    (n_bits is rounded up to a multiple of 8 so that _bloom_check's
+    len(bitset)*8 produces the same modulus).
     """
     import hashlib as _hl
     n = len(keys)
     if n == 0:
         return b""
-    n_bits = max(n * bits_per_key, 64)
-    byte_len = (n_bits + 7) // 8
+    # Round n_bits up to a multiple of 8 — _bloom_check computes its
+    # modulus as len(bitset)*8, so the two MUST agree or hash indices
+    # diverge and produce false negatives.
+    raw_bits = max(n * bits_per_key, 64)
+    n_bits = ((raw_bits + 7) // 8) * 8
+    byte_len = n_bits // 8
     bitset = bytearray(byte_len)
     for key in keys:
         h = _hl.sha256(key.encode("utf-8")).digest()
