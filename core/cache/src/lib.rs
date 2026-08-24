@@ -1,6 +1,12 @@
-// CachingObjectStore — local-disk + in-memory LRU cache for any ObjectStore.
+// CachingObjectStore — in-memory + local-disk LRU cache for any ObjectStore.
 //
-// WRAPS any `ObjectStore` (LocalFS, S3, GCS, ...) with two cache tiers:
+// WRAPS any `ObjectStore` (LocalFS, S3, GCS, ...) with THREE cache tiers:
+//
+//   Tier 0 (in-memory blob cache): `moka::sync::Cache` for hot content blobs.
+//       Sub-microsecond lookups with sharded internal locking (16 segments).
+//       Byte-level weight tracking ensures bounded memory usage (default 256 MB).
+//       Blobs >= skip threshold (default 1 MB) skip this tier — large blobs
+//       are better served from disk cache + mmap.
 //
 //   Tier 1 (in-memory): `HashMap` for ref lookups (get_path). Refs are
 //       tiny JSON blobs (~60 bytes each) and are consulted on EVERY
@@ -30,6 +36,7 @@
 //   let inner: Box<dyn ObjectStore> = Box::new(S3ObjectStore::new(...));
 //   let cached = CachingObjectStore::new(inner, "/var/lib/pond/cache")
 //       .with_max_disk_bytes(1_000_000_000)  // 1 GB
+//       .with_max_mem_bytes(256 * 1024 * 1024)  // 256 MB in-memory
 //       .with_ref_ttl(std::time::Duration::from_secs(5));
 //   let kernel = PondKernel::new_with_store(Box::new(cached));
 //
@@ -50,6 +57,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use lru::LruCache;
+use moka::sync::Cache;
 use pond_kernel::ObjectStore;
 
 // ---------------------------------------------------------------------------
@@ -85,13 +93,21 @@ struct DiskEntry {
 // CachingObjectStore
 // ---------------------------------------------------------------------------
 
-/// A two-tier cache wrapper around any `ObjectStore`.
+/// A three-tier cache wrapper around any `ObjectStore`.
 ///
+/// Tier 0: In-memory `moka::sync::Cache` for hot content blobs (< skip threshold).
 /// Tier 1: In-memory `HashMap` for ref lookups (get_path) with TTL.
 /// Tier 2: Local-disk file cache for content-addressed blobs with O(1) LRU eviction.
 pub struct CachingObjectStore {
     inner: Box<dyn ObjectStore>,
     cache_dir: PathBuf,
+    /// In-memory blob cache (moka segmented LRU). Sub-microsecond lookups
+    /// with sharded locking. Byte-weighted for bounded memory usage.
+    mem_cache: Cache<String, Arc<Vec<u8>>>,
+    max_mem_bytes: usize,
+    /// Blobs >= this size skip the in-memory cache (default 1 MB).
+    /// Large blobs are better served from disk cache + seek/mmap.
+    skip_mem_cache_threshold: usize,
     ref_cache: Mutex<std::collections::HashMap<String, RefEntry>>,
     ref_ttl: Duration,
     /// Tracks access order for TRUE LRU eviction. Key = hash, Value = byte size.
@@ -117,9 +133,18 @@ impl CachingObjectStore {
         let cache_dir = cache_dir.as_ref().to_path_buf();
         let blobs_dir = cache_dir.join("blobs");
         fs::create_dir_all(&blobs_dir)?;
+        let max_mem = 256 * 1024 * 1024; // 256 MB default
         Ok(Self {
             inner,
             cache_dir,
+            mem_cache: Cache::builder()
+                .max_capacity(max_mem as u64)
+                .weigher(|_key: &String, value: &Arc<Vec<u8>>| -> u32 {
+                    value.len() as u32
+                })
+                .build(),
+            max_mem_bytes: max_mem,
+            skip_mem_cache_threshold: 1_048_576, // 1 MB
             ref_cache: Mutex::new(std::collections::HashMap::new()),
             ref_ttl: Duration::from_secs(5),
             access_order: Mutex::new(LruCache::unbounded()),
@@ -136,6 +161,27 @@ impl CachingObjectStore {
         self
     }
 
+    /// Set the maximum in-memory cache size in bytes (default: 256 MB).
+    /// Blobs are weighted by their byte length. When the total weight
+    /// exceeds this value, the least-recently-used entries are evicted.
+    pub fn with_max_mem_bytes(mut self, bytes: usize) -> Self {
+        self.max_mem_bytes = bytes;
+        self.mem_cache = Cache::builder()
+            .max_capacity(bytes as u64)
+            .weigher(|_key: &String, value: &Arc<Vec<u8>>| -> u32 {
+                value.len() as u32
+            })
+            .build();
+        self
+    }
+
+    /// Set the threshold above which blobs skip the in-memory cache (default: 1 MB).
+    /// Large blobs are better served from disk cache with seek/mmap.
+    pub fn with_skip_mem_cache_threshold(mut self, bytes: usize) -> Self {
+        self.skip_mem_cache_threshold = bytes;
+        self
+    }
+
     /// Set the TTL for in-memory ref cache entries (default: 5 seconds).
     /// Refs older than this are re-fetched from the inner store.
     pub fn with_ref_ttl(mut self, ttl: Duration) -> Self {
@@ -148,6 +194,13 @@ impl CachingObjectStore {
         *self.disk_usage.lock().unwrap()
     }
 
+    /// Return the approximate weighted size of the in-memory blob cache.
+    /// Note: moka's internal counters may lag; prefer functional tests
+    /// (delete disk file, verify mem cache serves the data).
+    pub fn mem_cache_weighted_size(&self) -> u64 {
+        self.mem_cache.weighted_size()
+    }
+
     // -- Blob cache paths --
 
     fn blob_path(&self, hash: &str) -> PathBuf {
@@ -157,6 +210,14 @@ impl CachingObjectStore {
     fn read_blob_from_disk(&self, hash: &str) -> io::Result<Vec<u8>> {
         let path = self.blob_path(hash);
         fs::read(&path)
+    }
+
+    /// Maybe insert a blob into the in-memory cache.
+    /// Returns true if inserted (blob was small enough).
+    fn maybe_insert_mem_cache(&self, hash: &str, data: Vec<u8>) {
+        if data.len() < self.skip_mem_cache_threshold {
+            self.mem_cache.insert(hash.to_string(), Arc::new(data));
+        }
     }
 
     /// Write blob to disk cache and track in LRU. Evicts if over capacity.
@@ -235,11 +296,21 @@ impl ObjectStore for CachingObjectStore {
         let hash = self.inner.put_blob(data)?;
         // Cache to disk.
         let _ = self.write_blob_to_disk(&hash, data);
+        // Populate in-memory cache for warm reads (sub-microsecond).
+        self.maybe_insert_mem_cache(&hash, data.to_vec());
         Ok(hash)
     }
 
     fn get_blob(&self, hash: &str) -> io::Result<Vec<u8>> {
-        // Check disk cache first.
+        // ── TIER 0: In-memory cache (sub-microsecond) ──
+        if let Some(arc_data) = self.mem_cache.get(hash) {
+            // Cache HIT — Arc clone (atomic refcount), then unwrap or clone.
+            // ~50-100ns: sharded hash lookup + atomic increment.
+            return Ok(Arc::try_unwrap(arc_data)
+                .unwrap_or_else(|arc| (*arc).clone()));
+        }
+
+        // ── TIER 1: Disk cache (~10µs–1ms) ──
         if let Ok(data) = self.read_blob_from_disk(hash) {
             // Cache HIT: promote in LRU (true LRU — read updates recency).
             // Don't change disk_usage (file already counted).
@@ -249,6 +320,8 @@ impl ObjectStore for CachingObjectStore {
                     DiskEntry { bytes: file_data.len() as usize },
                 );
             }
+            // Promote to in-memory cache (if small enough).
+            self.maybe_insert_mem_cache(hash, data.clone());
             return Ok(data);
         }
 
@@ -279,9 +352,10 @@ impl ObjectStore for CachingObjectStore {
         // We are the designated fetcher. Do the S3 GET.
         let fetch_result = self.inner.get_blob(hash);
 
-        // Populate disk cache on success.
+        // Populate disk + in-memory cache on success.
         if let Ok(ref data) = fetch_result {
             let _ = self.write_blob_to_disk(hash, data);
+            self.maybe_insert_mem_cache(hash, data.clone());
         }
 
         // Wake up all waiters and clean up the in-flight entry.
@@ -361,7 +435,18 @@ impl ObjectStore for CachingObjectStore {
     /// fetching the whole blob (defeating the purpose of the range read).
     /// Subsequent full-blob reads will populate the cache normally.
     fn get_blob_range(&self, hash: &str, start: u64, end: u64) -> io::Result<Vec<u8>> {
-        // Fast path: blob cached on disk → native seek+read (don't load whole file).
+        // ── TIER 0: In-memory cache fast path ──
+        // If the full blob is in memory, slice from there (sub-µs).
+        if let Some(arc_data) = self.mem_cache.get(hash) {
+            let len = arc_data.len() as u64;
+            if start >= len {
+                return Ok(Vec::new());
+            }
+            let end_clamped = end.min(len);
+            return Ok(arc_data[start as usize..end_clamped as usize].to_vec());
+        }
+
+        // ── TIER 1: Disk cache → native seek+read ──
         let path = self.blob_path(hash);
         if path.exists() {
             use std::io::{Read, Seek, SeekFrom};
@@ -393,6 +478,7 @@ impl ObjectStore for CachingObjectStore {
 
     fn delete_blob(&self, hash: &str) -> io::Result<bool> {
         let result = self.inner.delete_blob(hash)?;
+        self.mem_cache.remove(hash);
         self.remove_blob_from_disk(hash);
         Ok(result)
     }
@@ -418,8 +504,14 @@ impl ObjectStore for CachingObjectStore {
         let mut miss_indices: Vec<usize> = Vec::new();
         let mut miss_hashes: Vec<String> = Vec::new();
 
-        // Phase 1: Check disk cache for each hash.
+        // Phase 0: Check in-memory cache for each hash (sub-microsecond).
         for (i, hash) in hashes.iter().enumerate() {
+            if let Some(arc_data) = self.mem_cache.get(hash) {
+                results[i] = Some(Arc::try_unwrap(arc_data)
+                    .unwrap_or_else(|arc| (*arc).clone()));
+                continue;
+            }
+            // Phase 1: Check disk cache.
             match self.read_blob_from_disk(hash) {
                 Ok(data) => {
                     // Cache hit — promote in LRU (true LRU: read updates recency).
@@ -429,6 +521,8 @@ impl ObjectStore for CachingObjectStore {
                             DiskEntry { bytes: meta.len() as usize },
                         );
                     }
+                    // Promote to in-memory cache.
+                    self.maybe_insert_mem_cache(hash, data.clone());
                     results[i] = Some(data);
                 }
                 Err(_) => {
@@ -444,9 +538,10 @@ impl ObjectStore for CachingObjectStore {
         if !miss_hashes.is_empty() {
             let miss_results = self.inner.get_blob_batch(&miss_hashes)?;
 
-            // Phase 3: Populate cache for misses and place in results.
+            // Phase 3: Populate disk + in-memory cache for misses.
             for (j, (data, hash)) in miss_results.iter().zip(miss_hashes.iter()).enumerate() {
                 let _ = self.write_blob_to_disk(hash, data);
+                self.maybe_insert_mem_cache(hash, data.clone());
                 results[miss_indices[j]] = Some(data.clone());
             }
         }
@@ -471,9 +566,10 @@ impl ObjectStore for CachingObjectStore {
         }
         // Delegate to inner (parallel on S3, sequential fallback on LocalFS).
         let hashes = self.inner.put_blob_batch(items)?;
-        // Cache all written blobs to local disk.
+        // Cache all written blobs to local disk + in-memory.
         for (data, hash) in items.iter().zip(hashes.iter()) {
             let _ = self.write_blob_to_disk(hash, data);
+            self.maybe_insert_mem_cache(hash, data.clone());
         }
         Ok(hashes)
     }
@@ -495,7 +591,10 @@ mod tests {
         let inner: Box<dyn ObjectStore> = Box::new(
             LocalFSObjectStore::new(inner_dir.path()).unwrap(),
         );
-        let cached = CachingObjectStore::new(inner, cache_dir.path()).unwrap();
+        // Disable mem cache for disk-specific tests.
+        let cached = CachingObjectStore::new(inner, cache_dir.path())
+            .unwrap()
+            .with_max_mem_bytes(0);
         (cached, inner_dir, cache_dir)
     }
 
@@ -608,7 +707,8 @@ mod tests {
         );
         let store = CachingObjectStore::new(inner, cache_dir.path())
             .unwrap()
-            .with_max_disk_bytes(350); // room for ~3.5 blobs of 100 bytes
+            .with_max_disk_bytes(350) // room for ~3.5 blobs of 100 bytes
+            .with_max_mem_bytes(0);   // disable mem cache for this LRU test
 
         // Write A, B, C (each 100 bytes = 300 bytes total, triggers eviction)
         let h_a = store.put_blob(&[1u8; 100]).unwrap();
@@ -814,5 +914,148 @@ mod tests {
         let (store, _inner, _cache) = make_cached_store();
         let hashes = store.put_blob_batch(&[]).unwrap();
         assert!(hashes.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Tier 0 (in-memory) cache tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_mem_cache_hit_after_put() {
+        // After put_blob, the blob should be in the in-memory cache.
+        // We verify this by deleting the disk cache and confirming the
+        // read still succeeds (served from memory).
+        let inner_dir = tempdir().unwrap();
+        let cache_dir = tempdir().unwrap();
+        let inner: Box<dyn ObjectStore> = Box::new(
+            LocalFSObjectStore::new(inner_dir.path()).unwrap(),
+        );
+        let store = CachingObjectStore::new(inner, cache_dir.path()).unwrap();
+        let h = store.put_blob(b"mem cached").unwrap();
+        // Delete from disk — read should still work from memory.
+        std::fs::remove_file(store.blob_path(&h)).unwrap();
+        let data = store.get_blob(&h).unwrap();
+        assert_eq!(data, b"mem cached");
+    }
+
+    #[test]
+    fn test_large_blob_skips_mem_cache() {
+        // Blobs >= 1 MB should skip the in-memory cache.
+        let inner_dir = tempdir().unwrap();
+        let cache_dir = tempdir().unwrap();
+        let inner: Box<dyn ObjectStore> = Box::new(
+            LocalFSObjectStore::new(inner_dir.path()).unwrap(),
+        );
+        let store = CachingObjectStore::new(inner, cache_dir.path())
+            .unwrap()
+            .with_skip_mem_cache_threshold(100); // 100-byte threshold
+
+        // Write a 200-byte blob (> threshold).
+        let big_blob = vec![0xABu8; 200];
+        let h = store.put_blob(&big_blob).unwrap();
+        // Verify large blob is NOT in memory cache by deleting BOTH
+        // disk cache and inner store, then confirming the read fails.
+        std::fs::remove_file(store.blob_path(&h)).unwrap();
+        let inner_blob = inner_dir.path().join("blobs").join(&h[..2]).join(&h);
+        std::fs::remove_file(inner_blob).unwrap();
+        assert!(store.get_blob(&h).is_err(),
+            "large blob should NOT be served from mem cache");
+    }
+
+    #[test]
+    fn test_mem_cache_eviction_respects_max_bytes() {
+        // Set a very small memory limit (500 bytes) and write many blobs.
+        // Moka's segmented LRU evicts lazily — most entries should be evicted.
+        let inner_dir = tempdir().unwrap();
+        let cache_dir = tempdir().unwrap();
+        let inner: Box<dyn ObjectStore> = Box::new(
+            LocalFSObjectStore::new(inner_dir.path()).unwrap(),
+        );
+        let store = CachingObjectStore::new(inner, cache_dir.path())
+            .unwrap()
+            .with_max_mem_bytes(500);
+
+        let mut hashes = Vec::new();
+        for i in 0..100u32 {
+            let data = vec![i as u8; 100];
+            hashes.push(store.put_blob(&data).unwrap());
+        }
+        // Delete ALL disk files and inner store files.
+        for h in &hashes {
+            let _ = std::fs::remove_file(store.blob_path(h));
+            let inner_blob = inner_dir.path().join("blobs").join(&h[..2]).join(h);
+            let _ = std::fs::remove_file(inner_blob);
+        }
+        let mut mem_hits = 0;
+        for h in &hashes {
+            if store.get_blob(h).is_ok() {
+                mem_hits += 1;
+            }
+        }
+        // With 500-byte limit and 100×100-byte blobs, most should be evicted.
+        assert!(mem_hits < 50,
+            "most blobs should be evicted from 500-byte mem cache, but {} survived", mem_hits);
+    }
+
+    #[test]
+    fn test_delete_blob_invalidates_mem_cache() {
+        // Delete should remove from both disk and in-memory cache.
+        let inner_dir = tempdir().unwrap();
+        let cache_dir = tempdir().unwrap();
+        let inner: Box<dyn ObjectStore> = Box::new(
+            LocalFSObjectStore::new(inner_dir.path()).unwrap(),
+        );
+        let store = CachingObjectStore::new(inner, cache_dir.path()).unwrap();
+        let h = store.put_blob(b"to delete from mem").unwrap();
+        // Verify blob is readable.
+        assert_eq!(store.get_blob(&h).unwrap(), b"to delete from mem");
+        // Delete from inner too, so we can test that mem cache is invalidated.
+        let inner_blob = inner_dir.path().join("blobs").join(&h[..2]).join(&h);
+        std::fs::remove_file(inner_blob).unwrap();
+        store.delete_blob(&h).unwrap();
+        assert!(!store.blob_path(&h).exists());
+        // Read should fail — both disk and memory invalidated.
+        assert!(store.get_blob(&h).is_err(),
+            "blob should not be readable after delete invalidates mem cache");
+    }
+
+    #[test]
+    fn test_get_blob_range_uses_mem_cache() {
+        // Small blob in memory → range read should slice from memory.
+        let inner_dir = tempdir().unwrap();
+        let cache_dir = tempdir().unwrap();
+        let inner: Box<dyn ObjectStore> = Box::new(
+            LocalFSObjectStore::new(inner_dir.path()).unwrap(),
+        );
+        let store = CachingObjectStore::new(inner, cache_dir.path()).unwrap();
+        let payload = b"0123456789ABCDEFGHIJ"; // 20 bytes
+        let h = store.put_blob(payload).unwrap();
+        // Delete from disk — range read should still work from memory.
+        std::fs::remove_file(store.blob_path(&h)).unwrap();
+        let range = store.get_blob_range(&h, 5, 15).unwrap();
+        assert_eq!(range, b"56789ABCDE");
+    }
+
+    #[test]
+    fn test_mem_cache_batch_hit() {
+        // Batch read where all blobs are in memory.
+        let inner_dir = tempdir().unwrap();
+        let cache_dir = tempdir().unwrap();
+        let inner: Box<dyn ObjectStore> = Box::new(
+            LocalFSObjectStore::new(inner_dir.path()).unwrap(),
+        );
+        let store = CachingObjectStore::new(inner, cache_dir.path()).unwrap();
+        let items = [b"x".to_vec(), b"y".to_vec(), b"z".to_vec()];
+        let hashes: Vec<String> = items.iter().map(|d| store.put_blob(d).unwrap()).collect();
+        // Delete all from disk.
+        for h in &hashes {
+            std::fs::remove_file(store.blob_path(h)).unwrap();
+        }
+        // Batch read — all should come from memory.
+        let results = store.get_blob_batch(&hashes).unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0], b"x");
+        assert_eq!(results[1], b"y");
+        assert_eq!(results[2], b"z");
     }
 }

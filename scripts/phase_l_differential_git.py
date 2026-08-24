@@ -84,7 +84,7 @@ class GitRepo:
         self.path = path
         os.makedirs(path, exist_ok=True)
         # Init with SHA-256 for hash-length parity with Pond
-        self._run(["git", "init", "-q", "--object-format=sha256", path])
+        self._run(["git", "init", "-q", "-b", "main", "--object-format=sha256", path])
         self._run(["git", "-C", path, "config", "user.email", "t@t.t"])
         self._run(["git", "-C", path, "config", "user.name", "Test"])
 
