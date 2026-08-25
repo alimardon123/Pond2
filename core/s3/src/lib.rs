@@ -632,6 +632,27 @@ struct SignedS3Request {
 // ---------------------------------------------------------------------------
 
 impl S3ObjectStore {
+    /// Like get_path but also returns the ETag header for CAS operations.
+    ///
+    /// Used by the trait's `put_path_if` override to combine content
+    /// verification and ETag capture into a single GET (was two: HEAD + GET).
+    fn get_path_with_etag(&self, path: &str) -> Option<(String, String)> {
+        let key = self.path_key(path);
+        match self.s3_request("GET", &key, None, None, &[]) {
+            Ok(resp) => {
+                let etag = resp.header("etag").unwrap_or("").to_string();
+                let mut body = String::new();
+                if resp.into_reader().read_to_string(&mut body).is_err() {
+                    return None;
+                }
+                let mut s = self.stats.lock().unwrap();
+                s.gets += 1;
+                extract_hash_from_json(&body).map(|hash| (hash, etag))
+            }
+            Err(_) => None,
+        }
+    }
+
     /// Upload a large blob using S3 multipart upload.
     ///
     /// Splits `data` into 16MB parts, uploads them in parallel using
@@ -851,6 +872,32 @@ impl ObjectStore for S3ObjectStore {
         }
     }
 
+    fn get_blob_suffix(&self, hash: &str, n: u64) -> io::Result<Vec<u8>> {
+        // S3 suffix range: `bytes=-N` returns the last N bytes.
+        // Single RTT for a 12-byte slab tail, regardless of slab size.
+        let key = self.blob_key(hash);
+        let range_value = format!("bytes=-{}", n);
+        let resp = self.s3_request("GET", &key, None, None,
+            &[("Range".to_string(), range_value)])?;
+
+        let status = resp.status();
+        let mut body = Vec::new();
+        resp.into_reader()
+            .read_to_end(&mut body)
+            .map_err(io::Error::other)?;
+
+        if status == 206 || status == 200 {
+            let mut s = self.stats.lock().unwrap();
+            s.gets += 1;
+            s.bytes_read += body.len() as u64;
+            Ok(body)
+        } else {
+            Err(io::Error::other(format!(
+                "S3 get_blob_suffix returned unexpected status {}", status
+            )))
+        }
+    }
+
     fn put_blob_batch(&self, items: &[Vec<u8>]) -> io::Result<Vec<String>> {
         if items.is_empty() {
             return Ok(Vec::new());
@@ -1006,50 +1053,52 @@ impl ObjectStore for S3ObjectStore {
 
     /// S3-native CAS using If-Match ETag precondition.
     ///
-    /// 1. HEAD the ref to get its current ETag.
-    /// 2. If expected_hash doesn't match, return Ok(false).
-    /// 3. PUT with If-Match: <etag>. S3 returns 412 on mismatch.
+    /// Two RTTs for CAS (was three): GET to verify expected_hash + capture ETag,
+    /// then PUT with If-Match. S3 returns 412 on concurrent modification.
+    /// For expected_hash = None, does an unconditional PUT (1 RTT).
     fn put_path_if(&self, path: &str, expected_hash: Option<&str>, new_hash: &str) -> io::Result<bool> {
         let key = self.path_key(path);
 
-        // HEAD to get current ETag (for If-Match)
-        let current_etag = match self.s3_request("HEAD", &key, None, None, &[]) {
-            Ok(resp) => resp.header("etag").unwrap_or("").to_string(),
-            Err(_) => String::new(),
-        };
-
-        // Validate expected_hash against actual current value
         if let Some(expected) = expected_hash {
-            let current_hash = self.get_path(path);
-            match (&current_hash, Some(expected)) {
-                (Some(current), Some(exp)) if current == exp => {}
-                _ => return Ok(false),
-            }
-        } else if !current_etag.is_empty() {
-            return Ok(false);
-        }
+            // Single GET: verify content hash AND capture ETag for If-Match.
+            // Previous impl wasted a separate HEAD (3 RTTs total).
+            let (current_hash, etag) = match self.get_path_with_etag(path) {
+                Some(pair) => pair,
+                None => return Ok(false),
+            };
 
-        // PUT with If-Match
-        let body = format!(r#"{{"hash":"{}"}}"#, new_hash).into_bytes();
-        let extra = if !current_etag.is_empty() {
-            vec![("If-Match".to_string(), current_etag)]
-        } else {
-            vec![]
-        };
-
-        match self.s3_request("PUT", &key, None, Some(&body), &extra) {
-            Ok(_) => {
-                let mut s = self.stats.lock().unwrap();
-                s.puts += 1;
-                Ok(true)
+            if current_hash != expected {
+                return Ok(false);
             }
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("412") || msg.contains("Precondition Failed") {
-                    Ok(false)
-                } else {
-                    Err(e)
+
+            // PUT with If-Match to prevent TOCTOU race
+            let body = format!(r#"{{"hash":"{}"}}"#, new_hash).into_bytes();
+            let extra = vec![("If-Match".to_string(), etag)];
+            match self.s3_request("PUT", &key, None, Some(&body), &extra) {
+                Ok(_) => {
+                    let mut s = self.stats.lock().unwrap();
+                    s.puts += 1;
+                    Ok(true)
                 }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("412") || msg.contains("Precondition Failed") {
+                        Ok(false)
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
+        } else {
+            // No expected_hash: unconditional put (1 RTT)
+            let body = format!(r#"{{"hash":"{}"}}"#, new_hash).into_bytes();
+            match self.s3_request("PUT", &key, None, Some(&body), &[]) {
+                Ok(_) => {
+                    let mut s = self.stats.lock().unwrap();
+                    s.puts += 1;
+                    Ok(true)
+                }
+                Err(e) => Err(e),
             }
         }
     }

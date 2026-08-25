@@ -540,6 +540,19 @@ impl ObjectStore for CachingObjectStore {
         result
     }
 
+    fn get_blob_suffix(&self, hash: &str, n: u64) -> io::Result<Vec<u8>> {
+        // If full blob is in memory cache, slice from there (sub-us).
+        if let Some(arc_data) = self.mem_cache.get(hash) {
+            let len = arc_data.len();
+            if len < n as usize {
+                return Ok(arc_data.to_vec());
+            }
+            return Ok(arc_data[len - n as usize..].to_vec());
+        }
+        // Delegate to inner for native suffix read (S3 bytes=-N, LocalFS SeekFrom::End).
+        self.inner.get_blob_suffix(hash, n)
+    }
+
     fn delete_blob(&self, hash: &str) -> io::Result<bool> {
         let result = self.inner.delete_blob(hash)?;
         self.mem_cache.remove(hash);

@@ -258,7 +258,8 @@ impl LakehouseLens {
 
     /// Point lookup — find a single row by key value.
     ///
-    /// Uses predicate pruning to skip row groups that can't contain the key.
+    /// Tries the BPTX index first for O(log N) lookup (2-3 S3 RTTs).
+    /// Falls back to full scan when no index exists or index is stale.
     ///
     /// Args:
     ///   - table_name: Collection name
@@ -272,6 +273,27 @@ impl LakehouseLens {
         key_col: &str,
         key_val: i64,
     ) -> Result<Option<HashMap<String, serde_json::Value>>, String> {
+        let active = self.storage.get_active_branch(table_name);
+        let kernel = self.storage.kernel();
+
+        // Try BPTX indexed path first — O(log N) with 2-3 RTTs
+        match pond_storage::bptx::index_lookup_checked(
+            kernel, table_name, &active, key_col, key_val,
+        ) {
+            Ok(Some(hit)) => {
+                // Index hit — read only the specific RG and extract the row
+                return self.read_row_by_hit(table_name, &active, &hit, key_col);
+            }
+            Ok(None) => {
+                // Index is fresh but key not found — no need for full scan
+                return Ok(None);
+            }
+            Err(_) => {
+                // No index or stale index — fall back to full scan
+            }
+        }
+
+        // Fallback: full scan (O(N))
         let cols = self.read_columns(table_name, None)?;
 
         // Find the key column
@@ -302,6 +324,76 @@ impl LakehouseLens {
         }
 
         Ok(None)
+    }
+
+    /// Read a single row identified by a BPTX IndexHit.
+    ///
+    /// Loads only the specific RG blob (slab-aware), decodes it,
+    /// and extracts the row at `hit.row_offset`.
+    fn read_row_by_hit(
+        &self,
+        table_name: &str,
+        branch: &str,
+        hit: &pond_storage::bptx::IndexHit,
+        _key_col: &str,
+    ) -> Result<Option<HashMap<String, serde_json::Value>>, String> {
+        let kernel = self.storage.kernel();
+
+        // Resolve manifest to get RG metadata
+        let commit_ref = pond_storage::branch_ref(table_name, branch);
+        let commit_hash = kernel.resolve(&commit_ref)
+            .ok_or_else(|| format!("Table '{}' has no commits", table_name))?;
+        let manifest_bytes = pond_storage::commit::resolve_manifest_bytes(kernel, &commit_hash)
+            .map_err(|e| format!("Failed to read manifest: {}", e))?;
+        let manifest = pond_storage::manifest::CollectionManifest::decode(&manifest_bytes)
+            .ok_or_else(|| "Failed to decode manifest".to_string())?;
+
+        let rg = manifest.row_groups.get(hit.rg_index as usize)
+            .ok_or_else(|| format!("BPTX rg_index {} out of range ({} RGs)",
+                hit.rg_index, manifest.row_groups.len()))?;
+
+        // Slab-aware read: only fetch the RG's bytes, not the whole slab
+        let blob_data = if let (Some(off), Some(len)) = (rg.slab_byte_offset, rg.slab_byte_len) {
+            kernel.read_blob_range(&rg.blob_hash, off, off + len as u64)
+                .map_err(|e| format!("Failed to read slab range: {}", e))?
+        } else {
+            kernel.read_blob(&rg.blob_hash)
+                .map_err(|e| format!("Failed to read blob: {}", e))?
+        };
+
+        let cols = pond_core::pnd2_decode(&blob_data)
+            .map_err(|e| format!("Failed to decode PND2: {}", e))?;
+
+        let row_offset = hit.row_offset as usize;
+        let mut row = HashMap::new();
+
+        for col in &cols {
+            let name = col.name.to_string_lossy().to_string();
+            // Skip CRDT metadata columns
+            if name == "_rowid" || name == "_version" || name == "_deleted" {
+                continue;
+            }
+
+            let val = match col.vtype {
+                pond_core::VT_INT64 => {
+                    col.i64_data.get(row_offset).map(|&x| serde_json::json!(x))
+                }
+                pond_core::VT_FLOAT64 => {
+                    col.f64_data.get(row_offset).map(|&x| serde_json::json!(x))
+                }
+                pond_core::VT_STRING => {
+                    col.str_data.get(row_offset)
+                        .map(|s| serde_json::json!(s.to_string_lossy().to_string()))
+                }
+                _ => None,
+            };
+
+            if let Some(v) = val {
+                row.insert(name, v);
+            }
+        }
+
+        Ok(Some(row))
     }
 
     /// Get a reference to the underlying UnifiedStorage.

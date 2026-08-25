@@ -130,6 +130,22 @@ pub trait ObjectStore: Send + Sync {
         Ok(full[start as usize..end_clamped as usize].to_vec())
     }
 
+    /// Read the last `n` bytes of a content-addressed blob.
+    ///
+    /// Efficient on object storage (S3 `Range: bytes=-N`) and local FS
+    /// (`SeekFrom::End(-N)`). Used for reading slab tails (12 bytes)
+    /// without knowing the total blob size.
+    ///
+    /// Default: reads full blob + slices (correct but slow).
+    /// Backends should override with native suffix support.
+    fn get_blob_suffix(&self, hash: &str, n: u64) -> io::Result<Vec<u8>> {
+        let data = self.get_blob(hash)?;
+        if data.len() < n as usize {
+            return Ok(data);
+        }
+        Ok(data[data.len() - n as usize..].to_vec())
+    }
+
     /// Physically delete a blob from the object store (maintenance operation).
     ///
     /// This is NOT a kernel primitive — it's a Layer 0.5 maintenance operation
@@ -339,6 +355,35 @@ impl ObjectStore for LocalFSObjectStore {
         let mut buf = vec![0u8; len];
         // read_exact ensures we got all requested bytes; if the file is
         // shorter than metadata reported (race condition), error out.
+        match f.read_exact(&mut buf) {
+            Ok(()) => {
+                let mut s = self.stats.lock().unwrap();
+                s.gets += 1;
+                s.bytes_read += buf.len() as u64;
+                Ok(buf)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn get_blob_suffix(&self, hash: &str, n: u64) -> io::Result<Vec<u8>> {
+        // Native suffix read: seek from end, read last N bytes.
+        // Avoids loading the whole blob — critical for slab tail reads
+        // on large slabs (100 MB+) where we only need 12 bytes.
+        use std::io::{Read, Seek, SeekFrom};
+        let path = self.blob_path(hash);
+        if !path.exists() {
+            return Err(io::Error::new(io::ErrorKind::NotFound,
+                format!("Blob '{}' not found", hash)));
+        }
+        let mut f = std::fs::File::open(&path)?;
+        let file_len = f.metadata()?.len();
+        let actual_n = n.min(file_len) as usize;
+        if actual_n == 0 {
+            return Ok(Vec::new());
+        }
+        f.seek(SeekFrom::End(-(actual_n as i64)))?;
+        let mut buf = vec![0u8; actual_n];
         match f.read_exact(&mut buf) {
             Ok(()) => {
                 let mut s = self.stats.lock().unwrap();

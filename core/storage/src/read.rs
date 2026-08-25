@@ -89,6 +89,104 @@ fn read_rgs_slab_aware_with_decompress(
     kernel: &PondKernel,
     row_groups: &[&crate::manifest::RowGroupEntry],
 ) -> Result<Vec<Vec<u8>>, String> {
+    read_rgs_slab_aware_with_decompress_inner(kernel, row_groups)
+}
+
+// ---------------------------------------------------------------------------
+// Bloom filter pre-check for slab-backed RGs
+// ---------------------------------------------------------------------------
+
+/// Check if a slab's bloom filter can definitively rule out a set of
+/// equality predicates. Returns `true` if the slab should be SKIPPED
+/// (bloom miss — value is definitely not in this slab).
+///
+/// This uses the suffix-read primitive to read only the slab header (10 bytes),
+/// tail (12 bytes), and footer (~100-500 bytes) — ~3 small I/Os total,
+/// regardless of slab size. For warm queries, the memory cache serves these.
+///
+/// # Cost
+///   - Cold: 2-3 small S3 RTTs (10 + 12 + ~500 bytes)
+///   - Warm: 0 RTTs (memory cache)
+///
+/// # Savings
+///   - Skips ALL RG reads for the slab on bloom miss
+///   - For a 128-RG slab, saves 128 range reads (~128 KB of data)
+fn slab_bloom_should_skip(
+    kernel: &PondKernel,
+    slab_hash: &str,
+    predicates: &[(String, String, Vec<u8>)],
+) -> bool {
+    // Only bloom helps for equality predicates (=, in)
+    let has_eq = predicates.iter().any(|(_, op, _)| op == "=" || op == "in");
+    if !has_eq {
+        return false;
+    }
+
+    // Read slab header (10 bytes) to check magic + PSLB_FLAG_HAS_BLOOM.
+    let header = match kernel.read_blob_range(slab_hash, 0, 10) {
+        Ok(h) if h.len() >= 6 => h,
+        _ => return false, // Can't read — don't prune (safe)
+    };
+
+    // Verify PSLB magic, version, and bloom flag.
+    if &header[0..4] != crate::slab::PSLB_MAGIC {
+        return false; // Not a slab (e.g. a standalone PND2 with same hash)
+    }
+    if header[4] != crate::slab::PSLB_VERSION {
+        return false;
+    }
+    if (header[5] & crate::slab::PSLB_FLAG_HAS_BLOOM) == 0 {
+        return false; // Slab has no bloom filter
+    }
+
+    // Read tail (last 12 bytes) to get footer_offset.
+    let tail = match kernel.read_blob_suffix(slab_hash, crate::slab::PSLB_TAIL_LEN as u64) {
+        Ok(t) if t.len() == crate::slab::PSLB_TAIL_LEN => t,
+        _ => return false,
+    };
+    let (footer_offset, valid_magic) = match crate::slab::decode_slab_tail(&tail) {
+        Some(pair) => pair,
+        None => return false,
+    };
+    if !valid_magic {
+        return false;
+    }
+
+    // Read footer: from footer_offset to EOF.
+    // read_blob_range clamps `end` to file length on all backends,
+    // so footer_offset + 1MB safely reads footer + tail.
+    // decode_slab_footer has strict bounds checking — extra bytes (tail)
+    // at the end are ignored after parsing n_entries + optional bloom.
+    const MAX_FOOTER_READ: u64 = 1_048_576; // 1 MB — covers ~2000 entries × 10 cols
+    let footer_raw = match kernel.read_blob_range(slab_hash, footer_offset, footer_offset + MAX_FOOTER_READ) {
+        Ok(f) if !f.is_empty() => f,
+        _ => return false,
+    };
+
+    let footer = match crate::slab::decode_slab_footer(&footer_raw, true) {
+        Some(f) => f,
+        None => return false, // Truncated footer — don't prune (safe)
+    };
+
+    // Check bloom for each equality predicate.
+    // A SINGLE bloom miss is definitive — skip the entire slab.
+    if let Some(ref bloom) = footer.bloom {
+        for (col_name, op, value) in predicates {
+            if (op == "=" || op == "in") && !bloom.might_contain_col_value(col_name, value) {
+                return true; // BLOOM MISS — definitely not in this slab
+            }
+        }
+    }
+
+    false // Bloom hit (inconclusive) or no bloom — don't skip
+}
+
+/// Shared slab-aware reader: separates slab/standalone RGs, does range reads,
+/// and decompresses if the slab uses PSLB v2 zstd compression.
+fn read_rgs_slab_aware_with_decompress_inner(
+    kernel: &PondKernel,
+    row_groups: &[&crate::manifest::RowGroupEntry],
+) -> Result<Vec<Vec<u8>>, String> {
     use std::collections::HashMap;
 
     let mut standalone_hashes: Vec<String> = Vec::new();
@@ -695,8 +793,48 @@ pub fn read_rows_i64(
     // 1024 RGs in one slab this turns 1024 Range GETs into 1.
 
     // 1. Predicate pruning — collect surviving RGs
+    //
+    // Two-phase pruning for slab-backed RGs with equality predicates:
+    //   Phase A: Bloom pre-check (slab-level, 2-3 small RTTs per unique slab)
+    //            A bloom miss skips ALL RGs in the slab without zone-map I/O.
+    //   Phase B: Zone-map pruning (per-RG, free — uses manifest stats)
+    //
+    // For standalone RGs and non-equality predicates, only Phase B applies.
+    // For warm queries, Phase A is free (memory cache serves header/tail/footer).
+
+    // Phase A: identify slab hashes to bloom-check
+    let mut bloom_skip_slabs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(preds) = predicates {
+        // Convert predicates to (String, String, Vec<u8>) for bloom check
+        let bloom_preds: Vec<(String, String, Vec<u8>)> = preds.iter().map(|(col, op, val)| {
+            (col.to_string(), op.to_string(), val.to_le_bytes().to_vec())
+        }).collect();
+
+        // Collect unique slab hashes that have slab_byte_offset set
+        let mut unique_slab_hashes: Vec<&str> = Vec::new();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for rg in &manifest.row_groups {
+            if rg.slab_byte_offset.is_some() && seen.insert(&rg.blob_hash) {
+                unique_slab_hashes.push(&rg.blob_hash);
+            }
+        }
+
+        // Bloom-check each unique slab
+        for slab_hash in &unique_slab_hashes {
+            if slab_bloom_should_skip(kernel, slab_hash, &bloom_preds) {
+                bloom_skip_slabs.insert(slab_hash.to_string());
+            }
+        }
+    }
+
+    // Phase B: zone-map pruning + bloom skip
     let surviving_rgs: Vec<&crate::manifest::RowGroupEntry> = manifest.row_groups.iter()
         .filter(|rg| {
+            // Skip RGs in bloom-negative slabs
+            if rg.slab_byte_offset.is_some() && bloom_skip_slabs.contains(&rg.blob_hash) {
+                return false;
+            }
+            // Zone-map pruning (per-RG, uses manifest stats — no I/O)
             if let Some(preds) = predicates {
                 for (col_name, op, value) in preds {
                     if let Some(stats) = rg.columns.iter().find(|c| c.name == *col_name) {

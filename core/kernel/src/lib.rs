@@ -160,6 +160,16 @@ impl PondKernel {
         Ok(data)
     }
 
+    /// Read the last `n` bytes of a content-addressed blob.
+    ///
+    /// Delegates to `ObjectStore::get_blob_suffix` — S3 uses `Range: bytes=-N`,
+    /// LocalFS uses `SeekFrom::End(-N)`. Single RTT regardless of blob size.
+    pub fn read_blob_suffix(&self, h: &str, n: u64) -> io::Result<Vec<u8>> {
+        let data = self.store.get_blob_suffix(h, n)?;
+        self.stats.lock().unwrap().reads += 1;
+        Ok(data)
+    }
+
     // ------------------------------------------------------------------
     // Primitive 3: Ref (mutable name → hash mapping)
     // ------------------------------------------------------------------
