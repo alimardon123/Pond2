@@ -9,6 +9,7 @@
 // Both paths create a commit and update branch refs identically.
 
 use crate::commit;
+use crate::pond_pack;
 use crate::manifest::{CollectionManifest, ColumnStatsEntry, LeafEntry, MAX_LEAF_RGS, RootManifest, RowGroupEntry, compute_key_range};
 use crate::slab;
 use crate::{branch_ref, manifest_ref};
@@ -386,23 +387,36 @@ fn write_rows_inner(
     });
 
     let manifest_bytes = manifest.encode();
-    let manifest_hash = kernel.write(&manifest_bytes)
-        .map_err(|e| format!("Failed to write manifest: {}", e))?;
 
-    // Write the commit
-    let commit_hash = commit::write_commit(
-        kernel, collection, &manifest_hash, parent.as_deref(), None,
-        if message.is_empty() { "write_rows" } else { message }, parent_index,
-    ).map_err(|e| format!("Failed to write commit: {}", e))?;
+    // Build commit JSON (inline — we pack it with the manifest)
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let commit_obj = serde_json::json!({
+        "parent": parent,
+        "second_parent": null,
+        "manifest": "packed",
+        "message": if message.is_empty() { "write_rows" } else { message },
+        "timestamp": timestamp,
+        "index": parent_index,
+    });
 
-    // Update branch refs
-    kernel.reference(&branch_ref(collection, active_branch), &commit_hash)
+    // Encode as PondPack (commit + manifest combined) → saves 1 S3 PUT
+    let pack_bytes = pond_pack::encode_pack(&commit_obj, &manifest_bytes, None);
+    let pack_hash = kernel.write(&pack_bytes)
+        .map_err(|e| format!("Failed to write PondPack: {}", e))?;
+
+    // Update branch refs (all point to the pack blob)
+    // branch_ref → pack_hash (read path detects PNPK and extracts commit+manifest)
+    // manifest_ref → pack_hash (load_manifest in branch.rs handles PNPK)
+    kernel.reference(&branch_ref(collection, active_branch), &pack_hash)
         .map_err(|e| format!("Failed to update branch ref: {}", e))?;
-    kernel.reference(&manifest_ref(collection, active_branch), &manifest_hash)
+    kernel.reference(&manifest_ref(collection, active_branch), &pack_hash)
         .map_err(|e| format!("Failed to update manifest ref: {}", e))?;
-    let _ = kernel.reference(collection, &commit_hash);
+    let _ = kernel.reference(collection, &pack_hash);
 
-    Ok(commit_hash)
+    Ok(pack_hash)
 }
 
 /// Write multiple row-group batches as ONE PSLB slab blob.
@@ -1156,6 +1170,55 @@ mod tests {
         assert_eq!(id_col.1[8], 9);
         assert_eq!(val_col.1[0], 10);
         assert_eq!(val_col.1[8], 90);
+    }
+
+    #[test]
+    fn test_write_rows_packed_commit_chain() {
+        // Verify write_rows (PondPack path) chains commits correctly.
+        // Parent is a PNPK pack, child should be able to read parent's commit.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        let ids1 = vec![1i64, 2, 3];
+        let vals1 = vec![10.0f64, 20.0, 30.0];
+
+        // First write via write_rows (PondPack path)
+        let c1 = write_rows(
+            kernel, "chain_test", "main",
+            &[("id", TypedColumn::Int64(ids1.clone())), ("val", TypedColumn::Float64(vals1.clone()))],
+            "first commit",
+        ).unwrap();
+
+        // Verify c1 is a PNPK pack
+        let pack_data = kernel.read_blob(&c1).unwrap();
+        assert!(pond_pack::is_pack(&pack_data), "write_rows should produce PNPK pack");
+
+        // Verify commit chain: c2's parent = c1
+        let ids2 = vec![4i64, 5];
+        let vals2 = vec![40.0f64, 50.0];
+        let c2 = write_rows(
+            kernel, "chain_test", "main",
+            &[("id", TypedColumn::Int64(ids2)), ("val", TypedColumn::Float64(vals2))],
+            "second commit",
+        ).unwrap();
+
+        let commit2 = commit::read_commit(kernel, &c2).unwrap();
+        assert_eq!(commit2.parent, Some(c1.clone()));
+        assert_eq!(commit2.index, 1);
+        assert_eq!(commit2.message, "second commit");
+
+        // Verify parent (c1) is also readable as a commit via commit::read_commit
+        let commit1 = commit::read_commit(kernel, &c1).unwrap();
+        assert!(commit1.parent.is_none());
+        assert_eq!(commit1.index, 0);
+        assert_eq!(commit1.message, "first commit");
+
+        // Verify data is readable through the standard read path
+        // Note: read_rows_i64 reads HEAD manifest only (latest commit's data)
+        let cols = crate::read::read_rows_i64(kernel, "chain_test", "main", None, None).unwrap();
+        let id_col = cols.iter().find(|(n, _)| n == "id").unwrap();
+        assert_eq!(id_col.1.len(), 2, "HEAD should have 2 rows from second commit");
     }
 
 }

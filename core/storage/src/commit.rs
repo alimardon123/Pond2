@@ -53,6 +53,18 @@ impl Commit {
         })
     }
 
+    /// Deserialize from a serde_json::Value (for PNPK pack extraction).
+    pub fn from_json_value(v: &serde_json::Value) -> Option<Self> {
+        Some(Commit {
+            parent: v.get("parent").and_then(|p| p.as_str()).map(|s| s.to_string()),
+            second_parent: v.get("second_parent").and_then(|p| p.as_str()).map(|s| s.to_string()),
+            manifest: v.get("manifest").and_then(|p| p.as_str()).unwrap_or("").to_string(),
+            message: v.get("message").and_then(|p| p.as_str()).unwrap_or("").to_string(),
+            timestamp: v.get("timestamp").and_then(|p| p.as_f64()).unwrap_or(0.0),
+            index: v.get("index").and_then(|p| p.as_u64()).unwrap_or(0) as usize,
+        })
+    }
+
     /// Is this a merge commit? (has second_parent)
     pub fn is_merge(&self) -> bool {
         self.second_parent.is_some()
@@ -97,9 +109,15 @@ pub fn write_commit(
 
 /// Read a commit blob from the kernel by hash.
 ///
+/// Handles both plain JSON commits and PNPK PondPack blobs.
 /// Matches Python's _read_commit_blob.
 pub fn read_commit(kernel: &PondKernel, commit_hash: &str) -> Option<Commit> {
     let data = kernel.read_blob(commit_hash).ok()?;
+    // If the blob is a PNPK pack, extract the commit from it
+    if data.len() >= 4 && &data[0..4] == b"PNPK" {
+        let (commit_val, _, _) = crate::pond_pack::decode_pack(&data)?;
+        return Commit::from_json_value(&commit_val);
+    }
     Commit::from_json_bytes(&data)
 }
 

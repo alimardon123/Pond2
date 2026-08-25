@@ -280,9 +280,16 @@ pub fn revert(
 }
 
 /// Load a manifest from a hash.
+/// Handles both raw PMAN manifests and PNPK PondPack blobs.
 fn load_manifest(kernel: &PondKernel, manifest_hash: &str) -> Option<CollectionManifest> {
     let data = kernel.read_blob(manifest_hash).ok()?;
-    CollectionManifest::decode(&data)
+    // If the blob is a PNPK pack, extract the manifest bytes first
+    let manifest_data = if data.len() >= 4 && &data[0..4] == b"PNPK" {
+        crate::pond_pack::decode_pack(&data)?.1
+    } else {
+        data
+    };
+    CollectionManifest::decode(&manifest_data)
 }
 
 // ---------------------------------------------------------------------------

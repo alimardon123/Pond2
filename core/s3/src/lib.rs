@@ -269,6 +269,10 @@ pub struct S3ObjectStore {
     credentials: S3Credentials,
     agent: ureq::Agent,
     stats: Mutex<StoreStats>,
+    /// Cached SigV4 derived signing key. Keyed by (date_stamp, region, service).
+    /// The date stamp changes once per day, so this avoids 3 redundant
+    /// HMAC-SHA256 operations on every single S3 request.
+    signing_key_cache: Mutex<Option<(String, [u8; 32])>>,
     /// Lazily-initialized async HTTP client. Only present with `feature = "async"`.
     /// `OnceLock` so we don't need to thread an `Option` through `new()`.
     #[cfg(feature = "async")]
@@ -315,9 +319,32 @@ impl S3ObjectStore {
             credentials,
             agent,
             stats: Mutex::new(StoreStats::default()),
+            signing_key_cache: Mutex::new(None),
             #[cfg(feature = "async")]
             async_client: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Return a cached SigV4 derived signing key for the given date stamp.
+    /// The derived key depends on (secret_key, date_stamp, region, service).
+    /// Since date_stamp changes once per day, this cache avoids 3 redundant
+    /// HMAC-SHA256 operations per request (k_date → k_region → k_service).
+    fn get_signing_key(&self, date_stamp: &str) -> [u8; 32] {
+        let cache_key = format!("{}:{}", date_stamp, self.region);
+        let mut cache = self.signing_key_cache.lock().unwrap();
+        if let Some((ref cached_key, ref key)) = *cache {
+            if cached_key == &cache_key {
+                return *key;
+            }
+        }
+        let key = sigv4_signing_key(
+            &self.credentials.secret_key,
+            date_stamp,
+            &self.region,
+            "s3",
+        );
+        *cache = Some((cache_key, key));
+        key
     }
 
     /// Create from a URL like `s3://bucket/prefix?region=us-east-1&endpoint=...`.
@@ -442,7 +469,7 @@ impl S3ObjectStore {
             &canonical_request,
         );
 
-        let signing_key = sigv4_signing_key(&self.credentials.secret_key, &date_stamp, &self.region, "s3");
+        let signing_key = self.get_signing_key(&date_stamp);
         let signature = sigv4_sign(&signing_key, &string_to_sign);
 
         let signed_headers = headers.iter()
