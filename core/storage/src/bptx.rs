@@ -633,6 +633,9 @@ pub fn build_index_for_collection(
 
 /// Point lookup using the B+ tree index.
 /// Returns (rg_index, row_offset) if the key is found, or None.
+///
+/// NOTE: This does NOT check staleness. Use `index_lookup_checked` for
+/// production reads that need consistency guarantees.
 pub fn index_lookup(
     kernel: &PondKernel,
     collection: &str,
@@ -654,6 +657,120 @@ pub fn index_lookup(
         .map_err(|e| format!("Failed to read index blob: {}", e))?;
 
     Ok(lookup_i64(&blob, key))
+}
+
+/// Point lookup with staleness detection.
+///
+/// Checks that the index's `manifest_hash` matches the current HEAD's
+/// manifest hash. If stale, returns `Err` so the caller falls back to
+/// a full scan.
+///
+/// Returns `Ok(None)` if the index is fresh but the key is absent.
+/// Returns `Err` if the index is stale or any I/O fails — the caller
+/// should fall back to the non-indexed path.
+pub fn index_lookup_checked(
+    kernel: &PondKernel,
+    collection: &str,
+    branch: &str,
+    column: &str,
+    key: i64,
+) -> Result<Option<IndexHit>, String> {
+    // 1. Resolve current HEAD manifest hash
+    let commit_ref = super::branch_ref(collection, branch);
+    let commit_hash = kernel.resolve(&commit_ref)
+        .ok_or_else(|| format!("No commits in '{}' on branch '{}'", collection, branch))?;
+    let current_manifest_hash = commit::resolve_manifest_hash(kernel, &commit_hash)
+        .ok_or_else(|| "Cannot resolve manifest from HEAD commit".to_string())?;
+
+    // 2. Read index metadata and check staleness
+    let meta_ref = BptxIndexMeta::meta_ref(collection, column);
+    let meta_hash = match kernel.resolve(&meta_ref) {
+        Some(h) => h,
+        None => return Err("no_bptx_index".to_string()), // No index — caller falls through
+    };
+    let meta_bytes = kernel.read_blob(&meta_hash)
+        .map_err(|e| format!("Failed to read index metadata: {}", e))?;
+    let meta = BptxIndexMeta::from_json_bytes(&meta_bytes)
+        .ok_or_else(|| "Failed to parse index metadata".to_string())?;
+
+    // Staleness check: if the index was built on a different manifest,
+    // the rg_index values may be wrong. Fall back to full scan.
+    if meta.manifest_hash != current_manifest_hash {
+        return Err(format!("BPTX index stale (index manifest={}, current manifest={})",
+            &meta.manifest_hash[..8.min(meta.manifest_hash.len())],
+            &current_manifest_hash[..8.min(current_manifest_hash.len())]
+        ));
+    }
+
+    // 3. Two-step lookup: header + internal nodes first (1 Range GET),
+    //    then only the target leaf (1 Range GET).
+    let blob_ref = BptxIndexMeta::blob_ref(collection, column);
+    let blob_hash = kernel.resolve(&blob_ref)
+        .ok_or_else(|| "Index blob ref not found".to_string())?;
+
+    // Step 1: Load header (48 bytes) to get tree geometry
+    let header_bytes = kernel.read_blob_range(&blob_hash, 0, HEADER_SIZE as u64)
+        .map_err(|e| format!("Failed to read BPTX header: {}", e))?;
+    let header = decode_header(&header_bytes)
+        .ok_or_else(|| "Failed to decode BPTX header".to_string())?;
+
+    if header.n_entries == 0 {
+        return Ok(None);
+    }
+
+    // Step 2a: If tree has internal nodes, load them + walk to find leaf offset
+    if header.n_internal_nodes > 0 {
+        let int_start = header.internal_section_offset;
+        let int_end = int_start + header.internal_section_len;
+        let internal_bytes = kernel.read_blob_range(&blob_hash, int_start as u64, int_end as u64)
+            .map_err(|e| format!("Failed to read BPTX internal nodes: {}", e))?;
+
+        let (leaf_offset, leaf_est_size) = lookup_i64_find_leaf(&header, &internal_bytes, key)
+            .ok_or_else(|| "BPTX internal node walk failed".to_string())?;
+
+        // Step 2b: Load only the target leaf
+        let leaf_end = (leaf_offset as u64) + (leaf_est_size as u64)
+            .min((header.leaf_section_offset + header.leaf_section_len) as u64);
+        let leaf_bytes = kernel.read_blob_range(&blob_hash, leaf_offset as u64, leaf_end)
+            .map_err(|e| format!("Failed to read BPTX leaf: {}", e))?;
+
+        // Search within the leaf
+        let (keys, values, _) = decode_leaf_i64(&leaf_bytes)
+            .ok_or_else(|| "Failed to decode BPTX leaf".to_string())?;
+        match keys.binary_search(&key) {
+            Ok(i) => Ok(Some(IndexHit {
+                rg_index: values[i].0,
+                row_offset: values[i].1,
+            })),
+            Err(_) => Ok(None),
+        }
+    } else {
+        // No internal nodes — single leaf tree. Load the whole leaf section.
+        let leaf_start = header.leaf_section_offset;
+        let leaf_end = leaf_start + header.leaf_section_len;
+        let leaf_bytes = kernel.read_blob_range(&blob_hash, leaf_start as u64, leaf_end as u64)
+            .map_err(|e| format!("Failed to read BPTX leaf: {}", e))?;
+        let (keys, values, _) = decode_leaf_i64(&leaf_bytes)
+            .ok_or_else(|| "Failed to decode BPTX leaf".to_string())?;
+        match keys.binary_search(&key) {
+            Ok(i) => Ok(Some(IndexHit {
+                rg_index: values[i].0,
+                row_offset: values[i].1,
+            })),
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+/// Check if a BPTX index exists for the given collection+column.
+/// Returns true if the meta ref resolves.
+pub fn has_bptx_index(
+    kernel: &PondKernel,
+    collection: &str,
+    column: &str,
+) -> bool {
+    let meta_ref = BptxIndexMeta::meta_ref(collection, column);
+    kernel.resolve(&meta_ref).is_some()
 }
 
 // ---------------------------------------------------------------------------

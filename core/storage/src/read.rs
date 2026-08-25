@@ -756,6 +756,145 @@ pub fn read_rows_i64(
     Ok(result)
 }
 
+/// Indexed point lookup: read a single row by key column using the BPTX index.
+///
+/// This is the **fast path** for primary-key lookups. Instead of scanning all
+/// row groups, it uses the B+ tree index to locate the exact RG and row offset
+/// in O(log N), then reads ONLY that one RG.
+///
+/// # S3 Round-Trips (cold, no cache)
+///
+/// | Step | Operation | RTTs |
+/// |------|-----------|------|
+/// | 1    | Resolve branch HEAD (ref cache hit) | 0 |
+/// | 2    | Resolve manifest hash (from commit) | 1 |
+/// | 3    | Read index metadata (cached) | 0 |
+/// | 4    | Read BPTX header (48 bytes) | 1 |
+/// | 5    | Read internal nodes (if multi-level) | 1 |
+/// | 6    | Read target leaf | 1 |
+/// | 7    | Read target RG data | 1 |
+/// | **Total** | | **3-5** |
+///
+/// vs. `read_rows_i64` with a point predicate: ~7+ RTTs cold.
+///
+/// # Arguments
+/// * `kernel` — Pond kernel
+/// * `collection` — collection name
+/// * `branch` — branch name (typically "main")
+/// * `columns` — columns to project (None = all i64 columns)
+/// * `key_column` — the indexed column name (e.g., "id")
+/// * `key` — the i64 key value to look up
+///
+/// # Returns
+/// Same as `read_rows_i64`: `Vec<(column_name, Vec<i64>)>`.
+/// Returns `Err` if no index exists or the index is stale —
+/// the caller should fall back to `read_rows_i64` in that case.
+pub fn read_rows_i64_indexed(
+    kernel: &PondKernel,
+    collection: &str,
+    branch: &str,
+    columns: Option<&[String]>,
+    key_column: &str,
+    key: i64,
+) -> Result<Vec<(String, Vec<i64>)>, String> {
+    // Try BPTX index with staleness check
+    let hit = match crate::bptx::index_lookup_checked(kernel, collection, branch, key_column, key) {
+        Ok(Some(hit)) => hit,
+        Ok(None) => {
+            // Key not in index — return empty result (correct for point lookup)
+            // But we need to return the right column schema, so fall through to
+            // get the manifest columns at least.
+            let commit_ref = branch_ref(collection, branch);
+            let commit_hash = kernel.resolve(&commit_ref)
+                .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
+            let manifest_bytes = commit::resolve_manifest_bytes(kernel, &commit_hash)
+                .map_err(|e| format!("Failed to read manifest: {}", e))?;
+            let manifest = resolve_manifest(kernel, &manifest_bytes, None)?;
+            let projection: Option<std::collections::HashSet<&str>> =
+                columns.map(|cols| cols.iter().map(|s| s.as_str()).collect());
+            let mut result: Vec<(String, Vec<i64>)> = Vec::new();
+            for (name, vtype) in &manifest.columns {
+                if *vtype == pond_core::VT_INT64 {
+                    if let Some(ref proj) = projection {
+                        if proj.contains(name.as_str()) {
+                            result.push((name.clone(), Vec::new()));
+                        }
+                    } else {
+                        result.push((name.clone(), Vec::new()));
+                    }
+                }
+            }
+            result.sort_by(|a, b| a.0.cmp(&b.0));
+            return Ok(result);
+        }
+        Err(_) => {
+            // No index or stale index — caller must fall back to full scan
+            return Err("no_fresh_bptx_index".to_string());
+        }
+    };
+
+    // We have an IndexHit — read ONLY the specific RG
+    let commit_ref = branch_ref(collection, branch);
+    let commit_hash = kernel.resolve(&commit_ref)
+        .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
+    let manifest_bytes = commit::resolve_manifest_bytes(kernel, &commit_hash)
+        .map_err(|e| format!("Failed to read manifest: {}", e))?;
+    let manifest = resolve_manifest(kernel, &manifest_bytes, None)?;
+
+    // Bounds check
+    let rg = manifest.row_groups.get(hit.rg_index as usize)
+        .ok_or_else(|| format!("BPTX rg_index {} out of range ({} RGs)",
+            hit.rg_index, manifest.row_groups.len()))?;
+
+    // Read only this one RG
+    let blob_data = if let (Some(off), Some(len)) = (rg.slab_byte_offset, rg.slab_byte_len) {
+        kernel.read_blob_range(&rg.blob_hash, off, off + len as u64)
+            .map_err(|e| format!("Failed to read slab range for indexed RG: {}", e))?
+    } else {
+        kernel.read_blob(&rg.blob_hash)
+            .map_err(|e| format!("Failed to read blob for indexed RG: {}", e))?
+    };
+
+    // Decode and project
+    let projection: Option<std::collections::HashSet<&str>> =
+        columns.map(|cols| cols.iter().map(|s| s.as_str()).collect());
+    let mut result_cols: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
+
+    let cols = pond_core::pnd2_decode(&blob_data)
+        .map_err(|e| format!("Failed to decode PND2 for indexed RG: {}", e))?;
+
+    for col in &cols {
+        let name = col.name.to_string_lossy().to_string();
+        if let Some(ref proj) = projection {
+            if !proj.contains(name.as_str()) {
+                continue;
+            }
+        }
+        if col.vtype == pond_core::VT_INT64 {
+            // Extract only the single row at hit.row_offset
+            let val = col.i64_data.get(hit.row_offset as usize)
+                .copied()
+                .unwrap_or_default();
+            result_cols.entry(name).or_default().push(val);
+        }
+    }
+
+    // Add projected columns that exist in schema but not in this RG's decoded data
+    for (name, vtype) in &manifest.columns {
+        if *vtype == pond_core::VT_INT64 && !result_cols.contains_key(name) {
+            if let Some(ref proj) = projection {
+                if proj.contains(name.as_str()) {
+                    result_cols.insert(name.clone(), Vec::new());
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<(String, Vec<i64>)> = result_cols.into_iter().collect();
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(result)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1124,5 +1263,141 @@ mod async_tests {
         for (r, p) in results.iter().zip(payloads.iter()) {
             assert_eq!(r, p);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // BPTX indexed read integration tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_read_rows_i64_indexed_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        // Write 3 rows with ids [10, 20, 30], ages [100, 200, 300]
+        let ids = vec![10i64, 20, 30];
+        let ages = vec![100i64, 200, 300];
+        crate::write::write_rows_i64(
+            kernel, "idx_test", "main",
+            &[("id", ids.as_slice()), ("age", ages.as_slice())],
+            "init",
+        ).unwrap();
+
+        // Build BPTX index on "id" column
+        crate::bptx::build_index_for_collection(kernel, "idx_test", "id", "main").unwrap();
+
+        // Indexed lookup for key=20 -> should find row with id=20, age=200
+        let result = read_rows_i64_indexed(
+            kernel, "idx_test", "main", None, "id", 20,
+        ).unwrap();
+        assert_eq!(result.len(), 2);
+        let id_col = result.iter().find(|(n, _)| n == "id").unwrap();
+        let age_col = result.iter().find(|(n, _)| n == "age").unwrap();
+        assert_eq!(id_col.1, vec![20]);
+        assert_eq!(age_col.1, vec![200]);
+    }
+
+    #[test]
+    fn test_read_rows_i64_indexed_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        let ids = vec![10i64, 20, 30];
+        crate::write::write_rows_i64(
+            kernel, "idx_miss", "main",
+            &[("id", ids.as_slice())],
+            "init",
+        ).unwrap();
+
+        crate::bptx::build_index_for_collection(kernel, "idx_miss", "id", "main").unwrap();
+
+        // Lookup for non-existent key=999
+        let result = read_rows_i64_indexed(
+            kernel, "idx_miss", "main", None, "id", 999,
+        ).unwrap();
+        let id_col = result.iter().find(|(n, _)| n == "id").unwrap();
+        assert_eq!(id_col.1, Vec::<i64>::new());
+    }
+
+    #[test]
+    fn test_read_rows_i64_indexed_stale_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        // Write initial data
+        let ids = vec![10i64, 20, 30];
+        crate::write::write_rows_i64(
+            kernel, "stale_test", "main",
+            &[("id", ids.as_slice())],
+            "v1",
+        ).unwrap();
+
+        // Build index on v1
+        crate::bptx::build_index_for_collection(kernel, "stale_test", "id", "main").unwrap();
+
+        // Write more data — this invalidates the index
+        let ids2 = vec![40i64, 50];
+        crate::write::write_rows_i64(
+            kernel, "stale_test", "main",
+            &[("id", ids2.as_slice())],
+            "v2",
+        ).unwrap();
+
+        // Indexed lookup should fail because index is stale
+        let result = read_rows_i64_indexed(
+            kernel, "stale_test", "main", None, "id", 10,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("stale"));
+    }
+
+    #[test]
+    fn test_read_rows_i64_indexed_no_index_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        let ids = vec![10i64, 20, 30];
+        crate::write::write_rows_i64(
+            kernel, "no_idx", "main",
+            &[("id", ids.as_slice())],
+            "init",
+        ).unwrap();
+
+        // No index built — should return Err
+        let result = read_rows_i64_indexed(
+            kernel, "no_idx", "main", None, "id", 10,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_rows_i64_indexed_with_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        let ids = vec![10i64, 20];
+        let ages = vec![100i64, 200];
+        let scores = vec![1000i64, 2000];
+        crate::write::write_rows_i64(
+            kernel, "proj_test", "main",
+            &[("id", ids.as_slice()), ("age", ages.as_slice()), ("score", scores.as_slice())],
+            "init",
+        ).unwrap();
+
+        crate::bptx::build_index_for_collection(kernel, "proj_test", "id", "main").unwrap();
+
+        // Project only "age" column
+        let proj = vec!["age".to_string()];
+        let result = read_rows_i64_indexed(
+            kernel, "proj_test", "main", Some(&proj), "id", 20,
+        ).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "age");
+        assert_eq!(result[0].1, vec![200]);
     }
 }
