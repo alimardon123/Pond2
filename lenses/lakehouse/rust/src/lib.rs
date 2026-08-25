@@ -194,8 +194,16 @@ impl LakehouseLens {
         let mut result_cols: HashMap<String, ColAccum> = HashMap::new();
 
         for rg in &manifest.row_groups {
-            let blob_data = self.storage.kernel().read_blob(&rg.blob_hash)
-                .map_err(|e| format!("Failed to read data blob: {}", e))?;
+            // Architecture review GAP 6 fix: use slab-aware range reads instead of
+            // full blob GETs when slab_byte_offset is set. For a 128 MB slab with
+            // 128 KB RGs, this reduces data transfer by 1000x per RG.
+            let blob_data = if let (Some(off), Some(len)) = (rg.slab_byte_offset, rg.slab_byte_len) {
+                self.storage.kernel().read_blob_range(&rg.blob_hash, off, off + len as u64)
+                    .map_err(|e| format!("Failed to read slab range for RG {}: {}", rg.key, e))?
+            } else {
+                self.storage.kernel().read_blob(&rg.blob_hash)
+                    .map_err(|e| format!("Failed to read data blob: {}", e))?
+            };
 
             let cols = pond_core::pnd2_decode(&blob_data)
                 .map_err(|e| format!("Failed to decode PND2: {}", e))?;

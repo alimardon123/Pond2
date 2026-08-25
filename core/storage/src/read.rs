@@ -895,6 +895,154 @@ pub fn read_rows_i64_indexed(
     Ok(result)
 }
 
+/// Indexed range scan: read rows by key range [start_key, end_key] using BPTX.
+///
+/// This is the **fast path for range queries**. Instead of scanning all row
+/// groups, it uses the B+ tree index to identify only the relevant row groups
+/// and row offsets, then reads ONLY those RGs.
+///
+/// # S3 Round-Trips (cold, no cache)
+///
+/// | Step | Operation | RTTs |
+/// |------|-----------|------|
+/// | 1 | Resolve HEAD + check staleness | 2 |
+/// | 2 | Read index metadata (cached) | 0 |
+/// | 3 | Read full BPTX blob (single GET) | 1 |
+/// | 4 | Read unique RGs (slab-aware) | 1-K |
+///
+/// vs. `read_rows_i64` with predicates: O(N) RG reads where N = total RGs.
+///
+/// # Arguments
+/// * `kernel` — Pond kernel
+/// * `collection` — collection name
+/// * `branch` — branch name
+/// * `columns` — columns to project (None = all i64 columns)
+/// * `key_column` — the indexed column name
+/// * `start_key` — inclusive lower bound
+/// * `end_key` — inclusive upper bound
+///
+/// # Returns
+/// `Err("no_fresh_bptx_index")` if no index or stale — caller falls back to full scan.
+pub fn read_rows_i64_range_indexed(
+    kernel: &PondKernel,
+    collection: &str,
+    branch: &str,
+    columns: Option<&[String]>,
+    key_column: &str,
+    start_key: i64,
+    end_key: i64,
+) -> Result<Vec<(String, Vec<i64>)>, String> {
+    // 1. Use BPTX range scan with staleness check
+    let hits = crate::bptx::range_scan_checked(
+        kernel, collection, branch, key_column, start_key, end_key,
+    )?;
+
+    if hits.is_empty() {
+        // No matching keys — return empty columns with correct schema
+        let commit_ref = branch_ref(collection, branch);
+        let commit_hash = kernel.resolve(&commit_ref)
+            .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
+        let manifest_bytes = commit::resolve_manifest_bytes(kernel, &commit_hash)
+            .map_err(|e| format!("Failed to read manifest: {}", e))?;
+        let manifest = resolve_manifest(kernel, &manifest_bytes, None)?;
+        let projection: Option<std::collections::HashSet<&str>> =
+            columns.map(|cols| cols.iter().map(|s| s.as_str()).collect());
+        let mut result: Vec<(String, Vec<i64>)> = Vec::new();
+        for (name, vtype) in &manifest.columns {
+            if *vtype == pond_core::VT_INT64 {
+                if let Some(ref proj) = projection {
+                    if proj.contains(name.as_str()) {
+                        result.push((name.clone(), Vec::new()));
+                    }
+                } else {
+                    result.push((name.clone(), Vec::new()));
+                }
+            }
+        }
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        return Ok(result);
+    }
+
+    // 2. Load manifest for RG metadata and schema
+    let commit_ref = branch_ref(collection, branch);
+    let commit_hash = kernel.resolve(&commit_ref)
+        .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
+    let manifest_bytes = commit::resolve_manifest_bytes(kernel, &commit_hash)
+        .map_err(|e| format!("Failed to read manifest: {}", e))?;
+    let manifest = resolve_manifest(kernel, &manifest_bytes, None)?;
+
+    let projection: Option<std::collections::HashSet<&str>> =
+        columns.map(|cols| cols.iter().map(|s| s.as_str()).collect());
+
+    // 3. Deduplicate RG indices and read only unique RGs (slab-aware)
+    let mut unique_rg_indices: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    for hit in &hits {
+        unique_rg_indices.insert(hit.rg_index);
+    }
+
+    // Read unique RGs
+    let mut rg_data_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+    for &rg_idx in &unique_rg_indices {
+        let rg = manifest.row_groups.get(rg_idx as usize)
+            .ok_or_else(|| format!("BPTX rg_index {} out of range ({} RGs)",
+                rg_idx, manifest.row_groups.len()))?;
+
+        let blob_data = if let (Some(off), Some(len)) = (rg.slab_byte_offset, rg.slab_byte_len) {
+            kernel.read_blob_range(&rg.blob_hash, off, off + len as u64)
+                .map_err(|e| format!("Failed to read slab range for indexed RG: {}", e))?
+        } else {
+            kernel.read_blob(&rg.blob_hash)
+                .map_err(|e| format!("Failed to read blob for indexed RG: {}", e))?
+        };
+        rg_data_map.insert(rg_idx, blob_data);
+    }
+
+    // 4. Extract values at the indicated row offsets, maintaining key order
+    // Build a map: rg_index → decoded columns
+    let mut decoded_map: std::collections::HashMap<u32, Vec<pond_core::PondColumn>> = std::collections::HashMap::new();
+    for (&rg_idx, blob_data) in &rg_data_map {
+        let cols = pond_core::pnd2_decode(blob_data)
+            .map_err(|e| format!("Failed to decode PND2 for indexed RG: {}", e))?;
+        decoded_map.insert(rg_idx, cols);
+    }
+
+    // Accumulate results in hit order (which is key-ascending from range scan)
+    let mut result_cols: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
+    for hit in &hits {
+        if let Some(cols) = decoded_map.get(&hit.rg_index) {
+            for col in cols {
+                let name = col.name.to_string_lossy().to_string();
+                if let Some(ref proj) = projection {
+                    if !proj.contains(name.as_str()) {
+                        continue;
+                    }
+                }
+                if col.vtype == pond_core::VT_INT64 {
+                    let val = col.i64_data.get(hit.row_offset as usize)
+                        .copied()
+                        .unwrap_or_default();
+                    result_cols.entry(name).or_default().push(val);
+                }
+            }
+        }
+    }
+
+    // Add projected columns that exist in schema but had no data
+    for (name, vtype) in &manifest.columns {
+        if *vtype == pond_core::VT_INT64 && !result_cols.contains_key(name) {
+            if let Some(ref proj) = projection {
+                if proj.contains(name.as_str()) {
+                    result_cols.insert(name.clone(), Vec::new());
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<(String, Vec<i64>)> = result_cols.into_iter().collect();
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(result)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

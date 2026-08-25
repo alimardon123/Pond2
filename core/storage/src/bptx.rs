@@ -774,6 +774,197 @@ pub fn has_bptx_index(
 }
 
 // ---------------------------------------------------------------------------
+// Range Scan
+// ---------------------------------------------------------------------------
+
+/// Range scan in a BPTX blob by i64 key range [start_key, end_key].
+/// Returns all (rg_index, row_offset) hits whose keys fall in the range.
+/// Results are ordered by key (ascending), as leaves are stored contiguously.
+///
+/// For small trees (single leaf or no internal nodes), decodes directly.
+/// For multi-level trees, walks internal nodes to find the first and last
+/// relevant leaves, then scans all leaves in between.
+pub fn range_scan_i64(blob: &[u8], start_key: i64, end_key: i64) -> Vec<IndexHit> {
+    let header = match decode_header(blob) {
+        Some(h) => h,
+        None => return Vec::new(),
+    };
+    if header.n_entries == 0 {
+        return Vec::new();
+    }
+
+    // Determine the range of leaf offsets to scan
+    let leaf_section_start = header.leaf_section_offset as usize;
+    let leaf_section_end = leaf_section_start + header.leaf_section_len as usize;
+
+    if header.n_internal_nodes == 0 {
+        // Single leaf — scan it directly
+        let leaf_data = &blob[leaf_section_start..leaf_section_end];
+        return scan_leaf_i64_range(leaf_data, start_key, end_key);
+    }
+
+    // Multi-level tree: find first and last leaf offsets via internal nodes
+    let int_start = header.internal_section_offset as usize;
+    let int_end = int_start + header.internal_section_len as usize;
+    let internal_bytes = &blob[int_start..int_end];
+
+    // Find the leaf offset for start_key
+    let first_leaf_off = match find_leaf_offset(&header, internal_bytes, start_key) {
+        Some(off) => off as usize,
+        None => return Vec::new(),
+    };
+
+    // Find the leaf offset for end_key
+    let last_leaf_off = match find_leaf_offset(&header, internal_bytes, end_key) {
+        Some(off) => off as usize,
+        None => return Vec::new(),
+    };
+
+    // Clamp to leaf section bounds
+    let scan_start = first_leaf_off.max(leaf_section_start);
+    let scan_end = (last_leaf_off + 4096).min(leaf_section_end); // 4096 = max leaf size
+
+    // Scan all leaf nodes from first_leaf_off to scan_end
+    let mut results = Vec::new();
+    let mut pos = scan_start;
+    while pos < scan_end {
+        let remaining = &blob[pos..scan_end];
+        if remaining.is_empty() || remaining[0] != NODE_LEAF {
+            break;
+        }
+        let (keys, values, _max_key) = match decode_leaf_i64(remaining) {
+            Some(decoded) => decoded,
+            None => break,
+        };
+
+        // Check if this leaf's min key exceeds end_key — we're done
+        if let Some(&first_key) = keys.first() {
+            if first_key > end_key {
+                break;
+            }
+        }
+
+        // Collect matching entries from this leaf
+        for (i, &key) in keys.iter().enumerate() {
+            if key < start_key {
+                continue;
+            }
+            if key > end_key {
+                break; // keys are sorted within a leaf
+            }
+            let (rg, row) = *values.get(i).unwrap_or(&(0, 0));
+            results.push(IndexHit { rg_index: rg, row_offset: row });
+        }
+
+        // Advance past this leaf node
+        if keys.is_empty() {
+            break;
+        }
+        let leaf_size = 3 + keys.len() * 16;
+        pos += leaf_size;
+    }
+
+    results
+}
+
+/// Find the leaf node absolute offset for a given key (same walk as point lookup).
+fn find_leaf_offset(header: &BptxHeader, internal_bytes: &[u8], key: i64) -> Option<u32> {
+    if header.n_internal_nodes == 0 {
+        return Some(header.leaf_section_offset);
+    }
+    let int_start = header.internal_section_offset as usize;
+    let mut node_abs_offset = header.root_node_offset as usize;
+    for _level in 0..header.tree_height - 1 {
+        let node_rel_offset = node_abs_offset - int_start;
+        let (sep_keys, child_offsets) = decode_internal_i64(&internal_bytes[node_rel_offset..])?;
+        let child_idx = match sep_keys.binary_search(&key) {
+            Ok(i) => i,
+            Err(i) => i,
+        };
+        node_abs_offset = *child_offsets.get(child_idx)? as usize;
+    }
+    Some(node_abs_offset as u32)
+}
+
+/// Scan a single leaf node for keys in [start_key, end_key].
+fn scan_leaf_i64_range(data: &[u8], start_key: i64, end_key: i64) -> Vec<IndexHit> {
+    let (keys, values, _) = match decode_leaf_i64(data) {
+        Some(decoded) => decoded,
+        None => return Vec::new(),
+    };
+
+    let mut results = Vec::new();
+    for (i, &key) in keys.iter().enumerate() {
+        if key < start_key {
+            continue;
+        }
+        if key > end_key {
+            break;
+        }
+        let (rg, row) = *values.get(i).unwrap_or(&(0, 0));
+        results.push(IndexHit { rg_index: rg, row_offset: row });
+    }
+    results
+}
+
+/// Range scan with staleness detection (high-level API).
+///
+/// Returns Ok(hits) if the index is fresh, Err if stale or missing.
+/// S3 round-trips (cold, multi-level tree):
+///   1. Resolve HEAD commit + manifest (1-2 RTTs)
+///   2. Check index staleness (1 RTT for meta, cached after first read)
+///   3. Read BPTX header (1 RTT)
+///   4. Read internal nodes (1 RTT)
+///   5. Read relevant leaf range (1 RTT, contiguous leaves in one Range GET)
+///   - Total: 5-6 RTTs for ANY selectivity range query
+///
+/// vs. full scan: O(N) RG reads where N = total RGs.
+pub fn range_scan_checked(
+    kernel: &PondKernel,
+    collection: &str,
+    branch: &str,
+    column: &str,
+    start_key: i64,
+    end_key: i64,
+) -> Result<Vec<IndexHit>, String> {
+    // 1. Resolve current HEAD manifest hash
+    let commit_ref = super::branch_ref(collection, branch);
+    let commit_hash = kernel.resolve(&commit_ref)
+        .ok_or_else(|| format!("No commits in '{}' on branch '{}'", collection, branch))?;
+    let current_manifest_hash = commit::resolve_manifest_hash(kernel, &commit_hash)
+        .ok_or_else(|| "Cannot resolve manifest from HEAD commit".to_string())?;
+
+    // 2. Read index metadata and check staleness
+    let meta_ref = BptxIndexMeta::meta_ref(collection, column);
+    let meta_hash = match kernel.resolve(&meta_ref) {
+        Some(h) => h,
+        None => return Err("no_bptx_index".to_string()),
+    };
+    let meta_bytes = kernel.read_blob(&meta_hash)
+        .map_err(|e| format!("Failed to read index metadata: {}", e))?;
+    let meta = BptxIndexMeta::from_json_bytes(&meta_bytes)
+        .ok_or_else(|| "Failed to parse index metadata".to_string())?;
+
+    if meta.manifest_hash != current_manifest_hash {
+        return Err(format!(
+            "BPTX index stale (index manifest={}, current manifest={})",
+            &meta.manifest_hash[..8.min(meta.manifest_hash.len())],
+            &current_manifest_hash[..8.min(current_manifest_hash.len())]
+        ));
+    }
+
+    // 3. Load the full BPTX blob (typically small: <1MB for 100K entries)
+    let blob_ref = BptxIndexMeta::blob_ref(collection, column);
+    let blob_hash = kernel.resolve(&blob_ref)
+        .ok_or_else(|| "Index blob ref not found".to_string())?;
+    let blob = kernel.read_blob(&blob_hash)
+        .map_err(|e| format!("Failed to read index blob: {}", e))?;
+
+    // 4. Perform range scan
+    Ok(range_scan_i64(&blob, start_key, end_key))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -993,5 +1184,121 @@ mod tests {
         let bytes_per_entry = blob.len() as f64 / n as f64;
         assert!(bytes_per_entry < 20.0,
             "BPTX should use < 20 bytes/entry, got {:.1}", bytes_per_entry);
+    }
+
+    // ------------------------------------------------------------------
+    // Range scan tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_range_scan_empty() {
+        let mut entries: Vec<(i64, u32, u32)> = Vec::new();
+        let blob = build_bptx_i64(&mut entries);
+        assert!(range_scan_i64(&blob, 0, 100).is_empty());
+    }
+
+    #[test]
+    fn test_range_scan_single_leaf() {
+        // 50 entries fit in one leaf (fanout=128)
+        let mut entries: Vec<(i64, u32, u32)> = (0..50i64)
+            .map(|i| (i, i as u32, i as u32))
+            .collect();
+        let blob = build_bptx_i64(&mut entries);
+
+        // Full range
+        let hits = range_scan_i64(&blob, 0, 49);
+        assert_eq!(hits.len(), 50);
+
+        // Partial range [10, 20]
+        let hits = range_scan_i64(&blob, 10, 20);
+        assert_eq!(hits.len(), 11);
+        assert_eq!(hits[0].rg_index, 10);
+        assert_eq!(hits[10].rg_index, 20);
+
+        // Range with no matches
+        let hits = range_scan_i64(&blob, 100, 200);
+        assert!(hits.is_empty());
+
+        // Single-key range
+        let hits = range_scan_i64(&blob, 25, 25);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].rg_index, 25);
+    }
+
+    #[test]
+    fn test_range_scan_multi_leaf() {
+        // 500 entries = 4 leaves (fanout=128)
+        let n = 500i64;
+        let mut entries: Vec<(i64, u32, u32)> = (0..n)
+            .map(|i| (i, (i / 100) as u32, (i % 100) as u32))
+            .collect();
+        let blob = build_bptx_i64(&mut entries);
+
+        // Range spanning all leaves
+        let hits = range_scan_i64(&blob, 0, 499);
+        assert_eq!(hits.len(), 500);
+
+        // Range spanning first two leaves [0, 255]
+        let hits = range_scan_i64(&blob, 0, 255);
+        assert_eq!(hits.len(), 256);
+
+        // Range entirely within second leaf [130, 200]
+        let hits = range_scan_i64(&blob, 130, 200);
+        assert_eq!(hits.len(), 71);
+
+        // Range in last leaf only [450, 499]
+        let hits = range_scan_i64(&blob, 450, 499);
+        assert_eq!(hits.len(), 50);
+    }
+
+    #[test]
+    fn test_range_scan_three_level_tree() {
+        // 100K entries → 3+ levels
+        let n = 100_000i64;
+        let mut entries: Vec<(i64, u32, u32)> = (0..n)
+            .map(|i| (i, i as u32, i as u32))
+            .collect();
+        let blob = build_bptx_i64(&mut entries);
+
+        // Small range in the middle
+        let hits = range_scan_i64(&blob, 50_000, 50_099);
+        assert_eq!(hits.len(), 100);
+        for (i, hit) in hits.iter().enumerate() {
+            assert_eq!(hit.rg_index, (50_000 + i) as u32);
+        }
+
+        // Full range
+        let hits = range_scan_i64(&blob, 0, 99_999);
+        assert_eq!(hits.len(), 100_000);
+    }
+
+    #[test]
+    fn test_range_scan_negative_keys() {
+        let mut entries = vec![
+            (-100i64, 0u32, 0u32),
+            (-50i64, 1u32, 1u32),
+            (0i64, 2u32, 2u32),
+            (50i64, 3u32, 3u32),
+            (100i64, 4u32, 4u32),
+        ];
+        let blob = build_bptx_i64(&mut entries);
+
+        let hits = range_scan_i64(&blob, -75, 25);
+        assert_eq!(hits.len(), 2); // -50, 0 are in [-75, 25]
+        assert_eq!(hits[0].rg_index, 1); // -50
+        assert_eq!(hits[1].rg_index, 2); // 0
+    }
+
+    #[test]
+    fn test_range_scan_sparse_keys() {
+        // Keys with gaps: 0, 10, 20, ..., 1000
+        let mut entries: Vec<(i64, u32, u32)> = (0..101)
+            .map(|i| ((i * 10) as i64, i as u32, i as u32))
+            .collect();
+        let blob = build_bptx_i64(&mut entries);
+
+        // Range [50, 150] should find keys 50, 60, 70, ..., 150
+        let hits = range_scan_i64(&blob, 50, 150);
+        assert_eq!(hits.len(), 11); // 50,60,70,80,90,100,110,120,130,140,150
     }
 }
