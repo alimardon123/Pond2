@@ -604,24 +604,8 @@ fn tool_get_schema(storage: &UnifiedStorage, args: &JsonValue) -> Result<JsonVal
     let head = kernel.resolve(&pond_storage::branch_ref(collection, &active))
         .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
 
-    // HEAD might be a PondPack (commit+manifest combined) or a plain commit.
-    let head_data = kernel.read_blob(&head)
-        .map_err(|e| format!("Failed to read HEAD: {}", e))?;
-
-    let manifest_bytes = if pond_storage::pond_pack::is_pack(&head_data) {
-        let (commit, manifest_bytes, _inline) = pond_storage::pond_pack::decode_pack(&head_data)
-            .ok_or_else(|| "Failed to decode PondPack".to_string())?;
-        let _ = commit;
-        manifest_bytes
-    } else {
-        let commit = commit::read_commit(kernel, &head)
-            .ok_or_else(|| "Failed to read HEAD commit".to_string())?;
-        if commit.manifest.is_empty() {
-            return Err("HEAD commit has no manifest".to_string());
-        }
-        kernel.read_blob(&commit.manifest)
-            .map_err(|e| format!("Failed to read manifest: {}", e))?
-    };
+    let manifest_bytes = commit::resolve_manifest_bytes(kernel, &head)
+        .map_err(|e| format!("Failed to read manifest: {}", e))?;
 
     let manifest = CollectionManifest::decode(&manifest_bytes)
         .ok_or_else(|| "Failed to decode manifest".to_string())?;

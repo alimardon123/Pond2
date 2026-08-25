@@ -21,16 +21,9 @@ pub fn read(
     let head = kernel.resolve(&branch_ref(collection, branch))
         .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
 
-    // Read the commit to get the manifest hash
-    let commit = commit::read_commit(kernel, &head)
-        .ok_or_else(|| "Failed to read HEAD commit".to_string())?;
-
-    if commit.manifest.is_empty() {
-        return Err("HEAD commit has no manifest".to_string());
-    }
-
     // Load the manifest (handles both v2 flat and v3 tree)
-    let manifest_bytes = kernel.read_blob(&commit.manifest)
+    // Uses resolve_manifest_bytes which handles PNPK packs transparently
+    let manifest_bytes = commit::resolve_manifest_bytes(kernel, &head)
         .map_err(|e| format!("Failed to read manifest: {}", e))?;
     let manifest = resolve_manifest(kernel, &manifest_bytes, None)?;
 
@@ -68,12 +61,7 @@ pub fn read_all_row_groups(
 ) -> Result<Vec<Vec<u8>>, String> {
     let head = kernel.resolve(&branch_ref(collection, branch))
         .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
-    let commit = commit::read_commit(kernel, &head)
-        .ok_or_else(|| "Failed to read HEAD commit".to_string())?;
-    if commit.manifest.is_empty() {
-        return Err("HEAD commit has no manifest".to_string());
-    }
-    let manifest_bytes = kernel.read_blob(&commit.manifest)
+    let manifest_bytes = commit::resolve_manifest_bytes(kernel, &head)
         .map_err(|e| format!("Failed to read manifest: {}", e))?;
     let manifest = resolve_manifest(kernel, &manifest_bytes, None)?;
     read_all_row_groups_from_manifest(kernel, &manifest)
@@ -468,14 +456,7 @@ pub fn read_at_snapshot(
     kernel: &PondKernel,
     commit_hash: &str,
 ) -> Result<Vec<u8>, String> {
-    let commit = commit::read_commit(kernel, commit_hash)
-        .ok_or_else(|| "Commit not found".to_string())?;
-
-    if commit.manifest.is_empty() {
-        return Err("Commit has no manifest".to_string());
-    }
-
-    let manifest_bytes = kernel.read_blob(&commit.manifest)
+    let manifest_bytes = commit::resolve_manifest_bytes(kernel, commit_hash)
         .map_err(|e| format!("Failed to read manifest: {}", e))?;
     let manifest = resolve_manifest(kernel, &manifest_bytes, None)?;
 
@@ -527,19 +508,15 @@ pub async fn read_rows_async(
     let head = kernel.resolve(&branch_ref(collection, branch))
         .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
 
-    // 2. Read the commit blob async.
-    let commit_bytes = kernel.read_blob_async(&head).await
-        .map_err(|e| format!("Failed to read HEAD commit: {}", e))?;
-    let commit = Commit::from_json_bytes(&commit_bytes)
-        .ok_or_else(|| "Failed to decode HEAD commit".to_string())?;
+    // 2. Read manifest bytes (handles PNPK packs transparently).
+    let kernel_clone = kernel.clone();
+    let head_clone = head.clone();
+    let manifest_bytes = tokio::task::spawn_blocking(move || {
+        commit::resolve_manifest_bytes(&kernel_clone, &head_clone)
+    }).await.map_err(|e| format!("join error: {}", e))?
+      .map_err(|e| format!("Failed to read manifest: {}", e))?;
 
-    if commit.manifest.is_empty() {
-        return Err("HEAD commit has no manifest".to_string());
-    }
-
-    // 3. Read the manifest blob async.
-    let manifest_bytes = kernel.read_blob_async(&commit.manifest).await
-        .map_err(|e| format!("Failed to read manifest: {}", e))?;
+    // 3. Decode manifest.
     let kernel_clone1 = kernel.clone();
     let mb_clone = manifest_bytes.clone();
     let manifest = tokio::task::spawn_blocking(move || {
@@ -573,17 +550,12 @@ pub async fn read_at_snapshot_async(
     kernel: &PondKernel,
     commit_hash: &str,
 ) -> Result<Vec<u8>, String> {
-    let commit_bytes = kernel.read_blob_async(commit_hash).await
-        .map_err(|e| format!("Failed to read commit: {}", e))?;
-    let commit = Commit::from_json_bytes(&commit_bytes)
-        .ok_or_else(|| "Commit not found or corrupt".to_string())?;
-
-    if commit.manifest.is_empty() {
-        return Err("Commit has no manifest".to_string());
-    }
-
-    let manifest_bytes = kernel.read_blob_async(&commit.manifest).await
-        .map_err(|e| format!("Failed to read manifest: {}", e))?;
+    let kernel_clone = kernel.clone();
+    let chash = commit_hash.to_string();
+    let manifest_bytes = tokio::task::spawn_blocking(move || {
+        commit::resolve_manifest_bytes(&kernel_clone, &chash)
+    }).await.map_err(|e| format!("join error: {}", e))?
+      .map_err(|e| format!("Failed to read manifest: {}", e))?;
     let kernel_clone1 = kernel.clone();
     let mb_clone = manifest_bytes.clone();
     let manifest = tokio::task::spawn_blocking(move || {

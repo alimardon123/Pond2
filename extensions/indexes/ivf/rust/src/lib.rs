@@ -257,20 +257,8 @@ impl<'a> IVFIndex<'a> {
         let head = self.kernel.resolve(&pond_storage::branch_ref(collection, branch))
             .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
 
-        // Check if HEAD is a PondPack
-        let head_data = self.kernel.read_blob(&head)
-            .map_err(|e| format!("Failed to read HEAD: {}", e))?;
-
-        let manifest_bytes = if pond_storage::pond_pack::is_pack(&head_data) {
-            let (_, manifest_bytes, _) = pond_storage::pond_pack::decode_pack(&head_data)
-                .ok_or_else(|| "Failed to decode PondPack".to_string())?;
-            manifest_bytes
-        } else {
-            let commit = pond_storage::commit::read_commit(self.kernel, &head)
-                .ok_or_else(|| "Failed to read commit".to_string())?;
-            self.kernel.read_blob(&commit.manifest)
-                .map_err(|e| format!("Failed to read manifest: {}", e))?
-        };
+        let manifest_bytes = pond_storage::commit::resolve_manifest_bytes(self.kernel, &head)
+            .map_err(|e| format!("Failed to read manifest: {}", e))?;
 
         let manifest = CollectionManifest::decode(&manifest_bytes)
             .ok_or_else(|| "Failed to decode manifest".to_string())?;

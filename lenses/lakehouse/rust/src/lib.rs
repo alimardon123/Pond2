@@ -178,20 +178,8 @@ impl LakehouseLens {
         let head = self.storage.kernel().resolve(&pond_storage::branch_ref(table_name, &active))
             .ok_or_else(|| format!("Table '{}' has no commits", table_name))?;
 
-        let head_data = self.storage.kernel().read_blob(&head)
-            .map_err(|e| format!("Failed to read HEAD: {}", e))?;
-
-        // Handle PondPack
-        let manifest_bytes = if pond_storage::pond_pack::is_pack(&head_data) {
-            let (_, manifest_bytes, _) = pond_storage::pond_pack::decode_pack(&head_data)
-                .ok_or_else(|| "Failed to decode PondPack".to_string())?;
-            manifest_bytes
-        } else {
-            let commit = storage_commit::read_commit(self.storage.kernel(), &head)
-                .ok_or_else(|| "Failed to read commit".to_string())?;
-            self.storage.kernel().read_blob(&commit.manifest)
-                .map_err(|e| format!("Failed to read manifest: {}", e))?
-        };
+        let manifest_bytes = storage_commit::resolve_manifest_bytes(self.storage.kernel(), &head)
+            .map_err(|e| format!("Failed to read manifest: {}", e))?;
 
         let manifest = CollectionManifest::decode(&manifest_bytes)
             .ok_or_else(|| "Failed to decode manifest".to_string())?;

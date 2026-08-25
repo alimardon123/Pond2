@@ -121,6 +121,44 @@ pub fn read_commit(kernel: &PondKernel, commit_hash: &str) -> Option<Commit> {
     Commit::from_json_bytes(&data)
 }
 
+/// Resolve manifest bytes from a commit hash.
+///
+/// Handles two cases:
+/// 1. PNPK PondPack: the commit hash points to a pack blob containing
+///    both commit JSON and manifest bytes. Extracts manifest directly.
+/// 2. Plain JSON commit: reads the commit, then reads the manifest blob
+///    referenced by `commit.manifest`.
+///
+/// This is the SINGLE correct way to get manifest bytes from a commit hash.
+/// Never use `kernel.read_blob(&commit.manifest)` directly — it fails for
+/// PNPK packs where `commit.manifest == "packed"`.
+pub fn resolve_manifest_bytes(kernel: &PondKernel, commit_hash: &str) -> std::io::Result<Vec<u8>> {
+    let data = kernel.read_blob(commit_hash)?;
+    if data.len() >= 4 && &data[0..4] == b"PNPK" {
+        // PNPK pack — extract manifest bytes directly
+        crate::pond_pack::decode_pack(&data)
+            .map(|(_, manifest_bytes, _)| manifest_bytes)
+            .ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Failed to decode PNPK pack"
+            ))
+    } else {
+        // Plain commit — read manifest hash and fetch manifest blob
+        let commit = Commit::from_json_bytes(&data)
+            .ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Failed to parse commit JSON"
+            ))?;
+        if commit.manifest.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Commit has no manifest",
+            ));
+        }
+        kernel.read_blob(&commit.manifest)
+    }
+}
+
 /// Walk the commit history from HEAD backwards.
 ///
 /// Matches Python's history() method. Returns a list of (hash, Commit) pairs.

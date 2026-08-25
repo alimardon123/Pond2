@@ -19,7 +19,7 @@ use pond_core::{pnd2_decode, PondColumn, TypedColumn, VT_BINARY, VT_FLOAT64, VT_
                 VT_STRING, VT_VARIANT};
 use pond_kernel::crdt::{uuidv7, HLC};
 use pond_storage::shard;
-use pond_storage::{commit, manifest::CollectionManifest, write as storage_write, UnifiedStorage};
+use pond_storage::{manifest::CollectionManifest, write as storage_write, UnifiedStorage};
 use serde_json::{json, Value as JsonValue};
 
 /// Result of executing a SQL statement.
@@ -1066,22 +1066,8 @@ fn read_collection_as_json_rows(
     // --- Read HEAD data ---
     let head = kernel.resolve(&pond_storage::branch_ref(collection, &active));
     if let Some(ref head_hash) = head {
-        let head_data = kernel.read_blob(head_hash)
-            .map_err(|e| format!("Failed to read HEAD: {}", e))?;
-
-        let manifest_bytes = if pond_storage::pond_pack::is_pack(&head_data) {
-            let (_, manifest_bytes, _) = pond_storage::pond_pack::decode_pack(&head_data)
-                .ok_or_else(|| "Failed to decode PondPack".to_string())?;
-            manifest_bytes
-        } else {
-            let commit = commit::read_commit(kernel, head_hash)
-                .ok_or_else(|| "Failed to read HEAD commit".to_string())?;
-            if commit.manifest.is_empty() {
-                return Ok(rows);
-            }
-            kernel.read_blob(&commit.manifest)
-                .map_err(|e| format!("Failed to read manifest: {}", e))?
-        };
+        let manifest_bytes = pond_storage::commit::resolve_manifest_bytes(kernel, head_hash)
+            .map_err(|e| format!("Failed to read manifest: {}", e))?;
 
         let manifest = CollectionManifest::decode(&manifest_bytes)
             .ok_or_else(|| "Failed to decode manifest".to_string())?;

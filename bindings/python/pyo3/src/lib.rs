@@ -5240,22 +5240,8 @@ fn read_collection_as_json_rows_filtered(
     // --- Read HEAD data ---
     let head = kernel.resolve(&branch_ref(collection, &active));
     if let Some(ref head_hash) = head {
-        let head_data = kernel.read_blob(head_hash)
-            .map_err(|e| format!("Failed to read HEAD: {}", e))?;
-
-        let manifest_bytes = if pond_storage::pond_pack::is_pack(&head_data) {
-            let (_, manifest_bytes, _) = pond_storage::pond_pack::decode_pack(&head_data)
-                .ok_or_else(|| "Failed to decode PondPack".to_string())?;
-            manifest_bytes
-        } else {
-            let commit = commit::read_commit(kernel, head_hash)
-                .ok_or_else(|| "Failed to read HEAD commit".to_string())?;
-            if commit.manifest.is_empty() {
-                return Ok(rows);
-            }
-            kernel.read_blob(&commit.manifest)
-                .map_err(|e| format!("Failed to read manifest: {}", e))?
-        };
+        let manifest_bytes = pond_storage::commit::resolve_manifest_bytes(kernel, head_hash)
+            .map_err(|e| format!("Failed to read manifest: {}", e))?;
 
         let manifest = CollectionManifest::decode(&manifest_bytes)
             .ok_or_else(|| "Failed to decode manifest".to_string())?;

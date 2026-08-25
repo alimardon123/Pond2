@@ -1087,25 +1087,8 @@ fn read_rows_as_json(
         .or_else(|| kernel.resolve(collection))
         .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
 
-    // Read the commit (or unpack PondPack) to get the manifest bytes.
-    let head_data = kernel
-        .read_blob(&head)
-        .map_err(|e| format!("Failed to read HEAD: {}", e))?;
-
-    let manifest_bytes = if pond_storage::pond_pack::is_pack(&head_data) {
-        let (_, mb, _) = pond_storage::pond_pack::decode_pack(&head_data)
-            .ok_or_else(|| "Failed to decode PondPack".to_string())?;
-        mb
-    } else {
-        let commit = commit::read_commit(kernel, &head)
-            .ok_or_else(|| "Failed to read HEAD commit".to_string())?;
-        if commit.manifest.is_empty() {
-            return Ok(Vec::new());
-        }
-        kernel
-            .read_blob(&commit.manifest)
-            .map_err(|e| format!("Failed to read manifest: {}", e))?
-    };
+    let manifest_bytes = commit::resolve_manifest_bytes(kernel, &head)
+        .map_err(|e| format!("Failed to read manifest: {}", e))?;
 
     let manifest = CollectionManifest::decode(&manifest_bytes)
         .ok_or_else(|| "Failed to decode manifest".to_string())?;
@@ -1775,41 +1758,11 @@ fn describe_collection(storage: &UnifiedStorage, collection: &str) {
         }
     };
 
-    let head_data = match kernel.read_blob(&head) {
+    let manifest_bytes = match commit::resolve_manifest_bytes(kernel, &head) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("Error reading HEAD: {}", e);
+            eprintln!("Error reading manifest: {}", e);
             return;
-        }
-    };
-
-    // The HEAD blob may be a raw commit or a PondPack (commit + manifest + data).
-    let manifest_bytes = if pond_storage::pond_pack::is_pack(&head_data) {
-        match pond_storage::pond_pack::decode_pack(&head_data) {
-            Some((_, mb, _)) => mb,
-            None => {
-                eprintln!("Error: failed to decode PondPack");
-                return;
-            }
-        }
-    } else {
-        let commit = match commit::read_commit(kernel, &head) {
-            Some(c) => c,
-            None => {
-                eprintln!("Error: failed to read commit");
-                return;
-            }
-        };
-        if commit.manifest.is_empty() {
-            println!("Collection '{}' has no manifest (empty commit).", collection);
-            return;
-        }
-        match kernel.read_blob(&commit.manifest) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("Error reading manifest: {}", e);
-                return;
-            }
         }
     };
 
