@@ -58,6 +58,28 @@ pub trait ObjectStore: Send + Sync {
     /// Last-writer-wins (no CAS). The backend handles atomicity.
     fn put_path(&self, path: &str, hash: &str) -> io::Result<()>;
 
+    /// CAS (Compare-And-Swap) a named path.
+    ///
+    /// Binds `path` to `new_hash` ONLY if the current value matches `expected_hash`.
+    /// Returns `Ok(true)` if the swap succeeded, `Ok(false)` if the current
+    /// value differs (caller should retry), `Err` on I/O failure.
+    ///
+    /// For `expected_hash = None`: succeeds only if the path does NOT exist.
+    /// For `expected_hash = Some(h)`: succeeds only if the path currently points to `h`.
+    ///
+    /// **Default impl**: read-check-write. Not atomic on concurrent writers.
+    /// Backends should override with atomic CAS (S3 If-Match, FS rename).
+    fn put_path_if(&self, path: &str, expected_hash: Option<&str>, new_hash: &str) -> io::Result<bool> {
+        let current = self.get_path(path);
+        match (&expected_hash, &current) {
+            (None, None) => {}
+            (Some(expected), Some(current)) if expected == current => {}
+            _ => return Ok(false),
+        }
+        self.put_path(path, new_hash)?;
+        Ok(true)
+    }
+
     /// Resolve a named path to its content hash. Returns None if unbound.
     fn get_path(&self, path: &str) -> Option<String>;
 

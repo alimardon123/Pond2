@@ -175,6 +175,24 @@ impl PondKernel {
         Ok(())
     }
 
+    /// CAS (Compare-And-Swap) a named reference.
+    ///
+    /// Sets `name` to `new_hash` ONLY if the current value is `expected_hash`.
+    /// Returns `Ok(true)` on success, `Ok(false)` if stale (caller should retry).
+    ///
+    /// This enables safe multi-writer concurrency: two writers that both
+    /// read HEAD=H1 can use CAS to avoid clobbering each other.
+    /// The second writer gets `Ok(false)`, re-reads, and retries.
+    ///
+    /// For `expected_hash = None`: creates the ref only if it doesn't exist.
+    pub fn reference_if(&self, name: &str, expected_hash: Option<&str>, new_hash: &str) -> io::Result<bool> {
+        let ok = self.store.put_path_if(name, expected_hash, new_hash)?;
+        if ok {
+            self.stats.lock().unwrap().references += 1;
+        }
+        Ok(ok)
+    }
+
     pub fn resolve(&self, name: &str) -> Option<String> {
         self.store.get_path(name)
     }

@@ -1004,6 +1004,56 @@ impl ObjectStore for S3ObjectStore {
         Ok(())
     }
 
+    /// S3-native CAS using If-Match ETag precondition.
+    ///
+    /// 1. HEAD the ref to get its current ETag.
+    /// 2. If expected_hash doesn't match, return Ok(false).
+    /// 3. PUT with If-Match: <etag>. S3 returns 412 on mismatch.
+    fn put_path_if(&self, path: &str, expected_hash: Option<&str>, new_hash: &str) -> io::Result<bool> {
+        let key = self.path_key(path);
+
+        // HEAD to get current ETag (for If-Match)
+        let current_etag = match self.s3_request("HEAD", &key, None, None, &[]) {
+            Ok(resp) => resp.header("etag").unwrap_or("").to_string(),
+            Err(_) => String::new(),
+        };
+
+        // Validate expected_hash against actual current value
+        if let Some(expected) = expected_hash {
+            let current_hash = self.get_path(path);
+            match (&current_hash, Some(expected)) {
+                (Some(current), Some(exp)) if current == exp => {}
+                _ => return Ok(false),
+            }
+        } else if !current_etag.is_empty() {
+            return Ok(false);
+        }
+
+        // PUT with If-Match
+        let body = format!(r#"{{"hash":"{}"}}"#, new_hash).into_bytes();
+        let extra = if !current_etag.is_empty() {
+            vec![("If-Match".to_string(), current_etag)]
+        } else {
+            vec![]
+        };
+
+        match self.s3_request("PUT", &key, None, Some(&body), &extra) {
+            Ok(_) => {
+                let mut s = self.stats.lock().unwrap();
+                s.puts += 1;
+                Ok(true)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("412") || msg.contains("Precondition Failed") {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
     fn get_path(&self, path: &str) -> Option<String> {
         let key = self.path_key(path);
         match self.s3_request("GET", &key, None, None, &[]) {
