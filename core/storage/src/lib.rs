@@ -37,6 +37,7 @@ pub mod pond_pack;
 pub mod slab;
 pub mod bloom;
 pub mod bptx;
+pub mod write_buffer;
 
 use pond_kernel::PondKernel;
 use std::sync::Mutex;
