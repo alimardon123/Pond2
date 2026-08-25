@@ -102,23 +102,15 @@ pub fn merge(
     let source_head = kernel.resolve(&branch_ref(collection, source_branch))
         .ok_or_else(|| format!("Source branch '{}' not found", source_branch))?;
 
-    // Read both commits to get manifest hashes
+    // Resolve manifest hashes (handles PNPK "packed" sentinel)
     let target_commit = commit::read_commit(kernel, &target_head)
         .ok_or_else(|| "Failed to read target commit".to_string())?;
-    let source_commit = commit::read_commit(kernel, &source_head)
-        .ok_or_else(|| "Failed to read source commit".to_string())?;
+    let target_manifest_hash = commit::resolve_manifest_hash(kernel, &target_head);
+    let source_manifest_hash = commit::resolve_manifest_hash(kernel, &source_head);
 
     // Load both manifests
-    let target_manifest = if !target_commit.manifest.is_empty() {
-        load_manifest(kernel, &target_commit.manifest)
-    } else {
-        None
-    };
-    let source_manifest = if !source_commit.manifest.is_empty() {
-        load_manifest(kernel, &source_commit.manifest)
-    } else {
-        None
-    };
+    let target_manifest = target_manifest_hash.as_ref().and_then(|h| load_manifest(kernel, h));
+    let source_manifest = source_manifest_hash.as_ref().and_then(|h| load_manifest(kernel, h));
 
     // Build per-source maps of rg_key → RowGroupEntry
     let target_rgs: HashMap<String, &_> = target_manifest.as_ref()
@@ -244,11 +236,9 @@ pub fn undo(
     kernel.reference(&branch_ref(collection, active_branch), &current)
         .map_err(|e| format!("Failed to update branch ref: {}", e))?;
 
-    // Sync manifest ref
-    if let Some(commit) = commit::read_commit(kernel, &current) {
-        if !commit.manifest.is_empty() {
-            let _ = kernel.reference(&manifest_ref(collection, active_branch), &commit.manifest);
-        }
+    // Sync manifest ref (handles PNPK "packed" sentinel)
+    if let Some(mhash) = commit::resolve_manifest_hash(kernel, &current) {
+        let _ = kernel.reference(&manifest_ref(collection, active_branch), &mhash);
     }
 
     Ok(current)
@@ -270,10 +260,8 @@ pub fn revert(
         .map_err(|e| format!("Failed to update branch ref: {}", e))?;
 
     // Sync manifest ref
-    if let Some(commit) = commit::read_commit(kernel, commit_hash) {
-        if !commit.manifest.is_empty() {
-            let _ = kernel.reference(&manifest_ref(collection, active_branch), &commit.manifest);
-        }
+    if let Some(mhash) = commit::resolve_manifest_hash(kernel, commit_hash) {
+        let _ = kernel.reference(&manifest_ref(collection, active_branch), &mhash);
     }
 
     Ok(())
@@ -463,6 +451,7 @@ mod tests {
     use super::*;
     use crate::UnifiedStorage;
     use crate::commit;
+    use crate::manifest::{CollectionManifest, RowGroupEntry, ColumnStatsEntry};
 
     fn setup() -> (tempfile::TempDir, UnifiedStorage) {
         let dir = tempfile::tempdir().unwrap();
@@ -596,5 +585,113 @@ mod tests {
             kernel.resolve(&branch_ref("users", "main")),
             Some(c1)
         );
+    }
+
+    /// Test merge when both branches have PNPK-packed commits (commit.manifest == "packed").
+    /// This is the exact scenario that failed in CI: write_rows uses PondPack,
+    /// creating commits where manifest=="packed". The merge must resolve
+    /// the manifest from the PNPK blob, not try to read_blob("packed").
+    #[test]
+    fn test_merge_pnkp_packed_commits() {
+        let (_dir, storage) = setup();
+        let kernel = storage.kernel();
+
+        // Write initial data as PNPK pack on main
+        let manifest_bytes = create_test_manifest(&["alice", "bob", "carol"]);
+        let pack_bytes = crate::pond_pack::encode_pack(
+            &serde_json::json!({"parent": null, "second_parent": null, "manifest": "packed", "message": "seed", "timestamp": 1.0, "index": 0}),
+            &manifest_bytes,
+            None,
+        );
+        let pack_hash = kernel.write(&pack_bytes).unwrap();
+        kernel.reference(&branch_ref("users", "main"), &pack_hash).unwrap();
+        kernel.reference(&manifest_ref("users", "main"), &pack_hash).unwrap();
+
+        // Create feature branch from main (both point to PNPK commit)
+        branch(kernel, "users", "feature", "main").unwrap();
+
+        // Write new data on feature as PNPK pack (snapshot: just dave, different key)
+        let branch_manifest = create_test_manifest_with_offset(&["dave"], 10);
+        let branch_pack = crate::pond_pack::encode_pack(
+            &serde_json::json!({"parent": Some(pack_hash.clone()), "second_parent": null, "manifest": "packed", "message": "add dave", "timestamp": 2.0, "index": 1}),
+            &branch_manifest,
+            None,
+        );
+        let branch_pack_hash = kernel.write(&branch_pack).unwrap();
+        kernel.reference(&branch_ref("users", "feature"), &branch_pack_hash).unwrap();
+        kernel.reference(&manifest_ref("users", "feature"), &branch_pack_hash).unwrap();
+
+        // Merge feature into main
+        let merge_hash = merge(kernel, "users", "feature", "main", "merge").unwrap();
+
+        // Verify merge commit has two parents
+        let merge_commit = commit::read_commit(kernel, &merge_hash).unwrap();
+        assert!(merge_commit.is_merge());
+        assert_eq!(merge_commit.parent, Some(pack_hash.clone()));
+        assert_eq!(merge_commit.second_parent, Some(branch_pack_hash.clone()));
+
+        // Verify main can now read the merged manifest
+        let main_head = kernel.resolve(&branch_ref("users", "main")).unwrap();
+        let manifest_data = commit::resolve_manifest_bytes(kernel, &main_head).unwrap();
+        let merged_manifest = CollectionManifest::decode(&manifest_data).unwrap();
+        // Should have 4 row groups (3 from main + 1 from feature, different keys = no conflict)
+        assert_eq!(merged_manifest.row_groups.len(), 4,
+            "Expected 4 row groups after merge, got {}", merged_manifest.row_groups.len());
+    }
+
+    /// Test undo through a PNPK commit resolves manifest ref correctly.
+    #[test]
+    fn test_undo_pnkp_commit() {
+        let (_dir, storage) = setup();
+        let kernel = storage.kernel();
+
+        // First commit: plain
+        let data = kernel.write(b"data1").unwrap();
+        let c1 = commit::write_commit(kernel, "users", &data, None, None, "c1", 0).unwrap();
+        kernel.reference(&branch_ref("users", "main"), &c1).unwrap();
+        kernel.reference(&manifest_ref("users", "main"), &data).unwrap();
+
+        // Second commit: PNPK packed
+        let manifest_bytes = create_test_manifest(&["alice"]);
+        let pack_bytes = crate::pond_pack::encode_pack(
+            &serde_json::json!({"parent": Some(c1.clone()), "second_parent": null, "manifest": "packed", "message": "c2", "timestamp": 2.0, "index": 1}),
+            &manifest_bytes,
+            None,
+        );
+        let c2 = kernel.write(&pack_bytes).unwrap();
+        kernel.reference(&branch_ref("users", "main"), &c2).unwrap();
+        kernel.reference(&manifest_ref("users", "main"), &c2).unwrap();
+
+        // Undo 1 step → should be at c1
+        let result = undo(kernel, "users", "main", 1).unwrap();
+        assert_eq!(result, c1);
+        // Manifest ref should point to data (c1's manifest)
+        assert_eq!(kernel.resolve(&manifest_ref("users", "main")), Some(data));
+    }
+
+    /// Helper: create a minimal PMAN manifest with N row groups.
+    fn create_test_manifest(names: &[&str]) -> Vec<u8> {
+        create_test_manifest_with_offset(names, 0)
+    }
+
+    /// Helper: create a minimal PMAN manifest with N row groups, using a key offset.
+    fn create_test_manifest_with_offset(names: &[&str], key_offset: usize) -> Vec<u8> {
+        let mut manifest = CollectionManifest::new(
+            vec![("name".to_string(), 3u8)],
+            String::new(),
+        );
+        for (i, name) in names.iter().enumerate() {
+            manifest.add_row_group(RowGroupEntry {
+                key: format!("rg_{}", i + key_offset),
+                blob_hash: (*name).to_string(),
+                n_rows: 1,
+                columns: vec![ColumnStatsEntry {
+                    name: "name".into(), value_type: 3, min: None, max: None, null_count: 0,
+                }],
+                slab_byte_offset: None,
+                slab_byte_len: None,
+            });
+        }
+        manifest.encode()
     }
 }

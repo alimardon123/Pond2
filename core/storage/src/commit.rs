@@ -121,6 +121,24 @@ pub fn read_commit(kernel: &PondKernel, commit_hash: &str) -> Option<Commit> {
     Commit::from_json_bytes(&data)
 }
 
+/// Resolve the effective manifest blob hash from a commit hash.
+///
+/// For PNPK packs (commit.manifest == "packed"), the commit blob itself
+/// contains the manifest, so the commit hash IS the manifest hash.
+/// For plain JSON commits, returns commit.manifest as-is.
+///
+/// Returns None if the commit has no manifest or cannot be read.
+pub fn resolve_manifest_hash(kernel: &PondKernel, commit_hash: &str) -> Option<String> {
+    let commit = read_commit(kernel, commit_hash)?;
+    if commit.manifest == "packed" {
+        Some(commit_hash.to_string())
+    } else if commit.manifest.is_empty() {
+        None
+    } else {
+        Some(commit.manifest)
+    }
+}
+
 /// Resolve manifest bytes from a commit hash.
 ///
 /// Handles two cases:
