@@ -10,7 +10,7 @@ path = "src/main.rs"
 [dependencies]
 pond_storage = { path = "../core/storage" }
 pond_kernel = { path = "../core/kernel" }
-pond_core = { path = "../core/codec" }
+pond_core = { path = "../core/codec", features = ["zstd"] }
 pond_sql = { path = "../core/sql" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

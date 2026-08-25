@@ -18,7 +18,7 @@ s3 = ["dep:pond_s3"]
 [dependencies]
 pond_kernel = { path = "../core/kernel" }
 pond_storage = { path = "../core/storage" }
-pond_core = { path = "../core/codec" }
+pond_core = { path = "../core/codec", features = ["zstd"] }
 pond_sql = { path = "../core/sql" }
 pond_s3 = { path = "../core/s3", optional = true }
 clap = { version = "4", features = ["derive", "env"] }

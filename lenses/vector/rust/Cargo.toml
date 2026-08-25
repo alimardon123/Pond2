@@ -12,7 +12,7 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 [dependencies]
 pond_kernel = { path = "../../../core/kernel" }
 pond_storage = { path = "../../../core/storage" }
-pond_core = { path = "../../../core/codec" }
+pond_core = { path = "../../../core/codec", features = ["zstd"] }
 pond_ivf_index = { path = "../../../extensions/indexes/ivf/rust" }
 pond_hnsw_index = { path = "../../../extensions/indexes/hnsw/rust" }
 serde = { version = "1", features = ["derive"] }

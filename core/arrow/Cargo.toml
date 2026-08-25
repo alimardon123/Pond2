@@ -10,7 +10,7 @@ name = "pond_arrow"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-pond_core = { path = "../codec" }
+pond_core = { path = "../codec", features = ["zstd"] }
 arrow = "53"
 
 [dev-dependencies]

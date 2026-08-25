@@ -10,7 +10,7 @@ name = "pond_sql"
 crate-type = ["rlib"]
 
 [dependencies]
-pond_core = { path = "../codec" }
+pond_core = { path = "../codec", features = ["zstd"] }
 pond_kernel = { path = "../kernel" }
 pond_storage = { path = "../storage" }
 serde = { version = "1", features = ["derive"] }

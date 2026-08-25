@@ -13,8 +13,59 @@ use crate::pond_pack;
 use crate::manifest::{CollectionManifest, ColumnStatsEntry, LeafEntry, MAX_LEAF_RGS, RootManifest, RowGroupEntry, compute_key_range};
 use crate::slab;
 use crate::{branch_ref, manifest_ref};
-use pond_core::{pnd2_encode_i64_auto, pnd2_encode_multi_typed, TypedColumn, VT_INT64};
+use pond_core::{pnd2_encode_i64_auto, pnd2_encode_multi_typed, TypedColumn, VT_INT64, PND2_MAGIC, COMPRESSION_NONE, COMPRESSION_ZSTD};
 use pond_kernel::PondKernel;
+
+/// Minimum PND2 blob size (inner data) to consider zstd compression.
+/// Below this, compression overhead outweighs savings.
+const PND2_COMPRESS_THRESHOLD: usize = 1024;
+
+/// Zstd compression level for PND2 blobs. Level 3 is the sweet spot
+/// for columnar data: ~3x compression at ~200 MB/s encode speed.
+const PND2_ZSTD_LEVEL: i32 = 3;
+
+/// Compress a PND2 blob with zstd if the inner data exceeds the threshold.
+///
+/// Takes a PND2 blob with COMPRESSION_NONE, returns either:
+/// - The original blob unchanged (if too small or compression doesn't help)
+/// - A new blob with COMPRESSION_ZSTD and compressed inner data
+///
+/// PND2 header layout (13 bytes):
+///   [0..4]  Magic "PND2"
+///   [4]     Version
+///   [5]     Flags
+///   [6..10] n_rows (u32 LE)
+///   [10..12] n_columns (u16 LE)
+///   [12]    compression_tag
+///   [13..]  inner data (schema + stats + payloads)
+pub fn maybe_compress_pnd2(blob: &[u8]) -> Vec<u8> {
+    if blob.len() < PND2_COMPRESS_THRESHOLD + 13 {
+        return blob.to_vec();
+    }
+    if blob.len() < 13 || &blob[0..4] != PND2_MAGIC {
+        return blob.to_vec();
+    }
+    if blob[12] != COMPRESSION_NONE {
+        return blob.to_vec(); // already compressed
+    }
+
+    let inner = &blob[13..];
+    let compressed = match zstd::encode_all(inner, PND2_ZSTD_LEVEL) {
+        Ok(c) => c,
+        Err(_) => return blob.to_vec(),
+    };
+
+    // Only use compression if it saves > 10%
+    if compressed.len() as f64 > inner.len() as f64 * 0.9 {
+        return blob.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(13 + compressed.len());
+    out.extend_from_slice(&blob[0..12]); // header with original compression tag
+    out.push(COMPRESSION_ZSTD);         // overwrite with ZSTD tag
+    out.extend_from_slice(&compressed);
+    out
+}
 
 /// Write raw bytes to a collection. Creates a new commit on the active branch.
 ///
@@ -95,8 +146,9 @@ pub fn write_rows_i64(
 ) -> Result<String, String> {
     let n_rows = columns.first().map(|(_, v)| v.len()).unwrap_or(0);
 
-    // Encode as PND2 with auto-encoding per column
+    // Encode as PND2 with auto-encoding per column, then compress
     let blob = pnd2_encode_i64_auto(columns);
+    let blob = maybe_compress_pnd2(&blob);
     let data_hash = kernel.write(&blob)
         .map_err(|e| format!("Failed to write PND2 blob: {}", e))?;
 
@@ -190,8 +242,8 @@ pub fn write_rows_i64_packed(
 ) -> Result<String, String> {
     let n_rows = columns.first().map(|(_, v)| v.len()).unwrap_or(0);
 
-    // 1. Encode data as PND2 blob
-    let blob = pnd2_encode_i64_auto(columns);
+    // 1. Encode data as PND2 blob, compress if worthwhile
+    let blob = maybe_compress_pnd2(&pnd2_encode_i64_auto(columns));
     let data_hash = kernel.write(&blob)
         .map_err(|e| format!("Failed to write PND2 blob: {}", e))?;
 
@@ -341,8 +393,8 @@ fn write_rows_inner(
         final_columns.push(("_version", TypedColumn::String(versions)));
     }
 
-    // Encode as PND2 with per-type encoding
-    let blob = pnd2_encode_multi_typed(&final_columns);
+    // Encode as PND2 with per-type encoding, compress if worthwhile
+    let blob = maybe_compress_pnd2(&pnd2_encode_multi_typed(&final_columns));
     let data_hash = kernel.write(&blob)
         .map_err(|e| format!("Failed to write PND2 blob: {}", e))?;
 
@@ -463,7 +515,7 @@ pub fn write_rows_i64_slab<'a>(
     // 1. Encode each RG as PND2 + compute column stats
     let mut encoded_rgs: Vec<(Vec<u8>, Vec<ColumnStatsEntry>, u32)> = Vec::with_capacity(row_groups.len());
     for rg in row_groups {
-        let blob = pnd2_encode_i64_auto(rg);
+        let blob = maybe_compress_pnd2(&pnd2_encode_i64_auto(rg));
         let n_rows = rg.first().map(|(_, v)| v.len()).unwrap_or(0) as u32;
         let col_stats: Vec<ColumnStatsEntry> = rg.iter().map(|(name, values)| {
             let (min, max) = if values.is_empty() {
@@ -609,7 +661,7 @@ impl<'a> SlabWriter<'a> {
     /// Returns an error on schema mismatch.
     pub fn write_rows_i64(&mut self, columns: &[(&str, &[i64])]) -> Result<(), String> {
         let n_rows = columns.first().map(|(_, v)| v.len()).unwrap_or(0) as u32;
-        let blob = pnd2_encode_i64_auto(columns);
+        let blob = maybe_compress_pnd2(&pnd2_encode_i64_auto(columns));
 
         // Set/validate schema on first write
         let schema: Vec<(String, u8)> = columns.iter()
@@ -824,6 +876,42 @@ mod tests {
     use super::*;
     use crate::UnifiedStorage;
     use crate::commit;
+
+    #[test]
+    fn test_maybe_compress_pnd2_small_blob_unchanged() {
+        // Small blobs should not be compressed
+        let small = pond_core::pnd2_encode_i64(&[1, 2, 3]);
+        let result = maybe_compress_pnd2(&small);
+        assert_eq!(result[12], COMPRESSION_NONE);
+        assert_eq!(result.len(), small.len());
+    }
+
+    #[test]
+    fn test_maybe_compress_pnd2_large_blob_compressed() {
+        // Large repetitive data should compress well
+        let values: Vec<i64> = (0..10_000).map(|i| i % 100).collect();
+        let blob = pond_core::pnd2_encode_i64(&values);
+        assert!(blob.len() > PND2_COMPRESS_THRESHOLD + 13);
+
+        let compressed = maybe_compress_pnd2(&blob);
+        assert_eq!(compressed[12], COMPRESSION_ZSTD);
+        assert!(compressed.len() < blob.len(),
+            "compressed {} should be < uncompressed {}", compressed.len(), blob.len());
+
+        // Verify round-trip: decode the compressed blob
+        let decoded = pond_core::pnd2_decode(&compressed).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].i64_data.len(), 10_000);
+        assert_eq!(decoded[0].i64_data[0], 0);
+        assert_eq!(decoded[0].i64_data[9999], 99);
+    }
+
+    #[test]
+    fn test_maybe_compress_pnd2_non_pnd2_unchanged() {
+        let random_data = vec![0u8; 100];
+        let result = maybe_compress_pnd2(&random_data);
+        assert_eq!(result.len(), 100);
+    }
 
     #[test]
     fn test_write_creates_commit() {
