@@ -774,15 +774,16 @@ pub fn decode_rle(payload: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
                     data[off], data[off+1], data[off+2], data[off+3]
                 ]) as usize;
                 off += 4;
-                for _ in 0..run_len {
-                    if total_rows >= n_rows { break; }
-                    if vtype == VT_STRING {
-                        str_vals.push(bytes_to_cstring(val));
-                    } else {
-                        bin_vals.push(val.to_vec());
-                    }
-                    total_rows += 1;
+                let actual = run_len.min(n_rows - total_rows);
+                if vtype == VT_STRING {
+                    // Bulk-extend with Clonable CString (single alloc + clone)
+                    let cs = bytes_to_cstring(val);
+                    str_vals.resize(str_vals.len() + actual, cs.clone());
+                } else {
+                    let bv = val.to_vec();
+                    bin_vals.resize(bin_vals.len() + actual, bv.clone());
                 }
+                total_rows += actual;
             }
             _ => break,
         }
@@ -812,7 +813,7 @@ mod tests {
         payload.extend_from_slice(&(max_val as i64).to_le_bytes());
         // packed bits — pack using the same bit-level format the encoder uses
         let total_bits = values.len() * bitwidth as usize;
-        let total_bytes = (total_bits + 7) / 8;
+        let total_bytes = total_bits.div_ceil(8);
         let mut packed = vec![0u8; total_bytes];
         let mut bit_pos = 0usize;
         for &v in values {
@@ -938,5 +939,72 @@ mod tests {
         let payload = make_bitpack_payload(8, 0, &values);
         let col = decode_bitpack(&payload, 1000);
         assert_eq!(col.n_values, 3);
+    }
+
+    // ------------------------------------------------------------------
+    // RLE string decode tests
+    // ------------------------------------------------------------------
+
+    /// Build an RLE-encoded STRING payload.
+    /// Format: [vtype_byte] [n_runs: u32] (per run: [slen: u32][val_bytes][run_len: u32])
+    fn make_rle_string_payload(runs: &[(&[u8], usize)]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.push(VT_STRING);
+        payload.extend_from_slice(&(runs.len() as u32).to_le_bytes());
+        for (val, count) in runs {
+            payload.extend_from_slice(&(val.len() as u32).to_le_bytes());
+            payload.extend_from_slice(val);
+            payload.extend_from_slice(&(*count as u32).to_le_bytes());
+        }
+        payload
+    }
+
+    #[test]
+    fn test_rle_string_single_run_large() {
+        // 100K rows all with the same string value — exercises the bulk resize path
+        let val = b"N/A";
+        let payload = make_rle_string_payload(&[(val, 100_000)]);
+        let col = decode_rle(&payload, VT_STRING, 100_000);
+        assert_eq!(col.n_values, 100_000);
+        assert_eq!(col.str_data.len(), 100_000);
+        for s in &col.str_data {
+            assert_eq!(s.to_bytes(), b"N/A");
+        }
+    }
+
+    #[test]
+    fn test_rle_string_multiple_runs() {
+        // 3 runs with different strings
+        let payload = make_rle_string_payload(&[
+            (b"hello", 10),
+            (b"world", 20),
+            (b"foo", 5),
+        ]);
+        let col = decode_rle(&payload, VT_STRING, 100);
+        assert_eq!(col.n_values, 35);
+        assert_eq!(col.str_data.len(), 35);
+        for i in 0..10 {
+            assert_eq!(col.str_data[i].to_bytes(), b"hello");
+        }
+        for i in 10..30 {
+            assert_eq!(col.str_data[i].to_bytes(), b"world");
+        }
+        for i in 30..35 {
+            assert_eq!(col.str_data[i].to_bytes(), b"foo");
+        }
+    }
+
+    #[test]
+    fn test_rle_string_n_rows_truncation() {
+        // n_rows < total run length — should truncate
+        let payload = make_rle_string_payload(&[
+            (b"a", 100),
+            (b"b", 100),
+        ]);
+        let col = decode_rle(&payload, VT_STRING, 50);
+        assert_eq!(col.n_values, 50);
+        for s in &col.str_data {
+            assert_eq!(s.to_bytes(), b"a");
+        }
     }
 }

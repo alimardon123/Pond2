@@ -489,7 +489,17 @@ pub extern "C" fn pond_storage_write_rows(
 
     use pond_core::TypedColumn;
 
-    let mut columns: Vec<(&str, TypedColumn)> = Vec::with_capacity(n_columns);
+    // First pass: collect owned column names (no borrows from col_name_buf
+    // can exist while we push to it). Second pass: build columns.
+    let mut col_name_buf: Vec<String> = Vec::with_capacity(n_columns);
+    // Intermediate storage for column data (name index, vtype, data)
+    struct ColInput {
+        name_idx: usize,
+        vtype: u8,
+        data_ptr: *const std::ffi::c_void,
+        len: usize,
+    }
+    let mut inputs: Vec<ColInput> = Vec::with_capacity(n_columns);
 
     for i in 0..n_columns {
         let name_ptr = unsafe { *col_names.add(i) };
@@ -506,25 +516,28 @@ pub extern "C" fn pond_storage_write_rows(
             Err(_) => continue,
         };
 
-        // Leak the name to get a 'static str (lifetime issue with C interop)
-        // This is acceptable for the duration of the write_rows call
-        let name_static: &'static str = Box::leak(name.to_string().into_boxed_str());
+        col_name_buf.push(name.to_string());
+        inputs.push(ColInput { name_idx: col_name_buf.len() - 1, vtype, data_ptr, len });
+    }
 
-        match vtype {
+    let mut columns: Vec<(&str, TypedColumn)> = Vec::with_capacity(inputs.len());
+    for inp in &inputs {
+        let name_borrowed: &str = &col_name_buf[inp.name_idx];
+        match inp.vtype {
             1 => { // VT_INT64
-                let ptr = data_ptr as *const i64;
-                let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-                columns.push((name_static, TypedColumn::Int64(slice.to_vec())));
+                let ptr = inp.data_ptr as *const i64;
+                let slice = unsafe { std::slice::from_raw_parts(ptr, inp.len) };
+                columns.push((name_borrowed, TypedColumn::Int64(slice.to_vec())));
             }
             2 => { // VT_FLOAT64
-                let ptr = data_ptr as *const f64;
-                let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-                columns.push((name_static, TypedColumn::Float64(slice.to_vec())));
+                let ptr = inp.data_ptr as *const f64;
+                let slice = unsafe { std::slice::from_raw_parts(ptr, inp.len) };
+                columns.push((name_borrowed, TypedColumn::Float64(slice.to_vec())));
             }
             3 => { // VT_STRING
-                let ptr = data_ptr as *const *const c_char;
-                let mut vals = Vec::with_capacity(len);
-                for j in 0..len {
+                let ptr = inp.data_ptr as *const *const c_char;
+                let mut vals = Vec::with_capacity(inp.len);
+                for j in 0..inp.len {
                     let s_ptr = unsafe { *ptr.add(j) };
                     if s_ptr.is_null() {
                         vals.push(String::new());
@@ -533,7 +546,7 @@ pub extern "C" fn pond_storage_write_rows(
                         vals.push(s);
                     }
                 }
-                columns.push((name_static, TypedColumn::String(vals)));
+                columns.push((name_borrowed, TypedColumn::String(vals)));
             }
             _ => continue,
         }
