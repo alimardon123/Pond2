@@ -46,7 +46,7 @@ pub fn pnd2_decode(blob: &[u8]) -> Result<Vec<PondColumn>, String> {
         {
             let decompressed = decompress_zstd(&blob[13..])?;
             let mut parser = PND2Parser::new(&decompressed);
-            return decode_inner(&decompressed, &mut parser, n_rows, n_columns, has_stats);
+            return decode_inner(&decompressed, &mut parser, n_rows, n_columns, has_stats, None);
         }
         #[cfg(not(feature = "zstd"))]
         {
@@ -60,7 +60,7 @@ pub fn pnd2_decode(blob: &[u8]) -> Result<Vec<PondColumn>, String> {
 
     let inner = &blob[13..];
     let mut parser = PND2Parser::new(inner);
-    decode_inner(inner, &mut parser, n_rows, n_columns, has_stats)
+    decode_inner(inner, &mut parser, n_rows, n_columns, has_stats, None)
 }
 
 /// Decompress zstd data using ruzstd (pure-Rust, no C deps).
@@ -76,6 +76,50 @@ fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
+/// Decode a PND2 blob with optional column projection pushdown.
+///
+/// When `projection` is `Some(set)`, only columns whose name appears in the
+/// set are decoded. Columns not in the set are skipped entirely — no memcpy,
+/// no allocation, no decode_column call.
+///
+/// When `projection` is `None`, all columns are decoded (identical to `pnd2_decode`).
+pub fn pnd2_decode_projected(
+    blob: &[u8],
+    projection: Option<&std::collections::HashSet<&str>>,
+) -> Result<Vec<PondColumn>, String> {
+    if blob.len() < 13 || &blob[0..4] != PND2_MAGIC {
+        return Err("not a PND2 blob".into());
+    }
+    if blob[4] != PND2_VERSION {
+        return Err(format!("unsupported PND2 version: {}", blob[4]));
+    }
+    let flags = blob[5];
+    let has_stats = (flags & FLAG_HAS_STATS) != 0;
+    let n_rows = u32::from_le_bytes([blob[6], blob[7], blob[8], blob[9]]) as usize;
+    let n_columns = u16::from_le_bytes([blob[10], blob[11]]) as usize;
+    let compression_tag = blob[12];
+
+    if compression_tag == COMPRESSION_ZSTD {
+        #[cfg(feature = "zstd")]
+        {
+            let decompressed = decompress_zstd(&blob[13..])?;
+            let mut parser = PND2Parser::new(&decompressed);
+            return decode_inner(&decompressed, &mut parser, n_rows, n_columns, has_stats, projection);
+        }
+        #[cfg(not(feature = "zstd"))]
+        {
+            return Err("zstd-compressed blobs require the 'zstd' feature.".into());
+        }
+    }
+    if compression_tag != COMPRESSION_NONE {
+        return Err(format!("unknown compression tag: {}", compression_tag));
+    }
+
+    let inner = &blob[13..];
+    let mut parser = PND2Parser::new(inner);
+    decode_inner(inner, &mut parser, n_rows, n_columns, has_stats, projection)
+}
+
 /// Inner decoder that works on already-decompressed bytes.
 /// Called by pnd2_decode for both uncompressed and zstd-decompressed data.
 fn decode_inner(
@@ -84,6 +128,7 @@ fn decode_inner(
     n_rows: usize,
     n_columns: usize,
     has_stats: bool,
+    projection: Option<&std::collections::HashSet<&str>>,
 ) -> Result<Vec<PondColumn>, String> {
 
     // Parse schema
@@ -119,9 +164,21 @@ fn decode_inner(
         payloads.push((name.clone(), *vtype, *enc, pstart, plen));
     }
 
-    // Decode each column
-    let mut columns: Vec<PondColumn> = Vec::with_capacity(payloads.len());
+    // Decode each column (with optional projection pushdown)
+    let cap = match projection {
+        Some(proj) => proj.len().min(payloads.len()),
+        None => payloads.len(),
+    };
+    let mut columns: Vec<PondColumn> = Vec::with_capacity(cap);
     for (name, vtype, enc, pstart, plen) in &payloads {
+        // Projection pushdown: skip columns not in the projection set
+        if let Some(proj) = projection {
+            if let Ok(name_str) = name.to_str() {
+                if !proj.contains(name_str) {
+                    continue;
+                }
+            }
+        }
         let payload = &inner[*pstart..*pstart + *plen];
         if payload.is_empty() {
             let mut col = PondColumn::empty_named("", *vtype);

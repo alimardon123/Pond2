@@ -871,7 +871,7 @@ pub fn read_rows_i64(
 
     // 3. Decode each PND2 blob and project columns
     for blob_data in &blob_data_list {
-        let cols = pond_core::pnd2_decode(blob_data)
+        let cols = pond_core::pnd2_decode_projected(blob_data, projection.as_ref())
             .map_err(|e| format!("Failed to decode PND2 blob: {}", e))?;
 
         for col in &cols {
@@ -998,7 +998,7 @@ pub fn read_rows_i64_indexed(
         columns.map(|cols| cols.iter().map(|s| s.as_str()).collect());
     let mut result_cols: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
 
-    let cols = pond_core::pnd2_decode(&blob_data)
+    let cols = pond_core::pnd2_decode_projected(&blob_data, projection.as_ref())
         .map_err(|e| format!("Failed to decode PND2 for indexed RG: {}", e))?;
 
     for col in &cols {
@@ -1139,7 +1139,7 @@ pub fn read_rows_i64_range_indexed(
     // Build a map: rg_index → decoded columns
     let mut decoded_map: std::collections::HashMap<u32, Vec<pond_core::PondColumn>> = std::collections::HashMap::new();
     for (&rg_idx, blob_data) in &rg_data_map {
-        let cols = pond_core::pnd2_decode(blob_data)
+        let cols = pond_core::pnd2_decode_projected(blob_data, projection.as_ref())
             .map_err(|e| format!("Failed to decode PND2 for indexed RG: {}", e))?;
         decoded_map.insert(rg_idx, cols);
     }

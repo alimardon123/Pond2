@@ -267,4 +267,64 @@ mod tests {
             assert_eq!(decoded[2].str_data[i].to_str().unwrap(), *expected);
         }
     }
+
+    #[test]
+    fn test_decode_projection_pushdown() {
+        use std::collections::HashSet;
+
+        // Build a 3-column blob (id, score, name)
+        let n_rows = 4usize;
+        let id_vals: Vec<i64> = vec![10, 20, 30, 40];
+        let mut id_payload = Vec::with_capacity(1 + n_rows * 8);
+        id_payload.push(VT_INT64);
+        for v in &id_vals { id_payload.extend_from_slice(&v.to_le_bytes()); }
+
+        let score_vals: Vec<f64> = vec![1.5, 2.5, 3.5, 4.5];
+        let mut score_payload = Vec::with_capacity(1 + n_rows * 8);
+        score_payload.push(VT_FLOAT64);
+        for v in &score_vals { score_payload.extend_from_slice(&v.to_le_bytes()); }
+
+        let name_vals: Vec<&str> = vec!["alice", "bob", "carol", "dave"];
+        let mut name_payload = Vec::new();
+        name_payload.push(VT_STRING);
+        for v in &name_vals {
+            let vb = v.as_bytes();
+            name_payload.extend_from_slice(&(vb.len() as u32).to_le_bytes());
+            name_payload.extend_from_slice(vb);
+        }
+
+        let cols = vec![
+            EncodeMultiColumn { name: "id", vtype: VT_INT64, payload: &id_payload, stats: None },
+            EncodeMultiColumn { name: "score", vtype: VT_FLOAT64, payload: &score_payload, stats: None },
+            EncodeMultiColumn { name: "name", vtype: VT_STRING, payload: &name_payload, stats: None },
+        ];
+        let blob = pnd2_encode_multi(&cols, n_rows);
+
+        // Project only "id" — should skip score + name decode entirely
+        let mut proj: HashSet<&str> = HashSet::new();
+        proj.insert("id");
+        let decoded = pnd2_decode_projected(&blob, Some(&proj)).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].name.to_str().unwrap(), "id");
+        assert_eq!(decoded[0].i64_data, id_vals);
+
+        // Project "name" + "score" — should skip id decode
+        let mut proj2: HashSet<&str> = HashSet::new();
+        proj2.insert("name");
+        proj2.insert("score");
+        let decoded2 = pnd2_decode_projected(&blob, Some(&proj2)).unwrap();
+        assert_eq!(decoded2.len(), 2);
+        assert_eq!(decoded2[0].name.to_str().unwrap(), "score");
+        assert_eq!(decoded2[1].name.to_str().unwrap(), "name");
+
+        // None projection = decode all (same as pnd2_decode)
+        let decoded_all = pnd2_decode_projected(&blob, None).unwrap();
+        assert_eq!(decoded_all.len(), 3);
+
+        // Nonexistent column = empty result
+        let mut proj3: HashSet<&str> = HashSet::new();
+        proj3.insert("nonexistent");
+        let decoded3 = pnd2_decode_projected(&blob, Some(&proj3)).unwrap();
+        assert_eq!(decoded3.len(), 0);
+    }
 }
