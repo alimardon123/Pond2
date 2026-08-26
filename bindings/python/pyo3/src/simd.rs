@@ -326,7 +326,7 @@ pub fn columnar_filter(
     for (col_name, op, value) in predicates {
         // Find the column
         let col = cols.iter().find(|c| {
-            c.name.to_string_lossy().to_string() == col_name.as_str()
+            c.name.to_string_lossy() == col_name.as_str()
         });
 
         let col = match col {
