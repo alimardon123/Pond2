@@ -22,6 +22,7 @@
 use std::ffi::{c_char, CString};
 #[allow(unused_imports)]
 use std::ptr;
+use std::sync::Mutex;
 
 use crate::constants::{VT_BINARY, VT_FLOAT64, VT_INT64, VT_STRING};
 use crate::decode::pnd2_decode;
@@ -40,6 +41,9 @@ use crate::types::PondColumn;
 pub struct PondResult {
     columns: Vec<PondColumn>,
     str_array_cache: std::cell::UnsafeCell<Vec<Option<Vec<*const c_char>>>>,
+    /// Leaked Box<[*const c_char]> pointers from pond_result_column_str_array.
+    /// Freed when PondResult is dropped.
+    leaked_str_arrays: Mutex<Vec<(*mut u8, usize)>>,
 }
 
 /// Decode a PND2 blob into a `PondResult` handle.
@@ -59,7 +63,11 @@ pub extern "C" fn pond_pnd2_decode(blob: *const u8, blob_len: usize) -> *mut Pon
     let data = unsafe { std::slice::from_raw_parts(blob, blob_len) };
 
     match pnd2_decode(data) {
-        Ok(columns) => Box::into_raw(Box::new(PondResult { columns, str_array_cache: std::cell::UnsafeCell::new(Vec::new()) })),
+        Ok(columns) => Box::into_raw(Box::new(PondResult {
+            columns,
+            str_array_cache: std::cell::UnsafeCell::new(Vec::new()),
+            leaked_str_arrays: Mutex::new(Vec::new()),
+        })),
         Err(_) => std::ptr::null_mut(),
     }
 }
@@ -220,7 +228,13 @@ pub extern "C" fn pond_result_column_str_array(
     // pond_str_array_free (or it's reclaimed when PondResult is dropped,
     // since the pointers inside remain valid until then).
     let boxed: Box<[*const c_char]> = ptrs.into_boxed_slice();
-    Box::into_raw(boxed) as *const *const c_char
+    let len = boxed.len();
+    let raw = Box::into_raw(boxed);
+    // Store (ptr, len) so we can reclaim on PondResult::drop
+    if let Ok(mut guard) = r.leaked_str_arrays.lock() {
+        guard.push((raw as *mut u8, len));
+    }
+    raw as *const *const c_char
 }
 
 /// Free a string pointer array returned by `pond_result_column_str_array`.
@@ -246,7 +260,16 @@ pub extern "C" fn pond_str_array_free(arr: *const *const c_char) {
 #[no_mangle]
 pub extern "C" fn pond_result_free(result: *mut PondResult) {
     if !result.is_null() {
-        unsafe { drop(Box::from_raw(result)); }
+        unsafe {
+            let r = &*result;
+            // Reclaim all leaked str_array allocations
+            if let Ok(mut guard) = r.leaked_str_arrays.lock() {
+                for (ptr, len) in guard.drain(..) {
+                    drop(Vec::from_raw_parts(ptr as *mut *const c_char, len, len));
+                }
+            }
+            drop(Box::from_raw(result));
+        }
     }
 }
 

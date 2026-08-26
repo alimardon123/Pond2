@@ -181,12 +181,28 @@ pub fn decode_raw(payload: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
         VT_INT64 => {
             let n = (data.len() / 8).min(n_rows);
             let mut vals = Vec::with_capacity(n);
-            for i in 0..n {
-                let o = i * 8;
-                vals.push(i64::from_le_bytes([
-                    data[o], data[o+1], data[o+2], data[o+3],
-                    data[o+4], data[o+5], data[o+6], data[o+7],
-                ]));
+            #[cfg(target_endian = "little")]
+            {
+                // On LE targets, from_le_bytes is identity — bulk byte memcpy
+                // into properly-aligned i64 vec allocation (no alignment req on src)
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        vals.as_mut_ptr() as *mut u8,
+                        n * 8,
+                    );
+                    vals.set_len(n);
+                }
+            }
+            #[cfg(not(target_endian = "little"))]
+            {
+                for i in 0..n {
+                    let o = i * 8;
+                    vals.push(i64::from_le_bytes([
+                        data[o], data[o+1], data[o+2], data[o+3],
+                        data[o+4], data[o+5], data[o+6], data[o+7],
+                    ]));
+                }
             }
             PondColumn {
                 name: CString::new("").unwrap(), vtype,
@@ -197,12 +213,27 @@ pub fn decode_raw(payload: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
         VT_FLOAT64 => {
             let n = (data.len() / 8).min(n_rows);
             let mut vals = Vec::with_capacity(n);
-            for i in 0..n {
-                let o = i * 8;
-                vals.push(f64::from_le_bytes([
-                    data[o], data[o+1], data[o+2], data[o+3],
-                    data[o+4], data[o+5], data[o+6], data[o+7],
-                ]));
+            #[cfg(target_endian = "little")]
+            {
+                // On LE targets, f64 byte layout is identical — bulk byte memcpy
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        vals.as_mut_ptr() as *mut u8,
+                        n * 8,
+                    );
+                    vals.set_len(n);
+                }
+            }
+            #[cfg(not(target_endian = "little"))]
+            {
+                for i in 0..n {
+                    let o = i * 8;
+                    vals.push(f64::from_le_bytes([
+                        data[o], data[o+1], data[o+2], data[o+3],
+                        data[o+4], data[o+5], data[o+6], data[o+7],
+                    ]));
+                }
             }
             PondColumn {
                 name: CString::new("").unwrap(), vtype,
@@ -583,11 +614,9 @@ pub fn decode_rle(payload: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
                     data[off], data[off+1], data[off+2], data[off+3]
                 ]) as usize;
                 off += 4;
-                for _ in 0..run_len {
-                    if total_rows >= n_rows { break; }
-                    int_vals.push(v);
-                    total_rows += 1;
-                }
+                let actual = run_len.min(n_rows - total_rows);
+                int_vals.resize(int_vals.len() + actual, v);
+                total_rows += actual;
             }
             VT_FLOAT64 => {
                 if off + 8 > data.len() { break; }
@@ -601,11 +630,9 @@ pub fn decode_rle(payload: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
                     data[off], data[off+1], data[off+2], data[off+3]
                 ]) as usize;
                 off += 4;
-                for _ in 0..run_len {
-                    if total_rows >= n_rows { break; }
-                    float_vals.push(v);
-                    total_rows += 1;
-                }
+                let actual = run_len.min(n_rows - total_rows);
+                float_vals.resize(float_vals.len() + actual, v);
+                total_rows += actual;
             }
             VT_STRING | VT_VARIANT => {
                 if off + 4 > data.len() { break; }

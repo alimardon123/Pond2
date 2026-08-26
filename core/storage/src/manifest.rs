@@ -66,34 +66,49 @@ impl ColumnStatsEntry {
         };
 
         match (self.value_type, op) {
-            (VT_INT64, "=") | (VT_FLOAT64, "=") => {
-                // Prune if value is outside [min, max]
-                let val = if self.value_type == VT_INT64 {
-                    i64_from_le_bytes(value)
-                } else {
-                    // For f64, compare as bytes (works for same-endian)
-                    0
-                };
-                let min_val = if self.value_type == VT_INT64 {
-                    i64_from_le_bytes(min)
-                } else { 0 };
-                let max_val = if self.value_type == VT_INT64 {
-                    i64_from_le_bytes(max)
-                } else { 0 };
-                if self.value_type == VT_INT64 {
-                    return val < min_val || val > max_val;
-                }
-                false
-            }
-            (VT_INT64, "<") | (VT_INT64, "<=") => {
+            (VT_INT64, "=") => {
                 let val = i64_from_le_bytes(value);
-                let min_val = i64_from_le_bytes(min);
-                val < min_val
+                val < i64_from_le_bytes(min) || val > i64_from_le_bytes(max)
             }
-            (VT_INT64, ">") | (VT_INT64, ">=") => {
+            (VT_INT64, "<") => {
+                // Strict: prune if val <= min (min itself doesn't satisfy <)
                 let val = i64_from_le_bytes(value);
-                let max_val = i64_from_le_bytes(max);
-                val > max_val
+                val <= i64_from_le_bytes(min)
+            }
+            (VT_INT64, "<=") => {
+                // Non-strict: prune if val < min
+                let val = i64_from_le_bytes(value);
+                val < i64_from_le_bytes(min)
+            }
+            (VT_INT64, ">") => {
+                // Strict: prune if val >= max (max itself doesn't satisfy >)
+                let val = i64_from_le_bytes(value);
+                val >= i64_from_le_bytes(max)
+            }
+            (VT_INT64, ">=") => {
+                // Non-strict: prune if val > max
+                let val = i64_from_le_bytes(value);
+                val > i64_from_le_bytes(max)
+            }
+            (VT_FLOAT64, "=") => {
+                let val = f64_from_le_bytes(value);
+                val < f64_from_le_bytes(min) || val > f64_from_le_bytes(max)
+            }
+            (VT_FLOAT64, "<") => {
+                let val = f64_from_le_bytes(value);
+                val <= f64_from_le_bytes(min)
+            }
+            (VT_FLOAT64, "<=") => {
+                let val = f64_from_le_bytes(value);
+                val < f64_from_le_bytes(min)
+            }
+            (VT_FLOAT64, ">") => {
+                let val = f64_from_le_bytes(value);
+                val >= f64_from_le_bytes(max)
+            }
+            (VT_FLOAT64, ">=") => {
+                let val = f64_from_le_bytes(value);
+                val > f64_from_le_bytes(max)
             }
             _ => false, // don't prune for string/binary or unknown ops
         }
@@ -105,6 +120,14 @@ fn i64_from_le_bytes(b: &[u8]) -> i64 {
         i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
     } else {
         0
+    }
+}
+
+fn f64_from_le_bytes(b: &[u8]) -> f64 {
+    if b.len() >= 8 {
+        f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+    } else {
+        0.0
     }
 }
 
@@ -691,9 +714,11 @@ impl RootManifest {
                 let max_val = i64_from_le_bytes(max);
 
                 let pruned = match op.as_str() {
-                    ">" | ">=" => val > max_val,
-                    "<" | "<=" => val < min_val,
                     "=" => val < min_val || val > max_val,
+                    "<" => val <= min_val,
+                    "<=" => val < min_val,
+                    ">" => val >= max_val,
+                    ">=" => val > max_val,
                     _ => false,
                 };
 
@@ -1052,5 +1077,51 @@ mod tests {
         let decoded = RootManifest::decode(&encoded).unwrap();
         assert_eq!(decoded.leaves.len(), 8000);
         assert_eq!(decoded.total_row_groups(), 8_192_000);
+    }
+
+    #[test]
+    fn test_float_pruning() {
+        let stats = ColumnStatsEntry {
+            name: "score".to_string(),
+            value_type: VT_FLOAT64,
+            min: Some(10.0_f64.to_le_bytes().to_vec()),
+            max: Some(20.0_f64.to_le_bytes().to_vec()),
+            null_count: 0,
+        };
+        // =: prune if outside [10, 20]
+        assert!(stats.can_prune("=", &5.0_f64.to_le_bytes()));   // 5 < 10, prune
+        assert!(!stats.can_prune("=", &15.0_f64.to_le_bytes())); // 15 in [10,20], keep
+        assert!(stats.can_prune("=", &25.0_f64.to_le_bytes()));  // 25 > 20, prune
+        // <: strict — prune if val <= min
+        assert!(stats.can_prune("<", &10.0_f64.to_le_bytes()));
+        assert!(!stats.can_prune("<", &15.0_f64.to_le_bytes()));
+        assert!(!stats.can_prune("<", &20.0_f64.to_le_bytes()));
+        // <=: non-strict — prune if val < min
+        assert!(stats.can_prune("<=", &9.0_f64.to_le_bytes()));
+        assert!(!stats.can_prune("<=", &10.0_f64.to_le_bytes()));
+        // >: strict — prune if val >= max
+        assert!(stats.can_prune(">", &20.0_f64.to_le_bytes()));
+        assert!(!stats.can_prune(">", &15.0_f64.to_le_bytes()));
+        assert!(!stats.can_prune(">", &10.0_f64.to_le_bytes()));
+        // >=: non-strict — prune if val > max
+        assert!(stats.can_prune(">=", &21.0_f64.to_le_bytes()));
+        assert!(!stats.can_prune(">=", &20.0_f64.to_le_bytes()));
+    }
+
+    #[test]
+    fn test_int_strict_boundary_pruning() {
+        let stats = ColumnStatsEntry {
+            name: "id".to_string(),
+            value_type: VT_INT64,
+            min: Some(10_i64.to_le_bytes().to_vec()),
+            max: Some(20_i64.to_le_bytes().to_vec()),
+            null_count: 0,
+        };
+        // Strict < on exact boundary: val=10 should prune (10 < 10 is false)
+        assert!(stats.can_prune("<", &10_i64.to_le_bytes()));
+        assert!(!stats.can_prune("<", &11_i64.to_le_bytes()));
+        // Strict > on exact boundary: val=20 should prune
+        assert!(stats.can_prune(">", &20_i64.to_le_bytes()));
+        assert!(!stats.can_prune(">", &19_i64.to_le_bytes()));
     }
 }

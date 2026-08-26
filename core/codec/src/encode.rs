@@ -201,8 +201,9 @@ pub fn pnd2_encode_multi(columns: &[EncodeMultiColumn], n_rows: usize) -> Vec<u8
 
     // Per-column payloads
     for col in columns {
-        inner.extend_from_slice(&(col.payload.len() as u32).to_le_bytes());
-        inner.extend_from_slice(col.payload);
+        let plen = col.payload.len().min(u32::MAX as usize) as u32;
+        inner.extend_from_slice(&plen.to_le_bytes());
+        inner.extend_from_slice(&col.payload[..plen as usize]);
     }
 
     // Final PND2 blob
@@ -210,8 +211,10 @@ pub fn pnd2_encode_multi(columns: &[EncodeMultiColumn], n_rows: usize) -> Vec<u8
     blob.extend_from_slice(PND2_MAGIC);
     blob.push(PND2_VERSION);
     blob.push(FLAG_HAS_STATS);
-    blob.extend_from_slice(&(n_rows as u32).to_le_bytes());
-    blob.extend_from_slice(&(columns.len() as u16).to_le_bytes());
+    let n_rows_u32 = n_rows.min(u32::MAX as usize) as u32;
+    let n_cols_u16 = columns.len().min(u16::MAX as usize) as u16;
+    blob.extend_from_slice(&n_rows_u32.to_le_bytes());
+    blob.extend_from_slice(&n_cols_u16.to_le_bytes());
     blob.push(COMPRESSION_NONE);
     blob.extend_from_slice(&inner);
     blob
@@ -676,8 +679,9 @@ pub fn pnd2_encode_multi_typed(columns: &[(&str, TypedColumn)]) -> Vec<u8> {
     // Phase 1: Write ALL schemas
     for (name, col) in columns {
         let name_bytes = name.as_bytes();
-        inner.push(name_bytes.len() as u8);
-        inner.extend_from_slice(name_bytes);
+        let name_len = name_bytes.len().min(u8::MAX as usize) as u8;
+        inner.push(name_len);
+        inner.extend_from_slice(&name_bytes[..name_len as usize]);
         inner.push(col.vtype());
         inner.push(col.encode_encoding());
     }
@@ -697,8 +701,9 @@ pub fn pnd2_encode_multi_typed(columns: &[(&str, TypedColumn)]) -> Vec<u8> {
     // Phase 3: Write ALL payloads
     for (_, col) in columns {
         let payload = col.encode_payload();
-        inner.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        inner.extend_from_slice(&payload);
+        let plen = payload.len().min(u32::MAX as usize) as u32;
+        inner.extend_from_slice(&plen.to_le_bytes());
+        inner.extend_from_slice(&payload[..plen as usize]);
     }
 
     // Final PND2 blob
@@ -706,8 +711,10 @@ pub fn pnd2_encode_multi_typed(columns: &[(&str, TypedColumn)]) -> Vec<u8> {
     blob.extend_from_slice(PND2_MAGIC);
     blob.push(PND2_VERSION);
     blob.push(FLAG_HAS_STATS);
-    blob.extend_from_slice(&(n_rows as u32).to_le_bytes());
-    blob.extend_from_slice(&(columns.len() as u16).to_le_bytes());
+    let n_rows_u32 = n_rows.min(u32::MAX as usize) as u32;
+    let n_cols_u16 = columns.len().min(u16::MAX as usize) as u16;
+    blob.extend_from_slice(&n_rows_u32.to_le_bytes());
+    blob.extend_from_slice(&n_cols_u16.to_le_bytes());
     blob.push(COMPRESSION_NONE);
     blob.extend_from_slice(&inner);
     blob
@@ -735,8 +742,9 @@ pub fn pnd2_encode_i64_auto(columns: &[(&str, &[i64])]) -> Vec<u8> {
         };
         encoded_cols.push((enc, payload, stats));
 
-        inner.push(name_bytes.len() as u8);
-        inner.extend_from_slice(name_bytes);
+        let name_len = name_bytes.len().min(u8::MAX as usize) as u8;
+        inner.push(name_len);
+        inner.extend_from_slice(&name_bytes[..name_len as usize]);
         inner.push(VT_INT64);
         inner.push(enc);
     }
@@ -755,8 +763,9 @@ pub fn pnd2_encode_i64_auto(columns: &[(&str, &[i64])]) -> Vec<u8> {
 
     // Phase 3: Write ALL payload lengths + payloads
     for (_, payload, _) in &encoded_cols {
-        inner.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        inner.extend_from_slice(payload);
+        let plen = payload.len().min(u32::MAX as usize) as u32;
+        inner.extend_from_slice(&plen.to_le_bytes());
+        inner.extend_from_slice(&payload[..plen as usize]);
     }
 
     // Final PND2 blob
@@ -764,8 +773,10 @@ pub fn pnd2_encode_i64_auto(columns: &[(&str, &[i64])]) -> Vec<u8> {
     blob.extend_from_slice(PND2_MAGIC);
     blob.push(PND2_VERSION);
     blob.push(FLAG_HAS_STATS);
-    blob.extend_from_slice(&(n_rows as u32).to_le_bytes());
-    blob.extend_from_slice(&(columns.len() as u16).to_le_bytes());
+    let n_rows_u32 = n_rows.min(u32::MAX as usize) as u32;
+    let n_cols_u16 = columns.len().min(u16::MAX as usize) as u16;
+    blob.extend_from_slice(&n_rows_u32.to_le_bytes());
+    blob.extend_from_slice(&n_cols_u16.to_le_bytes());
     blob.push(COMPRESSION_NONE);
     blob.extend_from_slice(&inner);
     blob
