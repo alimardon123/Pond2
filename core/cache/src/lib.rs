@@ -266,15 +266,32 @@ impl CachingObjectStore {
     }
 
     /// Invalidate all block cache entries for a given blob hash.
-    /// Called on delete_blob to prevent stale entries.
+    /// Called on delete_blob to prevent stale entries serving deleted data.
+    ///
+    /// CORRECTNESS: this must ACTUALLY remove the cached ranges. The old
+    /// implementation only removed the hash from the tracking set and let
+    /// entries "be evicted naturally" — meaning get_blob_range() kept
+    /// serving bytes for a blob deleted from the inner store (deleted-data
+    /// resurrection). Block keys are "{hash}:{offset}:{len}" and hashes are
+    /// 64-char hex (never contain ':'), so prefix "{hash}:" is unambiguous.
     fn invalidate_block_cache(&self, hash: &str) {
         let mut hashes = self.block_cache_hashes.lock().unwrap();
-        if hashes.remove(hash) {
-            // moka lacks prefix removal, so we rebuild the cache without
-            // entries for this hash. This is rare (only on delete_blob).
-            drop(hashes);
-            // Iterate and remove — not ideal but delete_blob is rare.
-            // The block cache is bounded and entries will be evicted naturally.
+        if !hashes.remove(hash) {
+            return; // no block entries tracked for this hash — nothing to do
+        }
+        drop(hashes);
+        // moka lacks prefix removal but exposes a weakly-consistent
+        // iterator. delete_blob is rare (GC/vacuum), so an O(n) scan over
+        // block-cache keys is acceptable; cache is bounded anyway.
+        let prefix = format!("{}:", hash);
+        let stale_keys: Vec<String> = self
+            .block_cache
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, _)| (*k).clone())
+            .collect();
+        for key in stale_keys {
+            self.block_cache.invalidate(&key);
         }
     }
 
@@ -473,6 +490,27 @@ impl ObjectStore for CachingObjectStore {
             inserted_at: Instant::now(),
         });
         Ok(())
+    }
+
+    fn put_path_if(&self, path: &str, expected_hash: Option<&str>, new_hash: &str) -> io::Result<bool> {
+        // Forward to the inner store's ATOMIC CAS (S3 If-Match). Never use
+        // the inherited read-check-write default: it compares against the
+        // ref CACHE, which can be TTL-stale (5s) — the check would pass
+        // while the inner store's HEAD already moved, silently reintroducing
+        // the lost-update bug the CAS exists to prevent.
+        let won = self.inner.put_path_if(path, expected_hash, new_hash)?;
+        if won {
+            let mut refs = self.ref_cache.lock().unwrap();
+            refs.insert(path.to_string(), RefEntry {
+                hash: new_hash.to_string(),
+                inserted_at: Instant::now(),
+            });
+        } else {
+            // CAS lost: drop the cached value so the caller's retry observes
+            // the CURRENT head from the inner store, not a stale snapshot.
+            self.ref_cache.lock().unwrap().remove(path);
+        }
+        Ok(won)
     }
 
     fn get_path(&self, path: &str) -> Option<String> {
@@ -1305,22 +1343,39 @@ mod tests {
         let data = vec![0xEFu8; 10_000];
         let hash = store.put_blob(&data).unwrap();
 
-        // Populate block cache.
+        // Populate TWO distinct block-cache ranges for this blob.
         let _ = store.get_blob_range(&hash, 100, 300).unwrap();
-        // Verify it's cached by removing disk and re-reading.
-        store.remove_blob_from_disk(&hash);
-        let r = store.get_blob_range(&hash, 100, 300);
-        assert!(r.is_ok(), "block cache should serve the range after disk removal");
+        let _ = store.get_blob_range(&hash, 500, 900).unwrap();
+        // Verify both entries exist in the block cache (prefix scan).
+        let prefix = format!("{}:", hash);
+        let count_entries = || {
+            store
+                .block_cache
+                .iter()
+                .filter(|(k, _)| k.starts_with(&prefix))
+                .count()
+        };
+        assert_eq!(count_entries(), 2, "two block entries should be cached");
 
-        // Delete the blob — block cache should be invalidated.
-        store.put_blob(&data).unwrap(); // re-create so delete_blob has something to delete
+        // Delete the blob — ALL block cache entries must be removed.
         store.delete_blob(&hash).unwrap();
 
-        // The hash tracker should be clean.
-        let hashes = store.block_cache_hashes.lock().unwrap();
-        assert!(!hashes.contains(&hash));
-    }
+        // REGRESSION (architecture review bug #2): the old invalidate only
+        // cleared the tracking SET and let moka "evict naturally" —
+        // get_blob_range kept serving bytes for a deleted blob
+        // (deleted-data resurrection). The entries themselves must be gone.
+        assert_eq!(
+            count_entries(),
+            0,
+            "block cache entries must be REMOVED on delete_blob, not just untracked"
+        );
 
+        // The hash tracker should be clean too.
+        {
+            let hashes = store.block_cache_hashes.lock().unwrap();
+            assert!(!hashes.contains(&hash));
+        }
+    }
     #[test]
     fn test_resolve_cache_dir_explicit_and_env() {
         // Explicit override wins.
