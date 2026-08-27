@@ -173,6 +173,29 @@ impl WhereExpr {
     }
 }
 
+impl WhereExpr {
+    /// Collect all column names referenced in this WHERE expression.
+    /// Used for projection pushdown to ensure filter columns are decoded.
+    pub fn collect_columns(&self, out: &mut std::collections::HashSet<String>) {
+        match self {
+            WhereExpr::True => {}
+            WhereExpr::Compare { col, .. }
+            | WhereExpr::In { col, .. }
+            | WhereExpr::Like { col, .. }
+            | WhereExpr::IsNull { col, .. }
+            | WhereExpr::Subquery { col, .. } => {
+                let base = col.rsplit('.').next().unwrap_or(col);
+                out.insert(base.to_string());
+            }
+            WhereExpr::And(a, b) | WhereExpr::Or(a, b) => {
+                a.collect_columns(out);
+                b.collect_columns(out);
+            }
+            WhereExpr::Not(e) => e.collect_columns(out),
+        }
+    }
+}
+
 /// Evaluate a comparison: cell op target.
 ///
 /// Handles type coercion: bool true/false is equivalent to int 1/0,

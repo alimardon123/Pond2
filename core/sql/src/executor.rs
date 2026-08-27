@@ -21,6 +21,7 @@ use pond_kernel::crdt::{uuidv7, HLC};
 use pond_storage::shard;
 use pond_storage::{write as storage_write, UnifiedStorage};
 use serde_json::{json, Value as JsonValue};
+use std::collections::{HashSet, HashMap};
 
 /// Result of executing a SQL statement.
 ///
@@ -122,7 +123,13 @@ fn execute_select(
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> Result<SqlResult, String> {
-    let mut result_rows = read_table_rows(storage, table)?;
+    let join_on_left: Vec<String> = joins.iter()
+        .flat_map(|j| j.on.iter().map(|(l, _)| l.clone()))
+        .collect();
+    let projection = extract_required_columns(
+        select_items, where_expr, groups, orders, &join_on_left, having,
+    );
+    let mut result_rows = read_table_rows(storage, table, projection.as_ref())?;
 
     // If there's an alias, prefix all columns with the alias.
     if let Some(al) = alias {
@@ -131,7 +138,7 @@ fn execute_select(
 
     // Execute JOINs.
     for join in joins {
-        let mut right_rows = read_table_rows(storage, &join.table)?;
+        let mut right_rows = read_table_rows(storage, &join.table, None)?;
         if let Some(al) = &join.alias {
             prefix_rows_with_alias(&mut right_rows, al);
         }
@@ -151,15 +158,13 @@ fn execute_select(
             Some(c) => c,
             None => return Ok(Vec::new()),
         };
-        let mut seen: Vec<JsonValue> = Vec::new();
+        let mut seen: std::collections::HashSet<JsonValue> = std::collections::HashSet::new();
         for row in &sub_result.rows {
             if let Some(v) = row.get(&first_col) {
-                if !seen.iter().any(|s| s == v) {
-                    seen.push(v.clone());
-                }
+                seen.insert(v.clone());
             }
         }
-        Ok(seen)
+        Ok(seen.into_iter().collect())
     });
 
     // Apply WHERE filter.
@@ -351,7 +356,6 @@ fn apply_group_by(
     select_items: &[SelectItem],
     having: &WhereExpr,
 ) -> Result<Vec<JsonValue>, String> {
-    use std::collections::HashMap;
 
     // If no GROUP BY but aggregates present, treat the whole input as one group.
     let aggregates: Vec<&AggregateExpr> = select_items
@@ -640,8 +644,6 @@ fn execute_join(
     on: &[(String, String)],
     join_type: &JoinType,
 ) -> Vec<JsonValue> {
-    use std::collections::HashMap;
-
     // Build an index on right_rows: composite key → list of right rows.
     let mut right_index: HashMap<String, Vec<&JsonValue>> = HashMap::new();
     for right_row in &right_rows {
@@ -761,11 +763,21 @@ fn execute_join(
 // Table reading
 // ---------------------------------------------------------------------------
 
-fn read_table_rows(storage: &UnifiedStorage, table: &TableRef) -> Result<Vec<JsonValue>, String> {
+fn read_table_rows(
+    storage: &UnifiedStorage,
+    table: &TableRef,
+    projection: Option<&HashSet<String>>,
+) -> Result<Vec<JsonValue>, String> {
     match table {
         TableRef::Collection(name) => {
             let kc = vec!["_rowid".to_string()];
-            let all_rows = read_collection_as_json_rows(storage, name, &kc, None)?;
+            // Convert HashSet<String> → HashSet<&str> for codec layer
+            let proj_ref: Option<HashSet<&str>> = projection.map(|s| {
+                s.iter().map(|c| c.as_str()).collect()
+            });
+            let all_rows = read_collection_as_json_rows(
+                storage, name, &kc, proj_ref.as_ref(),
+            )?;
             Ok(crdt_merge_rows(all_rows))
         }
         TableRef::File(path) => read_file_rows(path),
@@ -1049,6 +1061,119 @@ fn arrow_cell_to_json(
     }
 }
 
+/// Strip a leading "alias." prefix from a column reference.
+/// E.g., "u.name" → "name", "id" → "id".
+fn strip_alias_prefix(col: &str) -> &str {
+    col.rsplit('.').next().unwrap_or(col)
+}
+
+/// Extract aggregate function argument from a string like "SUM(amount)" or
+/// "AVG(salary)". Returns None for non-aggregate strings.
+fn extract_aggregate_arg(col: &str) -> Option<&str> {
+    let col = col.trim();
+    let open = col.find('(')?;
+    let close = col.rfind(')')?;
+    if close <= open + 1 { return None; }
+    let inner = &col[open + 1..close];
+    let inner = inner.trim();
+    if inner == "*" { return None; }
+    // Strip alias prefix from the arg
+    Some(strip_alias_prefix(inner))
+}
+
+/// Extract the set of column names that must be present in decoded rows
+/// for a SELECT to execute correctly. Returns `None` if all columns are
+/// needed (SELECT * or mixed Star + named).
+///
+/// Always includes CRDT metadata columns (`_rowid`, `_version`, `_deleted`)
+/// because `crdt_merge_rows` requires them for dedup + tombstone filtering.
+fn extract_required_columns(
+    select_items: &[SelectItem],
+    where_expr: &WhereExpr,
+    groups: &[String],
+    orders: &[OrderByItem],
+    join_on_cols: &[String],
+    having: &WhereExpr,
+) -> Option<HashSet<String>> {
+    // SELECT * → read everything
+    if select_items.len() == 1 && matches!(select_items[0], SelectItem::Star) {
+        return None;
+    }
+
+    let mut needed: HashSet<String> = HashSet::new();
+
+    // CRDT metadata (always required for merge/dedup)
+    needed.insert("_rowid".into());
+    needed.insert("_version".into());
+    needed.insert("_deleted".into());
+
+    for item in select_items {
+        match item {
+            SelectItem::Star => return None, // mixed * → bail, read all
+            SelectItem::Column(c) => {
+                needed.insert(strip_alias_prefix(c).to_string());
+            }
+            SelectItem::Aggregate(a) => {
+                if let Some(arg) = &a.arg {
+                    needed.insert(strip_alias_prefix(arg).to_string());
+                }
+            }
+        }
+    }
+
+    // WHERE columns
+    where_expr.collect_columns(&mut needed);
+
+    // GROUP BY columns
+    for g in groups {
+        needed.insert(strip_alias_prefix(g).to_string());
+    }
+
+    // ORDER BY columns
+    for o in orders {
+        needed.insert(strip_alias_prefix(&o.col).to_string());
+    }
+
+    // JOIN ON columns (left side)
+    for c in join_on_cols {
+        needed.insert(strip_alias_prefix(c).to_string());
+    }
+
+    // HAVING: extract aggregate arguments (e.g., "SUM(amount)" → "amount")
+    // HAVING uses WhereExpr::Compare { col: "SUM(amount)", ... } for
+    // aggregate predicates. We need the raw column for the aggregate to work.
+    extract_having_columns(having, &mut needed);
+
+    Some(needed)
+}
+
+/// Recursively extract column names from a HAVING expression.
+/// For aggregate comparisons like "SUM(amount) < 1000", parses the
+/// aggregate function argument ("amount") and adds it to the set.
+fn extract_having_columns(expr: &WhereExpr, needed: &mut HashSet<String>) {
+    match expr {
+        WhereExpr::True => {}
+        WhereExpr::Compare { col, .. }
+        | WhereExpr::In { col, .. }
+        | WhereExpr::Like { col, .. }
+        | WhereExpr::IsNull { col, .. }
+        | WhereExpr::Subquery { col, .. } => {
+            // Try to extract aggregate arg (e.g., "SUM(amount)" → "amount")
+            if let Some(arg) = extract_aggregate_arg(col) {
+                needed.insert(arg.to_string());
+            } else {
+                // Plain column reference
+                needed.insert(strip_alias_prefix(col).to_string());
+            }
+        }
+        WhereExpr::And(a, b) | WhereExpr::Or(a, b) => {
+            extract_having_columns(a, needed);
+            extract_having_columns(b, needed);
+        }
+        WhereExpr::Not(e) => extract_having_columns(e, needed),
+    }
+}
+
 /// Read all rows from a collection as (rowid, JSON row) pairs.
 ///
 /// Reads HEAD + shards, decodes PND2 blobs, converts each row to a JSON
@@ -1189,7 +1314,6 @@ fn determine_rowid(row: &JsonValue, key_fields: &[String]) -> String {
 
 /// Sequential CRDT merge — dedup by _rowid, latest _version wins.
 fn crdt_merge_rows(rows: Vec<(String, JsonValue)>) -> Vec<JsonValue> {
-    use std::collections::HashMap;
     let mut order: Vec<String> = Vec::new();
     let mut latest: HashMap<String, (String, JsonValue)> = HashMap::new();
     let mut no_rowid: Vec<JsonValue> = Vec::new();
@@ -1380,7 +1504,6 @@ fn execute_merge(
     // Build an index of target rows by the composite key built from the
     // FIRST match_key (target side). Multi-key match isn't fully supported
     // here — kept simple for the v1 port.
-    use std::collections::HashMap;
     let first_key = match_keys.first()
         .ok_or_else(|| "MERGE requires at least one match key".to_string())?;
     let target_key_col = &first_key.0;
