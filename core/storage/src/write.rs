@@ -398,13 +398,6 @@ fn write_rows_inner(
     let data_hash = kernel.write(&blob)
         .map_err(|e| format!("Failed to write PND2 blob: {}", e))?;
 
-    // Get parent commit
-    let parent = kernel.resolve(&branch_ref(collection, active_branch));
-    let parent_index = parent.as_ref()
-        .and_then(|p| commit::read_commit(kernel, p))
-        .map(|c| c.index + 1)
-        .unwrap_or(0);
-
     // Build manifest with schema + column stats (use final_columns to include
     // the auto-added _rowid / _version columns)
     let schema: Vec<(String, u8)> = final_columns.iter()
@@ -440,30 +433,64 @@ fn write_rows_inner(
 
     let manifest_bytes = manifest.encode();
 
-    // Build commit JSON (inline — we pack it with the manifest)
+    // CAS COMMIT LOOP — closes the multi-writer lost-update hole (review bug #1).
+    //
+    // The old unconditional `reference()` meant two concurrent write_rows that
+    // both parented off H0 would both succeed: the second PUT silently
+    // overwrote the first commit's parent link, ORPHANING one commit chain
+    // (rows lost from HEAD's history). reference_if() is a true CAS:
+    //   - S3/R2: conditional PUT with If-Match ETag (atomic at the store)
+    //   - CachingObjectStore forwards to inner + refreshes/drops its ref cache
+    //   - LocalFS: read-check-write (default impl; single-process safe)
+    //
+    // The branch ref is the linearization point and the read path's source of
+    // truth. Losers of the race re-read HEAD and rebuild their pack (the data
+    // blob is content-addressed and NOT rewritten; the superseded pack blobs
+    // become unreferenced garbage that GC/vacuum can reclaim).
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
-    let commit_obj = serde_json::json!({
-        "parent": parent,
-        "second_parent": null,
-        "manifest": "packed",
-        "message": if message.is_empty() { "write_rows" } else { message },
-        "timestamp": timestamp,
-        "index": parent_index,
-    });
+    let b_ref = branch_ref(collection, active_branch);
+    const MAX_CAS_ATTEMPTS: usize = 5;
+    let mut pack_hash: Option<String> = None;
+    for _attempt in 0..MAX_CAS_ATTEMPTS {
+        let parent = kernel.resolve(&b_ref);
+        let parent_index = parent.as_ref()
+            .and_then(|p| commit::read_commit(kernel, p))
+            .map(|c| c.index + 1)
+            .unwrap_or(0);
 
-    // Encode as PondPack (commit + manifest combined) → saves 1 S3 PUT
-    let pack_bytes = pond_pack::encode_pack(&commit_obj, &manifest_bytes, None);
-    let pack_hash = kernel.write(&pack_bytes)
-        .map_err(|e| format!("Failed to write PondPack: {}", e))?;
+        let commit_obj = serde_json::json!({
+            "parent": parent,
+            "second_parent": null,
+            "manifest": "packed",
+            "message": if message.is_empty() { "write_rows" } else { message },
+            "timestamp": timestamp,
+            "index": parent_index,
+        });
 
-    // Update branch refs (all point to the pack blob)
-    // branch_ref → pack_hash (read path detects PNPK and extracts commit+manifest)
+        // Encode as PondPack (commit + manifest combined) → saves 1 S3 PUT
+        let pack_bytes = pond_pack::encode_pack(&commit_obj, &manifest_bytes, None);
+        let candidate = kernel.write(&pack_bytes)
+            .map_err(|e| format!("Failed to write PondPack: {}", e))?;
+
+        let won = kernel.reference_if(&b_ref, parent.as_deref(), &candidate)
+            .map_err(|e| format!("Failed to CAS branch ref: {}", e))?;
+        if won {
+            pack_hash = Some(candidate);
+            break;
+        }
+        // Lost the race — HEAD moved under us. Retry against the new HEAD.
+    }
+    let pack_hash = pack_hash.ok_or_else(|| {
+        format!("Lost {} concurrent-writer races on '{}' — retry the write", MAX_CAS_ATTEMPTS, b_ref)
+    })?;
+
+    // Derived refs (legacy/compat readers): the branch ref is authoritative
+    // for the read path; these are refreshed only AFTER winning the CAS so
+    // they can never claim a commit that lost the linearization point.
     // manifest_ref → pack_hash (load_manifest in branch.rs handles PNPK)
-    kernel.reference(&branch_ref(collection, active_branch), &pack_hash)
-        .map_err(|e| format!("Failed to update branch ref: {}", e))?;
     kernel.reference(&manifest_ref(collection, active_branch), &pack_hash)
         .map_err(|e| format!("Failed to update manifest ref: {}", e))?;
     let _ = kernel.reference(collection, &pack_hash);
@@ -1201,7 +1228,7 @@ mod tests {
         let manifest_bytes = kernel.read_blob(&commit_obj.manifest).unwrap();
         let manifest = CollectionManifest::decode(&manifest_bytes).unwrap();
         let slab_hash = manifest.row_groups[0].blob_hash.clone();
-        let header = kernel.read_blob_range(&slab_hash, 0, 6).unwrap();
+        let header = kernel.read_blob_range(&slab_hash, 0, slab::PSLB_HEADER_LEN as u64).unwrap();
         assert_eq!(&header[0..4], slab::PSLB_MAGIC);
         assert_ne!(header[5] & slab::PSLB_FLAG_HAS_BLOOM, 0,
             "production slab writes must embed a bloom filter");
@@ -1444,6 +1471,98 @@ mod tests {
         let cols = crate::read::read_rows_i64(kernel, "chain_test", "main", None, None).unwrap();
         let id_col = cols.iter().find(|(n, _)| n == "id").unwrap();
         assert_eq!(id_col.1.len(), 2, "HEAD should have 2 rows from second commit");
+    }
+
+    #[test]
+    fn test_reference_if_cas_semantics() {
+        // Deterministic CAS semantics on LocalFS (the S3/R2 If-Match /
+        // If-None-Match paths are exercised end-to-end by the moto + R2
+        // suites through write_rows' CAS commit loop).
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        let c1 = write_rows(kernel, "cas_sem", "main",
+            &[("id", TypedColumn::Int64(vec![1i64]))], "c1").unwrap();
+        let c2 = write_rows(kernel, "cas_sem", "main",
+            &[("id", TypedColumn::Int64(vec![2i64]))], "c2").unwrap();
+        let b_ref = branch_ref("cas_sem", "main");
+        assert_eq!(kernel.resolve(&b_ref), Some(c2.clone()));
+
+        // Stale writer (holds the pre-c2 view): CAS must FAIL and leave
+        // HEAD untouched — this is the guard against lost updates.
+        let won = kernel.reference_if(&b_ref, Some(&c1), &c1).unwrap();
+        assert!(!won, "stale CAS must lose");
+        assert_eq!(kernel.resolve(&b_ref), Some(c2.clone()), "HEAD unchanged after lost CAS");
+
+        // Fresh writer (current HEAD as expected): CAS wins.
+        let won = kernel.reference_if(&b_ref, Some(&c2), &c1).unwrap();
+        assert!(won, "fresh CAS must win");
+        assert_eq!(kernel.resolve(&b_ref), Some(c1.clone()));
+
+        // Expected=Some(h) but ref absent → fail (no false create).
+        let won = kernel.reference_if(&branch_ref("cas_sem", "ghost"), Some(&c1), &c2).unwrap();
+        assert!(!won, "CAS with expected-value on absent ref must fail");
+
+        // Expected=None → create-if-absent only.
+        let fresh = branch_ref("cas_fresh", "main");
+        let won = kernel.reference_if(&fresh, None, &c1).unwrap();
+        assert!(won, "create-if-absent on fresh ref must win");
+        let won = kernel.reference_if(&fresh, None, &c2).unwrap();
+        assert!(!won, "create-if-absent must LOSE when the ref already exists");
+        assert_eq!(kernel.resolve(&fresh), Some(c1), "existing binding survives failed create");
+    }
+
+    #[test]
+    fn test_write_rows_concurrent_threads_all_succeed() {
+        // Behavioral smoke: N threads commit to the same collection through
+        // the CAS loop. Every write must return Ok (retries converge), the
+        // final HEAD must resolve, and the chain must be walkable. On
+        // LocalFS put_path_if is read-check-write (non-atomic), so a truly
+        // simultaneous check window can still orphan a commit — the atomic
+        // guarantee lives in the S3/R2 If-Match path; this test proves the
+        // loop itself never wedges, errors, or corrupts state under races.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(UnifiedStorage::new_local(dir.path()).unwrap());
+        let kernel = storage.kernel();
+        let ok_count = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for t in 0..4i64 {
+            let storage = Arc::clone(&storage);
+            let ok_count = Arc::clone(&ok_count);
+            handles.push(std::thread::spawn(move || {
+                let k = storage.kernel();
+                let h = write_rows(k, "cas_threads", "main",
+                    &[("id", TypedColumn::Int64(vec![t])), ("t", TypedColumn::Int64(vec![t]))],
+                    &format!("thread {}", t)).unwrap();
+                ok_count.fetch_add(1, Ordering::SeqCst);
+                h
+            }));
+        }
+        let mut hashes = Vec::new();
+        for h in handles {
+            hashes.push(h.join().expect("writer thread must not panic"));
+        }
+        assert_eq!(ok_count.load(Ordering::SeqCst), 4, "all concurrent writes must succeed");
+
+        // HEAD resolves and is one of the commits.
+        let head = kernel.resolve(&branch_ref("cas_threads", "main")).expect("HEAD must resolve");
+        assert!(hashes.contains(&head));
+
+        // The chain from HEAD is walkable and terminates (no cycles).
+        let mut cur = Some(head);
+        let mut hops = 0;
+        while let Some(h) = cur {
+            let c = commit::read_commit(kernel, &h).expect("commit must be readable");
+            cur = c.parent;
+            hops += 1;
+            assert!(hops < 100, "commit chain must terminate (possible cycle)");
+        }
+        assert!(hops >= 1);
     }
 
 }

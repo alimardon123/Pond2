@@ -1090,15 +1090,28 @@ impl ObjectStore for S3ObjectStore {
                 }
             }
         } else {
-            // No expected_hash: unconditional put (1 RTT)
+            // No expected_hash: CREATE-IF-ABSENT via If-None-Match: *.
+            // S3/R2 return 412 if the key already exists — closing the
+            // lost-update hole for the FIRST commit on a fresh collection
+            // (two concurrent writers both see None; the old unconditional
+            // PUT let the second silently overwrite the first).
+            // Supported by AWS S3 (Dec 2024+), Cloudflare R2, and moto 5.0.20+.
             let body = format!(r#"{{"hash":"{}"}}"#, new_hash).into_bytes();
-            match self.s3_request("PUT", &key, None, Some(&body), &[]) {
+            let extra = vec![("If-None-Match".to_string(), "*".to_string())];
+            match self.s3_request("PUT", &key, None, Some(&body), &extra) {
                 Ok(_) => {
                     let mut s = self.stats.lock().unwrap();
                     s.puts += 1;
                     Ok(true)
                 }
-                Err(e) => Err(e),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("412") || msg.contains("Precondition Failed") {
+                        Ok(false)
+                    } else {
+                        Err(e)
+                    }
+                }
             }
         }
     }
