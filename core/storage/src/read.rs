@@ -123,7 +123,10 @@ fn slab_bloom_should_skip(
     }
 
     // Read slab header (10 bytes) to check magic + PSLB_FLAG_HAS_BLOOM.
-    let header = match kernel.read_blob_range(slab_hash, 0, 10) {
+    // Canonical header read: ALWAYS [0, PSLB_HEADER_LEN) so the block-cache
+    // key matches the compression-flag read in
+    // read_rgs_slab_aware_with_decompress_inner (one GET + one cache entry).
+    let header = match kernel.read_blob_range(slab_hash, 0, crate::slab::PSLB_HEADER_LEN as u64) {
         Ok(h) if h.len() >= 6 => h,
         _ => return false, // Can't read — don't prune (safe)
     };
@@ -216,10 +219,13 @@ fn read_rgs_slab_aware_with_decompress_inner(
     let mut slab_compressed: HashMap<String, bool> = HashMap::new();
     for (hash, _, _) in &slab_ranges {
         if !slab_compressed.contains_key(hash) {
-            let header = kernel.read_blob_range(hash, 0, 6)
+            // Same canonical range as slab_bloom_should_skip — shares the
+            // block-cache entry instead of minting a second [0,6) GET.
+            let header = kernel.read_blob_range(hash, 0, crate::slab::PSLB_HEADER_LEN as u64)
                 .map_err(|e| format!("Failed to read slab header for {}: {}", hash, e))?;
             slab_compressed.insert(hash.clone(),
-                header.len() >= 6 && &header[0..4] == b"PSLB" && (header[5] & 0x02) != 0);
+                header.len() >= 6 && &header[0..4] == crate::slab::PSLB_MAGIC
+                    && (header[5] & crate::slab::PSLB_FLAG_COMPRESSED) != 0);
         }
     }
 

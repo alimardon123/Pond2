@@ -4935,14 +4935,33 @@ fn guess_mime(name: &str) -> &'static str {
     }
 }
 
-/// Generate a short unique ID for shard names (timestamp-based).
+/// Generate a short unique ID for shard names.
+///
+/// Timestamp + PID + per-process atomic counter, splitmix64-mixed.
+/// The old timestamp-only version could COLLIDE across processes or
+/// threads on VMs with coarse clock steps (100ns-15ms granularity):
+/// two shards minted in the same nanosecond silently overwrite each
+/// other in the shards/ namespace (lost CRDT update). CRDT merge is
+/// commutative and dedups by _rowid/_version, so the id needs
+/// UNIQUENESS only — no ordering is derived from shard names.
 fn chrono_like_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
+        .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    format!("{:016x}", ts)
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id() as u64;
+
+    let mut z = ts ^ (seq.wrapping_mul(0x9E37_79B9_7F4A_7C15)) ^ (pid << 32);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    format!("{:016x}", z)
 }
 
 /// CRDT merge: dedup by _rowid, latest _version wins, tombstones suppress.
@@ -5349,13 +5368,19 @@ fn read_collection_as_json_rows_filtered(
     // Shards are JSON — no columnar filter possible (they're already JSON)
     let (_, shards) = shard::read_with_shards(kernel, collection, &active);
     for (_, shard_hash) in shards {
-        if let Ok(data) = kernel.read_blob(&shard_hash) {
-            if let Ok(arr) = serde_json::from_slice::<Vec<JsonValue>>(&data) {
-                for row in arr {
-                    let rowid = determine_rowid(&row, key_fields);
-                    rows.push((rowid, row));
-                }
-            }
+        // Propagate shard read/parse failures: silently skipping a shard on a
+        // transient S3 500/429 returned QUIETLY INCOMPLETE results (missing
+        // rows, no signal). Shard blobs are content-addressed and referenced
+        // only after a full write, so a read failure is transient — the
+        // caller must see it and retry.
+        let data = kernel
+            .read_blob(&shard_hash)
+            .map_err(|e| format!("Failed to read shard blob {}: {}", shard_hash, e))?;
+        let arr: Vec<JsonValue> = serde_json::from_slice(&data)
+            .map_err(|e| format!("Failed to parse shard blob {}: {}", shard_hash, e))?;
+        for row in arr {
+            let rowid = determine_rowid(&row, key_fields);
+            rows.push((rowid, row));
         }
     }
 

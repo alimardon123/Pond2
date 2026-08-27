@@ -1217,13 +1217,19 @@ fn read_collection_as_json_rows(
     // --- Read shard data (CRDT) ---
     let (_, shards) = shard::read_with_shards(kernel, collection, &active);
     for (_, shard_hash) in shards {
-        if let Ok(data) = kernel.read_blob(&shard_hash) {
-            if let Ok(arr) = serde_json::from_slice::<Vec<JsonValue>>(&data) {
-                for row in arr {
-                    let rowid = determine_rowid(&row, key_fields);
-                    rows.push((rowid, row));
-                }
-            }
+        // Propagate shard read/parse failures: silently skipping a shard on a
+        // transient S3 500/429 returned QUIETLY INCOMPLETE results (missing
+        // rows, no signal). Shard blobs are content-addressed and referenced
+        // only after a full write, so a read failure is transient — the
+        // caller must see it and retry.
+        let data = kernel
+            .read_blob(&shard_hash)
+            .map_err(|e| format!("Failed to read shard blob {}: {}", shard_hash, e))?;
+        let arr: Vec<JsonValue> = serde_json::from_slice(&data)
+            .map_err(|e| format!("Failed to parse shard blob {}: {}", shard_hash, e))?;
+        for row in arr {
+            let rowid = determine_rowid(&row, key_fields);
+            rows.push((rowid, row));
         }
     }
 

@@ -96,7 +96,7 @@ pub const PSLB_VERSION: u8 = 1;
 const PSLB_FLAG_HAS_FOOTER: u8 = 0x01;
 /// Flag bit1: per-RG payloads are zstd-compressed.
 /// Reader must decompress each range-read result before PND2 decode.
-const PSLB_FLAG_COMPRESSED: u8 = 0x02;
+pub const PSLB_FLAG_COMPRESSED: u8 = 0x02;
 /// Flag bit2: slab footer includes a bloom filter section for point-lookup pruning.
 pub const PSLB_FLAG_HAS_BLOOM: u8 = 0x04;
 /// ZSTD compression level for slabs. Level 3 gives 3-5x ratio at ~500 MB/s encode speed.
