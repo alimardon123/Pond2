@@ -10,9 +10,10 @@ name = "pond"                # import pond from Python
 crate-type = ["cdylib"]      # produces pond.so / .pyd / .dylib
 
 [features]
-default = ["s3", "zstd"]
+default = ["s3", "zstd", "cache"]
 s3 = ["dep:pond_s3"]
 zstd = ["pond_core/zstd"]
+cache = ["dep:pond_cache"]
 
 [dependencies]
 pond_core = { path = "../../../core/codec", features = ["zstd"] }
@@ -20,6 +21,7 @@ pond_kernel = { path = "../../../core/kernel" }
 pond_storage = { path = "../../../core/storage" }
 pond_sql = { path = "../../../core/sql" }
 pond_s3 = { path = "../../../core/s3", optional = true }
+pond_cache = { path = "../../../core/cache", optional = true }
 pond_ivf_index = { path = "../../../extensions/indexes/ivf/rust" }
 pond_hnsw_index = { path = "../../../extensions/indexes/hnsw/rust" }
 pond_simple_index = { path = "../../../extensions/indexes/simple/rust" }

@@ -139,6 +139,42 @@ pub struct CachingObjectStore {
     in_flight: Mutex<std::collections::HashMap<String, Arc<(Mutex<InFlight>, Condvar)>>>,
 }
 
+// ---------------------------------------------------------------------------
+// Cache-dir resolution for entry points (CLI, pyo3 bindings)
+// ---------------------------------------------------------------------------
+
+/// Resolve the local disk-cache directory for an entry point (CLI / pyo3).
+///
+/// Resolution order:
+///   1. `explicit` override (e.g. the `cache_dir=` kwarg from Python),
+///   2. the `POND_CACHE_DIR` environment variable,
+///   3. default: `$HOME/.pond_cache` (or the temp dir if HOME is unset).
+///
+/// Caching is DISABLED (returns `None`) when the effective value is empty,
+/// `"off"`, or `"none"` — set `POND_CACHE_DIR=off` to opt out.
+///
+/// This is what connects the 3-tier cache (memory → disk → S3) to every
+/// production entry point, so warm reads are served in µs–ms instead of
+/// paying 50–300ms S3 RTTs.
+pub fn resolve_cache_dir(explicit: Option<&str>) -> Option<PathBuf> {
+    let raw: Option<String> = explicit
+        .map(str::to_string)
+        .or_else(|| std::env::var("POND_CACHE_DIR").ok());
+    match raw.as_deref() {
+        None => Some(default_cache_root()),
+        Some("") | Some("off") | Some("none") => None,
+        Some(dir) => Some(PathBuf::from(dir)),
+    }
+}
+
+/// Default cache root: `$HOME/.pond_cache`, falling back to the temp dir.
+fn default_cache_root() -> PathBuf {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => PathBuf::from(home).join(".pond_cache"),
+        _ => std::env::temp_dir().join("pond-cache"),
+    }
+}
+
 impl CachingObjectStore {
     /// Create a new CachingObjectStore wrapping `inner`.
     ///
@@ -399,6 +435,14 @@ impl ObjectStore for CachingObjectStore {
             self.maybe_insert_mem_cache(hash, data.clone());
         }
 
+        // Keep the result for our own return before moving it into the
+        // waiter slot (io::Error is not Clone — rebuild it from kind+msg,
+        // the same downconversion the waiter path itself already uses).
+        let return_result: io::Result<Vec<u8>> = match &fetch_result {
+            Ok(data) => Ok(data.clone()),
+            Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+        };
+
         // Wake up all waiters and clean up the in-flight entry.
         {
             let entry = {
@@ -411,8 +455,13 @@ impl ObjectStore for CachingObjectStore {
             cvar.notify_all();
         }
 
-        // Read from disk cache (populated above) or return error.
-        self.read_blob_from_disk(hash)
+        // Return the S3 result directly.
+        // (The previous implementation re-read the blob from the disk cache
+        // here — doubling I/O on the hot path AND failing the read when the
+        // disk cache was unwritable (disk full, permissions) even though the
+        // S3 GET had succeeded. The blob is already cached to disk + memory
+        // above; the fetch result is authoritative.)
+        return_result
     }
 
     fn put_path(&self, path: &str, hash: &str) -> io::Result<()> {
@@ -548,6 +597,35 @@ impl ObjectStore for CachingObjectStore {
                 return Ok(arc_data.to_vec());
             }
             return Ok(arc_data[len - n as usize..].to_vec());
+        }
+        // ── DISK CACHE TIER: seek to the tail of the cached file. ──
+        // Serves warm slab-tail reads (footer/bloom lookups) from local disk
+        // in ~50µs instead of a 50-300ms S3 GET. Uses SeekFrom::End so only
+        // the requested tail bytes are read — never the whole file.
+        let path = self.blob_path(hash);
+        if path.exists() {
+            use std::io::{Read, Seek, SeekFrom};
+            if let Ok(mut file) = fs::File::open(&path) {
+                if let Ok(meta) = file.metadata() {
+                    let take = n.min(meta.len());
+                    if take > 0
+                        && file.seek(SeekFrom::End(-(take as i64))).is_ok()
+                    {
+                        let mut buf = Vec::with_capacity(take as usize);
+                        if file.read_to_end(&mut buf).is_ok() {
+                            // Promote in disk LRU so hot slab tails keep
+                            // recency (same policy as full-blob disk hits).
+                            self.access_order.lock().unwrap().put(
+                                hash.to_string(),
+                                DiskEntry { bytes: meta.len() as usize },
+                            );
+                            return Ok(buf);
+                        }
+                    } else if take == 0 {
+                        return Ok(Vec::new());
+                    }
+                }
+            }
         }
         // Delegate to inner for native suffix read (S3 bytes=-N, LocalFS SeekFrom::End).
         self.inner.get_blob_suffix(hash, n)
@@ -1241,5 +1319,61 @@ mod tests {
         // The hash tracker should be clean.
         let hashes = store.block_cache_hashes.lock().unwrap();
         assert!(!hashes.contains(&hash));
+    }
+
+    #[test]
+    fn test_resolve_cache_dir_explicit_and_env() {
+        // Explicit override wins.
+        assert_eq!(
+            resolve_cache_dir(Some("/tmp/pond-explicit")),
+            Some(PathBuf::from("/tmp/pond-explicit"))
+        );
+        // Sentinel values disable caching.
+        assert_eq!(resolve_cache_dir(Some("off")), None);
+        assert_eq!(resolve_cache_dir(Some("none")), None);
+        assert_eq!(resolve_cache_dir(Some("")), None);
+        // Env var is consulted when no explicit value is given.
+        std::env::set_var("POND_CACHE_DIR", "/tmp/pond-env-cache");
+        assert_eq!(
+            resolve_cache_dir(None),
+            Some(PathBuf::from("/tmp/pond-env-cache"))
+        );
+        // Explicit "off" wins over the env var.
+        assert_eq!(resolve_cache_dir(Some("off")), None);
+        std::env::remove_var("POND_CACHE_DIR");
+        // Default (no explicit, no env) is SOME cache dir — the cache is
+        // the product, not an option.
+        assert!(resolve_cache_dir(None).is_some());
+    }
+
+    #[test]
+    fn test_get_blob_suffix_served_from_disk_tier() {
+        // A blob too large for the mem cache lands on disk. With the inner
+        // store DELETED, a suffix read must still succeed from the local
+        // disk cache (seek-to-tail), instead of paying an S3 RTT.
+        let inner_dir = tempdir().unwrap();
+        let cache_dir = tempdir().unwrap();
+        let inner: Box<dyn ObjectStore> = Box::new(
+            LocalFSObjectStore::new(inner_dir.path()).unwrap(),
+        );
+        let store = CachingObjectStore::new(inner, cache_dir.path())
+            .unwrap()
+            .with_skip_mem_cache_threshold(100); // blob below skips mem tier
+
+        let data: Vec<u8> = (0u8..200).collect();
+        let h = store.put_blob(&data).unwrap();
+
+        // Remove the blob from the INNER store — the disk cache is now
+        // the only tier that can serve this blob.
+        let inner_blob = inner_dir.path().join("blobs").join(&h[..2]).join(&h);
+        std::fs::remove_file(inner_blob).unwrap();
+
+        let suffix = store.get_blob_suffix(&h, 50).unwrap();
+        assert_eq!(suffix, &data[150..],
+            "suffix must be served from the disk cache (seek-to-tail)");
+
+        // n larger than the blob → whole blob (mirrors mem-tier semantics).
+        let whole = store.get_blob_suffix(&h, 1000).unwrap();
+        assert_eq!(whole, data);
     }
 }

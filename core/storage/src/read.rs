@@ -154,10 +154,12 @@ fn slab_bloom_should_skip(
 
     // Read footer: from footer_offset to EOF.
     // read_blob_range clamps `end` to file length on all backends,
-    // so footer_offset + 1MB safely reads footer + tail.
+    // so footer_offset + 2MB safely reads footer + tail.
     // decode_slab_footer has strict bounds checking — extra bytes (tail)
     // at the end are ignored after parsing n_entries + optional bloom.
-    const MAX_FOOTER_READ: u64 = 1_048_576; // 1 MB — covers ~2000 entries × 10 cols
+    // 2 MB covers ~1024 RG entries × 100 cols (~1 MB) + the 512 KB
+    // bloom bitset ceiling (SLAB_BLOOM_CAPACITY in write.rs) with headroom.
+    const MAX_FOOTER_READ: u64 = 2 * 1_048_576; // 2 MB — entries + bloom
     let footer_raw = match kernel.read_blob_range(slab_hash, footer_offset, footer_offset + MAX_FOOTER_READ) {
         Ok(f) if !f.is_empty() => f,
         _ => return false,
@@ -731,34 +733,17 @@ pub fn read_rows_i64(
     let head = kernel.resolve(&branch_ref(collection, branch))
         .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
 
-    // Check if HEAD is a PondPack blob.
-    // Optimization (G6): first fetch only 4 bytes to check the magic,
-    // avoiding a full GET for the common case (plain commit JSON,
-    // typically ~200 bytes). PondPack blobs have PNPK magic at offset 0.
-    let head_magic = kernel.read_blob_range(&head, 0, 4)
-        .map_err(|e| format!("Failed to read HEAD magic: {}", e))?;
-    let is_pack = head_magic.len() >= 4 && &head_magic[..4] == b"PNPK";
-
-    let manifest_bytes = if is_pack {
-        // PondPack — need the full HEAD blob to extract manifest
-        let head_data = kernel.read_blob(&head)
-            .map_err(|e| format!("Failed to read HEAD: {}", e))?;
-        let (commit, manifest_bytes, _inline) = crate::pond_pack::decode_pack(&head_data)
-            .ok_or_else(|| "Failed to decode PondPack".to_string())?;
-        let _ = commit; // commit metadata not needed for read
-        manifest_bytes
-    } else {
-        // Plain commit — read commit JSON (typically ~200 bytes), then manifest
-        let commit = commit::read_commit(kernel, &head)
-            .ok_or_else(|| "Failed to read HEAD commit".to_string())?;
-
-        if commit.manifest.is_empty() {
-            return Err("HEAD commit has no manifest".to_string());
-        }
-
-        kernel.read_blob(&commit.manifest)
-            .map_err(|e| format!("Failed to read manifest: {}", e))?
-    };
+    // Resolve manifest bytes from HEAD in a SINGLE code path.
+    //
+    // The previous "G6 magic optimization" fetched 4 bytes first to peek at
+    // the PNPK magic, then read the full blob in BOTH branches — a pure
+    // +1 S3 GET on every cold read. `commit::resolve_manifest_bytes`
+    // reads the HEAD blob exactly once (commit JSON is ~200 B, PNPK packs
+    // are small too) and fetches the manifest blob only for plain commits:
+    //   plain commit: 2 GETs (HEAD + manifest) — was 3 with the magic peek
+    //   PNPK pack:    1 GET (manifest is inline) — was 2 with the magic peek
+    let manifest_bytes = crate::commit::resolve_manifest_bytes(kernel, &head)
+        .map_err(|e| format!("Failed to resolve manifest from HEAD: {}", e))?;
 
     // Decode manifest (handles v2 flat and v3 tree)
     // Pass predicates for v3 leaf pruning: skip leaves whose key range
@@ -795,46 +780,20 @@ pub fn read_rows_i64(
     // 1. Predicate pruning — collect surviving RGs
     //
     // Two-phase pruning for slab-backed RGs with equality predicates:
-    //   Phase A: Bloom pre-check (slab-level, 2-3 small RTTs per unique slab)
-    //            A bloom miss skips ALL RGs in the slab without zone-map I/O.
-    //   Phase B: Zone-map pruning (per-RG, free — uses manifest stats)
+    //   Phase 1: Zone-map pruning (per-RG, FREE — uses manifest stats, no I/O)
+    //   Phase 2: Bloom pre-check (slab-level, 2-3 small RTTs per unique slab)
+    //            A bloom miss skips ALL RGs in the slab. Run ONLY on slabs
+    //            that still have zone-map survivors — bloom-checking a slab
+    //            whose RGs were already pruned is pure wasted I/O. Checks
+    //            run in parallel (bounded, 32 concurrent) so wall-clock on
+    //            multi-slab queries is ~max(RTT), not sum(RTT).
     //
-    // For standalone RGs and non-equality predicates, only Phase B applies.
-    // For warm queries, Phase A is free (memory cache serves header/tail/footer).
+    // For standalone RGs and non-equality predicates, only Phase 1 applies.
+    // For warm queries, Phase 2 is free (memory cache serves header/tail/footer).
 
-    // Phase A: identify slab hashes to bloom-check
-    let mut bloom_skip_slabs: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if let Some(preds) = predicates {
-        // Convert predicates to (String, String, Vec<u8>) for bloom check
-        let bloom_preds: Vec<(String, String, Vec<u8>)> = preds.iter().map(|(col, op, val)| {
-            (col.to_string(), op.to_string(), val.to_le_bytes().to_vec())
-        }).collect();
-
-        // Collect unique slab hashes that have slab_byte_offset set
-        let mut unique_slab_hashes: Vec<&str> = Vec::new();
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for rg in &manifest.row_groups {
-            if rg.slab_byte_offset.is_some() && seen.insert(&rg.blob_hash) {
-                unique_slab_hashes.push(&rg.blob_hash);
-            }
-        }
-
-        // Bloom-check each unique slab
-        for slab_hash in &unique_slab_hashes {
-            if slab_bloom_should_skip(kernel, slab_hash, &bloom_preds) {
-                bloom_skip_slabs.insert(slab_hash.to_string());
-            }
-        }
-    }
-
-    // Phase B: zone-map pruning + bloom skip
-    let surviving_rgs: Vec<&crate::manifest::RowGroupEntry> = manifest.row_groups.iter()
+    // Phase 1: zone-map pruning (free — manifest stats only)
+    let zone_map_survivors: Vec<&crate::manifest::RowGroupEntry> = manifest.row_groups.iter()
         .filter(|rg| {
-            // Skip RGs in bloom-negative slabs
-            if rg.slab_byte_offset.is_some() && bloom_skip_slabs.contains(&rg.blob_hash) {
-                return false;
-            }
-            // Zone-map pruning (per-RG, uses manifest stats — no I/O)
             if let Some(preds) = predicates {
                 for (col_name, op, value) in preds {
                     if let Some(stats) = rg.columns.iter().find(|c| c.name == *col_name) {
@@ -845,6 +804,69 @@ pub fn read_rows_i64(
                 }
             }
             true
+        })
+        .collect();
+
+    // Phase 2: bloom-check only the slabs that still have zone-map survivors
+    let mut bloom_skip_slabs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(preds) = predicates {
+        let has_eq = preds.iter().any(|(_, op, _)| *op == "=" || *op == "in");
+        if has_eq {
+            // Collect unique slab hashes among zone-map survivors
+            let mut unique_slab_hashes: Vec<&str> = Vec::new();
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for rg in &zone_map_survivors {
+                if rg.slab_byte_offset.is_some() && seen.insert(&rg.blob_hash) {
+                    unique_slab_hashes.push(&rg.blob_hash);
+                }
+            }
+
+            if !unique_slab_hashes.is_empty() {
+                let bloom_preds: Vec<(String, String, Vec<u8>)> = preds.iter().map(|(col, op, val)| {
+                    (col.to_string(), op.to_string(), val.to_le_bytes().to_vec())
+                }).collect();
+
+                // Parallel bloom checks (bounded by MAX_PARALLEL_RANGE_READS=32).
+                // slab_bloom_should_skip is total & monotone: it only ever
+                // returns true when the value is DEFINITELY absent, so
+                // parallel execution preserves semantics exactly.
+                let skip_flags = std::sync::Arc::new(std::sync::Mutex::new(
+                    vec![false; unique_slab_hashes.len()]));
+                std::thread::scope(|s| {
+                    let (tx, rx) = std::sync::mpsc::sync_channel(MAX_PARALLEL_RANGE_READS);
+                    for _ in 0..MAX_PARALLEL_RANGE_READS {
+                        tx.send(()).unwrap();
+                    }
+                    let tx = std::sync::Arc::new(tx);
+                    for (i, slab_hash) in unique_slab_hashes.iter().enumerate() {
+                        rx.recv().unwrap(); // acquire a parallelism permit (blocks at 32)
+                        let tx = std::sync::Arc::clone(&tx);
+                        let flags = std::sync::Arc::clone(&skip_flags);
+                        let hash = *slab_hash;
+                        let preds_ref = &bloom_preds;
+                        s.spawn(move || {
+                            let skip = slab_bloom_should_skip(kernel, hash, preds_ref);
+                            if let Ok(mut f) = flags.lock() {
+                                f[i] = skip;
+                            }
+                            let _ = tx.send(()); // release the permit
+                        });
+                    }
+                });
+                let flags = skip_flags.lock().map_err(|_| "bloom flags mutex poisoned")?;
+                for (slab_hash, &skip) in unique_slab_hashes.iter().zip(flags.iter()) {
+                    if skip {
+                        bloom_skip_slabs.insert(slab_hash.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Final survivors: zone-map pass minus bloom-negative slabs
+    let surviving_rgs: Vec<&crate::manifest::RowGroupEntry> = zone_map_survivors.into_iter()
+        .filter(|rg| {
+            !(rg.slab_byte_offset.is_some() && bloom_skip_slabs.contains(&rg.blob_hash))
         })
         .collect();
 

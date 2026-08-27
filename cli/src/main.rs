@@ -351,15 +351,14 @@ fn describe_storage(url: &str) -> String {
 /// Open a storage backend from a root URL/path.
 ///
 /// Auto-detects:
-///   - `s3://bucket/prefix?...` → S3-compatible storage
-///   - `/path/to/dir` or `.` → local filesystem
+///   - `s3://bucket/prefix?...` → S3-compatible storage (wrapped in the
+///     3-tier cache: memory → local disk → S3; see `POND_CACHE_DIR`)
+///   - `/path/to/dir` or `.` → local filesystem (no cache — already local)
 fn open_storage(root: &str) -> Result<UnifiedStorage, Box<dyn std::error::Error>> {
     if root.starts_with("s3://") {
         #[cfg(feature = "s3")]
         {
-            let store = pond_s3::S3ObjectStore::from_url(root)?;
-            let kernel = PondKernel::new_with_store(Box::new(store));
-            Ok(UnifiedStorage::new(kernel))
+            Ok(UnifiedStorage::new(open_s3_kernel(root)?))
         }
         #[cfg(not(feature = "s3"))]
         {
@@ -373,6 +372,36 @@ fn open_storage(root: &str) -> Result<UnifiedStorage, Box<dyn std::error::Error>
     } else {
         UnifiedStorage::new_local(root).map_err(|e| e.into())
     }
+}
+
+/// Build the kernel for an S3 root, wrapped in the 3-tier cache
+/// (memory → local disk → S3) when caching is enabled.
+///
+/// Cache directory resolution (see `pond_cache::resolve_cache_dir`):
+///   `POND_CACHE_DIR` env var → default `$HOME/.pond_cache`;
+///   `POND_CACHE_DIR=off` (or `none`/empty) disables caching.
+/// If the cache directory cannot be created (read-only home, permissions),
+/// we degrade gracefully to the raw store rather than failing to open —
+/// `S3ObjectStore::from_url` is a pure URL parser, so rebuilding the raw
+/// store after the cache constructor consumed the first one is free.
+#[cfg(feature = "s3")]
+fn open_s3_kernel(root: &str) -> Result<PondKernel, Box<dyn std::error::Error>> {
+    #[cfg(feature = "cache")]
+    {
+        if let Some(dir) = pond_cache::resolve_cache_dir(None) {
+            let store = Box::new(pond_s3::S3ObjectStore::from_url(root)?);
+            return match pond_cache::CachingObjectStore::new(store, &dir) {
+                Ok(cached) => Ok(PondKernel::new_with_store(Box::new(cached))),
+                Err(e) => {
+                    eprintln!("pond: local cache disabled ({e}); using direct storage");
+                    let raw = Box::new(pond_s3::S3ObjectStore::from_url(root)?);
+                    Ok(PondKernel::new_with_store(raw))
+                }
+            };
+        }
+    }
+    let raw = Box::new(pond_s3::S3ObjectStore::from_url(root)?);
+    Ok(PondKernel::new_with_store(raw))
 }
 
 /// Initialize or connect to a Pond repository.

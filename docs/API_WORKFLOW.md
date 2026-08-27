@@ -67,6 +67,26 @@ s = Storage(
 s = Storage('s3://my-bucket/prod?region=us-east-1')
 ```
 
+**S3 reads go through the local smart cache (3 tiers).** Every S3-backed
+`Storage` wraps object storage with an in-memory cache (256 MB), a local
+disk cache (1 GB, LRU-evicted), and in-flight request coalescing — warm
+reads resolve in µs–ms instead of paying 50–300ms S3 round-trips:
+
+```python
+# Cache location (default: ~/.pond_cache):
+s = Storage('s3://my-bucket/prod', cache_dir='/fast-nvme/pond-cache')
+
+# Or via the environment (CLI honors this too):
+#   export POND_CACHE_DIR=/fast-nvme/pond-cache
+
+# Disable the cache entirely:
+s = Storage('s3://my-bucket/prod', cache_dir='off')   # or POND_CACHE_DIR=off
+```
+
+The cache is write-through and content-addressed (blob names are SHA-256
+hashes), so it is always consistent with object storage. Refs (branch
+heads) are cached in-memory with a 5-second TTL for multi-writer safety.
+
 **One `Storage` object serves all workloads.** No per-workload clients,
 no per-format handles. The storage doesn't know or care whether you're
 storing KV pairs, vectors, streaming events, or lakehouse tables.

@@ -534,19 +534,45 @@ pub fn write_rows_i64_slab<'a>(
         .map(|(blob, stats, n_rows)| (blob.clone(), stats.clone(), *n_rows))
         .collect();
 
-    // 3. Encode as PSLB v2 slab (zstd-compressed per-RG)
-    // Compression reduces S3 storage by 3-5x and transfer time proportionally.
-    let slab_bytes = slab::encode_slab_compressed(&slab_inputs);
+    // 3. Encode as PSLB v2 slab (zstd-compressed per-RG), with a bloom
+    //    filter when it fits the size ceiling. Compression reduces S3
+    //    storage by 3-5x and transfer time proportionally. The bloom
+    //    (exact-sized from the raw column values still in scope) lets
+    //    equality queries skip this entire slab in 1-3 small RTTs on the
+    //    read side — previously blooms were only written by tests, so
+    //    production slabs paid a header RTT per slab for nothing.
+    //    If the element count exceeds SLAB_BLOOM_CAPACITY, the bitset
+    //    would exceed the read path's footer window and saturate to
+    //    ~100% FP — skip it and rely on zone-map pruning instead.
+    let mut bloom_cols: std::collections::HashMap<&str, Vec<Vec<u8>>> = std::collections::HashMap::new();
+    let mut total_elements: usize = 0;
+    for rg in row_groups {
+        for (name, values) in rg.iter() {
+            bloom_cols.entry(name).or_default()
+                .extend(values.iter().map(|v| v.to_le_bytes().to_vec()));
+            total_elements += values.len();
+        }
+    }
+    let (slab_bytes, has_bloom) = if total_elements <= SLAB_BLOOM_CAPACITY {
+        let bloom_col_refs: Vec<(&str, &[Vec<u8>])> = bloom_cols.iter()
+            .map(|(name, vals)| (*name, vals.as_slice()))
+            .collect();
+        let bloom = slab::build_bloom(&bloom_col_refs);
+        (slab::encode_slab_compressed_with_bloom(&slab_inputs, &bloom), true)
+    } else {
+        (slab::encode_slab_compressed(&slab_inputs), false)
+    };
     let slab_hash = kernel.write(&slab_bytes)
         .map_err(|e| format!("Failed to write slab blob: {}", e))?;
 
     // 4. Decode slab footer to get exact byte offsets for each RG
-    //    First get the tail to find footer_offset, then extract footer bytes
+    //    First get the tail to find footer_offset, then extract footer bytes.
+    //    has_bloom matches whether WE embedded a bloom above.
     let tail = slab::decode_slab_tail(&slab_bytes)
         .ok_or_else(|| "Failed to decode slab tail after encode".to_string())?;
     let footer_offset = tail.0 as usize;
     let footer_end = slab_bytes.len() - slab::PSLB_TAIL_LEN;
-    let footer = slab::decode_slab_footer(&slab_bytes[footer_offset..footer_end], false)
+    let footer = slab::decode_slab_footer(&slab_bytes[footer_offset..footer_end], has_bloom)
         .ok_or_else(|| "Failed to decode slab footer after encode".to_string())?;
 
     // 5. Get parent commit
@@ -609,6 +635,14 @@ const SLAB_TARGET_RG_COUNT: usize = 1024;
 /// SLAB_TARGET_RG_COUNT hasn't been reached yet.
 const SLAB_TARGET_BYTES: usize = 128 * 1024 * 1024;
 
+/// Upper bound for the incremental per-slab bloom filter (elements).
+/// 419,430 elements × 10 bits ≈ 4M bits = 512 KB bitset — the largest
+/// bloom that keeps a full footer (entries + bloom) comfortably inside
+/// the read path's MAX_FOOTER_READ window. Past the cap the false-positive
+/// rate grows (bloom filters never false-negative), so pruning stays
+/// CORRECT — just less selective.
+const SLAB_BLOOM_CAPACITY: usize = 419_430;
+
 /// A stateful buffer that accumulates row groups and flushes them as PSLB slabs.
 ///
 /// This is the production write path for high-throughput workloads. Instead of
@@ -638,6 +672,11 @@ pub struct SlabWriter<'a> {
     /// Schema (set on first write, validated on subsequent).
     schema: Option<Vec<(String, u8)>>,
     key_col: Option<String>,
+    /// Incremental bloom over the values buffered for the CURRENT slab.
+    /// Sized adaptively from the first batch (rows × target RG count,
+    /// clamped to [1024, SLAB_BLOOM_CAPACITY]); reset at every flush_slab.
+    /// Enables read-side whole-slab pruning for equality predicates.
+    slab_bloom: Option<crate::bloom::BloomFilter>,
 }
 
 impl<'a> SlabWriter<'a> {
@@ -652,6 +691,7 @@ impl<'a> SlabWriter<'a> {
             completed_rgs: Vec::new(),
             schema: None,
             key_col: None,
+            slab_bloom: None,
         }
     }
 
@@ -693,6 +733,33 @@ impl<'a> SlabWriter<'a> {
                 min, max, null_count: 0 }
         }).collect();
 
+        // Insert values into the incremental slab bloom BEFORE any
+        // auto-flush below — the bloom must cover exactly the RGs that
+        // end up in the current slab.
+        if self.slab_bloom.is_none() {
+            // Adaptive sizing: first batch's (rows × columns) × target RGs
+            // per slab — the bloom hashes EVERY (column, value) pair —
+            // clamped to the 512 KB bitset ceiling. Keeps small workloads
+            // tiny and bounds the footer size at PB scale.
+            let est_elements = (n_rows as usize)
+                .saturating_mul(columns.len().max(1))
+                .saturating_mul(SLAB_TARGET_RG_COUNT);
+            if est_elements <= SLAB_BLOOM_CAPACITY {
+                self.slab_bloom = Some(crate::bloom::BloomFilter::new(
+                    est_elements.max(1024)));
+            }
+            // else: estimated elements exceed the bitset ceiling — the
+            // bloom would saturate to ~100% FP and bloat the footer with
+            // zero pruning power. Skip it; zone-map pruning still applies.
+        }
+        if let Some(ref mut bloom) = self.slab_bloom {
+            for (name, values) in columns {
+                for v in values.iter() {
+                    bloom.insert_col_value(name, &v.to_le_bytes());
+                }
+            }
+        }
+
         self.buffer_bytes += blob.len();
         self.buffer.push((blob, col_stats, n_rows));
 
@@ -709,15 +776,26 @@ impl<'a> SlabWriter<'a> {
     fn flush_slab(&mut self) -> Result<(), String> {
         if self.buffer.is_empty() { return Ok(()); }
 
-        let slab_bytes = slab::encode_slab_compressed(&self.buffer);
+        // Take the incremental bloom covering exactly this slab's RGs.
+        // If it is somehow absent (defensive — every buffered RG inserts
+        // into it), encode WITHOUT a bloom rather than embedding an empty
+        // one: an empty bloom would falsely prune the whole slab on reads.
+        let (slab_bytes, has_bloom) = match self.slab_bloom.take() {
+            Some(bloom) => (
+                slab::encode_slab_compressed_with_bloom(&self.buffer, &bloom),
+                true,
+            ),
+            None => (slab::encode_slab_compressed(&self.buffer), false),
+        };
         let slab_hash = self.kernel.write(&slab_bytes)
             .map_err(|e| format!("SlabWriter: failed to write slab: {}", e))?;
 
         // Decode footer for exact byte offsets
+        // (has_bloom matches whether WE embedded a bloom above.)
         let tail = slab::decode_slab_tail(&slab_bytes)
             .ok_or_else(|| "SlabWriter: slab tail decode failed".to_string())?;
         let footer_end = slab_bytes.len() - slab::PSLB_TAIL_LEN;
-        let footer = slab::decode_slab_footer(&slab_bytes[tail.0 as usize..footer_end], false)
+        let footer = slab::decode_slab_footer(&slab_bytes[tail.0 as usize..footer_end], has_bloom)
             .ok_or_else(|| "SlabWriter: slab footer decode failed".to_string())?;
 
         for (i, (_, col_stats, n_rows)) in self.buffer.iter().enumerate() {
@@ -1095,6 +1173,65 @@ mod tests {
         let cols0 = pond_core::pnd2_decode(&rg_data[0]).unwrap();
         assert_eq!(cols0[0].i64_data, vec![1i64, 2, 3]);
         assert_eq!(cols0[1].i64_data, vec![10i64, 20, 30]);
+    }
+
+    #[test]
+    fn test_write_rows_i64_slab_writes_bloom_and_prunes_correctly() {
+        // Production slabs must carry a bloom filter (header flag set) and
+        // the read path must prune with NO false negatives: an equality
+        // query for a PRESENT value still returns it, and a query for an
+        // ABSENT value returns empty (pruning correctness).
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        let rg1: Vec<(&str, &[i64])> = vec![
+            ("id", &[1i64, 2, 3]),
+            ("val", &[10i64, 20, 30]),
+        ];
+        let rg2: Vec<(&str, &[i64])> = vec![
+            ("id", &[4i64, 5, 6]),
+            ("val", &[40i64, 50, 60]),
+        ];
+        let rgs: Vec<&[(&str, &[i64])]> = vec![&rg1, &rg2];
+        let hash = write_rows_i64_slab(kernel, "slab_bloom", "main", &rgs, "bloom slab").unwrap();
+
+        // 1. The slab blob must have the PSLB bloom flag set.
+        let commit_obj = commit::read_commit(kernel, &hash).unwrap();
+        let manifest_bytes = kernel.read_blob(&commit_obj.manifest).unwrap();
+        let manifest = CollectionManifest::decode(&manifest_bytes).unwrap();
+        let slab_hash = manifest.row_groups[0].blob_hash.clone();
+        let header = kernel.read_blob_range(&slab_hash, 0, 6).unwrap();
+        assert_eq!(&header[0..4], slab::PSLB_MAGIC);
+        assert_ne!(header[5] & slab::PSLB_FLAG_HAS_BLOOM, 0,
+            "production slab writes must embed a bloom filter");
+
+        // 2. Equality query for a PRESENT value → must return it
+        //    (no false-negative pruning through the bloom).
+        let present = crate::read::read_rows_i64(
+            kernel, "slab_bloom", "main", None,
+            Some(&[("id", "=", 4i64)]),
+        ).unwrap();
+        let id_col = present.iter().find(|(n, _)| n == "id")
+            .expect("id column present");
+        assert!(id_col.1.contains(&4), "bloom must not prune a PRESENT value; got {:?}",
+            id_col.1);
+
+        // 3. Equality query for an ABSENT value → empty result
+        //    (the bloom legitimately prunes the whole slab).
+        let absent = crate::read::read_rows_i64(
+            kernel, "slab_bloom", "main", None,
+            Some(&[("id", "=", 9999i64)]),
+        ).unwrap();
+        let id_absent = absent.iter().find(|(n, _)| n == "id")
+            .expect("id column present (empty)");
+        assert!(id_absent.1.is_empty(),
+            "absent value must return no rows; got {:?}", id_absent.1);
+
+        // 4. Full read (no predicates) → all 6 rows intact.
+        let all = crate::read::read_rows_i64(kernel, "slab_bloom", "main", None, None).unwrap();
+        let id_all = all.iter().find(|(n, _)| n == "id").unwrap();
+        assert_eq!(id_all.1.len(), 6, "full read must return all rows");
     }
     #[test]
     fn test_slab_writer_single_batch() {

@@ -1362,6 +1362,39 @@ fn build_s3_url(
     url
 }
 
+/// Build the kernel for an S3 URL, wrapped in the 3-tier smart cache
+/// (memory → local disk → S3) when the `cache` feature is enabled.
+///
+/// Cache directory resolution (see `pond_cache::resolve_cache_dir`):
+///   1. explicit `cache_dir` kwarg (Python-side control),
+///   2. `POND_CACHE_DIR` environment variable,
+///   3. default `$HOME/.pond_cache` (or temp dir).
+///
+/// Disable with `cache_dir='off'` / `'none'` / `''` or `POND_CACHE_DIR=off`.
+///
+/// This is what makes warm reads single-digit-ms: refs and hot blobs are
+/// served from memory/disk instead of paying 50-300ms S3 RTTs.
+/// If the cache directory cannot be created, degrade gracefully to the raw
+/// store (`S3ObjectStore::from_url` is a pure URL parser — rebuilding the
+/// store after the cache constructor consumed the first one is free).
+#[cfg(all(feature = "s3", feature = "cache"))]
+fn s3_kernel_cached(url: &str, cache_dir: Option<&str>) -> PyResult<PondKernel> {
+    let py_err = |e: std::io::Error| pyo3::exceptions::PyIOError::new_err(e.to_string());
+    if let Some(dir) = pond_cache::resolve_cache_dir(cache_dir) {
+        let store = pond_s3::S3ObjectStore::from_url(url).map_err(py_err)?;
+        return match pond_cache::CachingObjectStore::new(Box::new(store), &dir) {
+            Ok(cached) => Ok(PondKernel::new_with_store(Box::new(cached))),
+            Err(e) => {
+                eprintln!("pond: local cache disabled ({e}); using direct storage");
+                let raw = pond_s3::S3ObjectStore::from_url(url).map_err(py_err)?;
+                Ok(PondKernel::new_with_store(Box::new(raw)))
+            }
+        };
+    }
+    let raw = pond_s3::S3ObjectStore::from_url(url).map_err(py_err)?;
+    Ok(PondKernel::new_with_store(Box::new(raw)))
+}
+
 /// A Pond storage handle backed by the Rust UnifiedStorage.
 ///
 /// This is the Python-facing wrapper around `pond_storage::UnifiedStorage`.
@@ -1412,13 +1445,14 @@ impl Storage {
     /// For S3, you can also pass credentials as optional kwargs:
     ///   `Storage('s3://...', access_key='...', secret_key='...')`
     #[new]
-    #[pyo3(signature = (location, access_key=None, secret_key=None, region=None, endpoint=None))]
+    #[pyo3(signature = (location, access_key=None, secret_key=None, region=None, endpoint=None, cache_dir=None))]
     fn new(
         location: &str,
         access_key: Option<&str>,
         secret_key: Option<&str>,
         region: Option<&str>,
         endpoint: Option<&str>,
+        cache_dir: Option<&str>,
     ) -> PyResult<Self> {
         if location.starts_with("s3://") {
             // S3-compatible storage
@@ -1431,9 +1465,17 @@ impl Storage {
                     std::env::set_var("AWS_ACCESS_KEY_ID", ak);
                     std::env::set_var("AWS_SECRET_ACCESS_KEY", sk);
                 }
-                let store = pond_s3::S3ObjectStore::from_url(&url)
-                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-                let kernel = PondKernel::new_with_store(Box::new(store));
+                // Wrap with the 3-tier smart cache (memory → disk → S3)
+                // when the `cache` feature is on. Warm reads become
+                // single-digit-ms instead of 50-300ms S3 RTTs.
+                #[cfg(feature = "cache")]
+                let kernel = s3_kernel_cached(&url, cache_dir)?;
+                #[cfg(not(feature = "cache"))]
+                let kernel = {
+                    let store = pond_s3::S3ObjectStore::from_url(&url)
+                        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+                    PondKernel::new_with_store(Box::new(store))
+                };
                 let storage = UnifiedStorage::new(kernel);
                 Ok(Self {
                     storage: Arc::new(Mutex::new(storage)),
@@ -1449,6 +1491,8 @@ impl Storage {
             }
         } else {
             // Local filesystem
+            // (Silence unused-param when built without the s3 feature.)
+            let _ = cache_dir;
             let path = location.strip_prefix("file://").unwrap_or(location);
             let storage = UnifiedStorage::new_local(path)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
@@ -1464,12 +1508,19 @@ impl Storage {
     ///
     /// This is a convenience method — equivalent to `Storage('s3://...')`.
     /// Kept for explicit clarity, but `Storage()` auto-detects S3 URLs.
+    /// Uses the 3-tier smart cache (see `POND_CACHE_DIR` / `s3_kernel_cached`).
     #[cfg(feature = "s3")]
     #[staticmethod]
-    fn from_s3(url: &str) -> PyResult<Self> {
-        let store = pond_s3::S3ObjectStore::from_url(url)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
-        let kernel = PondKernel::new_with_store(Box::new(store));
+    #[pyo3(signature = (url, cache_dir=None))]
+    fn from_s3(url: &str, cache_dir: Option<&str>) -> PyResult<Self> {
+        #[cfg(feature = "cache")]
+        let kernel = s3_kernel_cached(url, cache_dir)?;
+        #[cfg(not(feature = "cache"))]
+        let kernel = {
+            let store = pond_s3::S3ObjectStore::from_url(url)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            PondKernel::new_with_store(Box::new(store))
+        };
         let storage = UnifiedStorage::new(kernel);
         Ok(Self {
             storage: Arc::new(Mutex::new(storage)),
@@ -5690,7 +5741,7 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let dir = make_temp_dir();
-            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+            let storage = Storage::new(&dir, None, None, None, None, None).unwrap();
 
             // Write test data: alice(25), bob(15), carol(30)
             storage
@@ -5749,7 +5800,7 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let dir = make_temp_dir();
-            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+            let storage = Storage::new(&dir, None, None, None, None, None).unwrap();
 
             // Write test data with various names
             storage
@@ -5799,7 +5850,7 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let dir = make_temp_dir();
-            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+            let storage = Storage::new(&dir, None, None, None, None, None).unwrap();
 
             // Write test data
             storage
@@ -5856,7 +5907,7 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let dir = make_temp_dir();
-            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+            let storage = Storage::new(&dir, None, None, None, None, None).unwrap();
 
             storage
                 .write_rows(
@@ -5915,7 +5966,7 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let dir = make_temp_dir();
-            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+            let storage = Storage::new(&dir, None, None, None, None, None).unwrap();
 
             // No policy initially
             assert_eq!(storage.get_rls_policy("users"), None);
@@ -5940,7 +5991,7 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let dir = make_temp_dir();
-            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+            let storage = Storage::new(&dir, None, None, None, None, None).unwrap();
 
             // Set RLS policy
             storage.set_rls_policy("users", "tenant_A").unwrap();
@@ -5983,7 +6034,7 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let dir = make_temp_dir();
-            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+            let storage = Storage::new(&dir, None, None, None, None, None).unwrap();
 
             // Write rows with explicit _tenant values (no policy → no auto-add,
             // we provide _tenant manually)
@@ -6044,7 +6095,7 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let dir = make_temp_dir();
-            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+            let storage = Storage::new(&dir, None, None, None, None, None).unwrap();
 
             // Write all rows at once with explicit _tenant values
             storage
@@ -6116,7 +6167,7 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let dir = make_temp_dir();
-            let storage = Storage::new(&dir, None, None, None, None).unwrap();
+            let storage = Storage::new(&dir, None, None, None, None, None).unwrap();
 
             // Set policy and write
             storage.set_rls_policy("users", "tenant_X").unwrap();

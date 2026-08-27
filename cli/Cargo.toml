@@ -10,10 +10,13 @@ name = "pond"
 path = "src/main.rs"
 
 [features]
-default = ["s3"]
+default = ["s3", "cache"]
 # S3 support (enabled by default). Disable with --no-default-features to
 # build a local-only CLI without the pond_s3 dependency.
 s3 = ["dep:pond_s3"]
+# Local disk+memory cache tier for S3 reads (enabled by default).
+# Warm reads are served in µs–ms instead of 50–300ms S3 RTTs.
+cache = ["dep:pond_cache"]
 
 [dependencies]
 pond_kernel = { path = "../core/kernel" }
@@ -21,6 +24,7 @@ pond_storage = { path = "../core/storage" }
 pond_core = { path = "../core/codec", features = ["zstd"] }
 pond_sql = { path = "../core/sql" }
 pond_s3 = { path = "../core/s3", optional = true }
+pond_cache = { path = "../core/cache", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
