@@ -6700,3 +6700,67 @@ Stage Summary:
   4. Write buffering + batch flush for small writes (arch #9)
   5. Ref update race condition fix (CAS via If-Match ETag)
   6. Rust proptest suite (currently ZERO — critical gap)
+
+---
+Task ID: cron-2026-08-27-2144
+Agent: autonomous-cron (main orchestrator + architecture review subagent)
+Task: Wire the 3-tier cache into production entry points; fix G6 extra GET; zone-map-first parallel bloom pruning; bloom-on-write for production slabs
+
+Work Log:
+- Fresh clone (sandbox reset): cloned origin/main at 366efb6; CI run 33031363981 on HEAD = SUCCESS (7/7 jobs)
+- Verified P0 compact_after_commit bug (keyvalue_lens.py:111) — still fixed (default False)
+- Launched deep architecture review subagent (veteran systems architect lens): score 54/100
+  KEY FINDING: the entire performance stack was UNWIRED from production —
+  CachingObjectStore had zero production callers (pyo3 lib.rs:1436,1472; cli main.rs:361
+  wrapped raw S3ObjectStore), G6 magic peek added +1 GET on EVERY cold read,
+  bloom filters were write-side fiction (encode_slab_compressed never set the flag),
+  bloom checks ran sequentially over ALL slabs BEFORE free zone-map pruning
+- Fixed cache get_blob: return the S3 fetch result directly (was re-reading from disk
+  after a successful fetch — doubled I/O and failed reads on unwritable disk)
+- Fixed cache get_blob_suffix: added disk-cache tier with seek-to-tail (never full-file)
+  — warm slab-tail/bloom/footer reads stop hitting S3
+- Added pond_cache::resolve_cache_dir (explicit > POND_CACHE_DIR env > ~/.pond_cache;
+  "off"/"none"/"" disables)
+- Wired CachingObjectStore into CLI open_s3_kernel + pyo3 Storage (new cache_dir kwarg
+  on Storage()/from_s3, backward compatible; graceful fallback to raw store if cache
+  dir creation fails — from_url is a pure parser so reconstruction is free)
+- Removed G6 magic pre-GET: read_rows_i64 now uses commit::resolve_manifest_bytes
+  (single HEAD read): plain commit 3→2 GETs, PNPK pack 2→1 GET cold
+- Reordered pruning: zone-map FIRST (free, manifest stats), bloom checks ONLY for
+  slabs with zone-map survivors, in PARALLEL (32-way bounded, thread::scope semaphore)
+- Bloom-on-write: write_rows_i64_slab builds exact-sized bloom from raw column values;
+  SlabWriter maintains incremental per-slab bloom (adaptive sizing rows×cols×1024,
+  512KB bitset ceiling = SLAB_BLOOM_CAPACITY 419,430; skipped when estimate exceeds
+  ceiling — saturating blooms bloat footers with zero pruning power)
+- Raised MAX_FOOTER_READ 1MB → 2MB (entries + bloom bitset with headroom);
+  footer decodes in write paths now pass the REAL has_bloom flag
+- Multi-role review caught 3 of my own bugs pre-commit: unreachable!() fallback
+  (→ pure reconstruction), fail-UNSAFE empty-bloom fallback (→ encode without bloom),
+  bloom-size vs 1MB read-window mismatch (→ 512KB cap + 2MB window + skip-oversized)
+- Updated docs/API_WORKFLOW.md with cache_dir / POND_CACHE_DIR semantics
+- Validation: cargo test --workspace --release --exclude pond_python --exclude pond_sql
+  (CI command): 442 passed / 0 failed; clippy --workspace --all-targets -D warnings CLEAN;
+  moto S3 suite 32/32 WITH cache live (~/.pond_cache populated by the run);
+  pytest 21 passed / 4 skipped (installed missing pyarrow/moto[server]);
+  R2 test skipped (no creds in this sandbox)
+- Committed 04ac316 (9 files, +501/-100)
+- PUSH BLOCKED: no ~/.git-credentials, no gh CLI, no SSH, no tokens in this sandbox
+  session — commit is ready locally; next cycle must push origin main
+
+Stage Summary:
+- Commit: 04ac316 perf(cache,read,write): wire 3-tier cache into production entry
+  points + bloom-on-write (+501/-100, 9 files)
+- Warm S3 reads now actually cached: 100-300ms → µs-ms (the north-star centerpiece)
+- Cold reads: -1 GET every read; equality queries: parallel survivor-only bloom
+  checks over slabs that now actually carry blooms
+- Next recommended tasks (ranked):
+  1. PUSH origin main (04ac316 pending — sandbox credentials missing this cycle)
+  2. Route pyo3 read_rows + SQL executor through read_rows_i64/resolve_manifest with
+     predicates (still O(N) all-RG JSON materialization at lib.rs:5222+/executor.rs:1186;
+     also breaks on slab-backed collections)
+  3. Route write_rows through WriteBuffer/SlabWriter with auto-flush (5 PUTs/RG → ~6
+     PUTs per 1024 RGs) + remove manifest_ref/root-ref PUTs (−2 PUTs/commit; check
+     branch.rs:32 graceful-absence first) + switch HEAD updates to reference_if CAS
+  4. Rust proptest suite for PMAN/PNPK/PSLB decoders (still ZERO property tests;
+     manifest.rs:300-391 has panic-on-truncation bounds holes)
+  5. Switch decode from ruzstd → zstd crate (2-5x decode throughput on compressed data)
