@@ -139,15 +139,11 @@ def compact_tombstones(kernel) -> dict:
     compacted = 0
     for name in names:
         if kernel.resolve(name) == TOMBSTONE_HASH:
-            # Direct SQL delete — the kernel exposes root_db as an
-            # implementation detail. This is the only place the SDK
-            # reaches into the kernel's internal storage, and it is
-            # justified because compact_tombstones IS a maintenance
-            # operation on the kernel's root namespace.
-            kernel.root_db.execute(
-                "DELETE FROM roots WHERE name = ?", (name,)
-            )
-            compacted += 1
+            # Kernel maintenance primitive — delete_reference() takes the
+            # kernel's _db_lock (raw SQL against kernel.root_db raced with
+            # concurrent resolve()/close() from background threads).
+            if kernel.delete_reference(name):
+                compacted += 1
     return {
         "compacted": compacted,
         "remaining_names": len(kernel.list_names()),

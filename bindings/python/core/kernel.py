@@ -92,6 +92,7 @@ class PondMinimal:
         # but cross-thread writes without a lock raise ProgrammingError).
         import threading
         self._db_lock = threading.RLock()
+        self._closed = False
         self.root_db = sqlite3.connect(
             self.root_store_path, isolation_level=None,
             check_same_thread=False,
@@ -105,6 +106,19 @@ class PondMinimal:
         """)
 
         self.stats = {"writes": 0, "reads": 0, "references": 0}
+
+    def _ensure_open(self) -> None:
+        """Raise RuntimeError if the kernel has been closed.
+
+        MUST be called while holding _db_lock so that the check and the
+        subsequent root_db access are atomic with respect to close().
+        """
+        if self._closed:
+            raise RuntimeError(
+                "PondMinimal kernel is closed — the roots.sqlite connection "
+                "was closed by a previous close() call. Create a new "
+                "PondMinimal instance to continue."
+            )
 
     # ------------------------------------------------------------------
     # Primitive 1: Write
@@ -238,6 +252,7 @@ class PondMinimal:
         if not os.path.exists(self._blob_path(h)):
             raise ValueError(f"Hash {h} does not refer to an existing blob")
         with self._db_lock:
+            self._ensure_open()
             self.root_db.execute(
                 "INSERT OR REPLACE INTO roots (name, hash, updated_at) VALUES (?, ?, ?)",
                 (name, h, time.time())
@@ -247,14 +262,30 @@ class PondMinimal:
     def resolve(self, name: str) -> Optional[str]:
         """Resolve a name to its current hash. Returns None if unbound."""
         with self._db_lock:
+            self._ensure_open()
             cur = self.root_db.execute("SELECT hash FROM roots WHERE name = ?", (name,))
             row = cur.fetchone()
         return row[0] if row else None
 
     def list_names(self) -> list[str]:
         with self._db_lock:
+            self._ensure_open()
             cur = self.root_db.execute("SELECT name FROM roots ORDER BY name")
             return [row[0] for row in cur.fetchall()]
+
+    def delete_reference(self, name: str) -> bool:
+        """Delete a name -> hash binding. Returns True if it existed.
+
+        Maintenance primitive (used by SDK compact_tombstones) so the SDK
+        no longer needs to reach into kernel.root_db with raw SQL — that
+        bypassed _db_lock and raced with concurrent resolve()/close().
+        """
+        with self._db_lock:
+            self._ensure_open()
+            cur = self.root_db.execute(
+                "DELETE FROM roots WHERE name = ?", (name,)
+            )
+            return cur.rowcount > 0
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -282,4 +313,17 @@ class PondMinimal:
         }
 
     def close(self) -> None:
-        self.root_db.close()
+        """Close the kernel's root store. Thread-safe and idempotent.
+
+        Takes _db_lock so it can never interleave with a concurrent
+        resolve()/reference()/list_names() call from a background thread
+        (UnifiedStorage fires daemon tombstone/vacuum threads from
+        compact() — closing the SQLite connection mid-execute used to
+        SEGFAULT the whole process). Late callers raise RuntimeError
+        (via _ensure_open) instead of touching the closed connection.
+        """
+        with self._db_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self.root_db.close()

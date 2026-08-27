@@ -424,3 +424,114 @@ def test_rust_s3_r2_backend():
         f"R2 test failed:\nSTDOUT:\n{result.stdout[-2000:]}\nSTDERR:\n{result.stderr[-1000:]}"
     assert "ALL R2 TESTS PASSED" in result.stdout, \
         f"R2 tests did not complete:\n{result.stdout[-2000:]}"
+
+
+def test_kernel_close_race_no_segfault():
+    """Regression: PondMinimal.close() vs background-thread resolve() race.
+
+    UnifiedStorage.compact() fires daemon tombstone/vacuum threads that call
+    kernel.resolve(). The lens-laws CI harness called kernel.close() right
+    after the test body — closing the shared SQLite connection mid-execute
+    SEGFAULTED the whole process (CI run 33125162667, exit 139).
+
+    The fix: close() takes _db_lock and sets _closed; all root_db accessors
+    call _ensure_open() under the lock so late callers get a clean
+    RuntimeError instead of use-after-free.
+    """
+    import shutil
+    import threading
+    import tempfile
+
+    sys.path.insert(0, os.path.join(REPO_ROOT, "bindings", "python", "core"))
+    from kernel import PondMinimal
+
+    tmp = tempfile.mkdtemp(prefix="pond_close_race_")
+    try:
+        k = PondMinimal(tmp)
+        h = k.write(b"race-payload")
+        k.reference("branch/main", h)
+
+        stop = threading.Event()
+        errors: list = []
+
+        def hammer():
+            # Simulates the async tombstone/vacuum thread calling resolve().
+            while not stop.is_set():
+                try:
+                    k.resolve("branch/main")
+                except RuntimeError:
+                    errors.append("late")  # post-close: clean error, no crash
+                    return
+                except Exception as e:  # pragma: no cover
+                    errors.append(e)
+                    return
+
+        threads = [threading.Thread(target=hammer, daemon=True) for _ in range(4)]
+        for t in threads:
+            t.start()
+
+        # Race: close while resolvers are mid-flight.
+        k.close()
+        stop.set()
+        for t in threads:
+            t.join(timeout=5)
+
+        # Post-close contract: clean RuntimeError, not segfault/ProgrammingError.
+        for op in (lambda: k.resolve("x"),
+                   lambda: k.list_names(),
+                   lambda: k.reference("x", h),
+                   lambda: k.delete_reference("x")):
+            try:
+                op()
+                assert False, "expected RuntimeError after close()"
+            except RuntimeError:
+                pass
+
+        # Idempotent: second close is a no-op.
+        k.close()
+
+        # Any exceptions raised inside hammer must be the clean late-close
+        # RuntimeError (or nothing at all if the thread won the race).
+        for e in errors:
+            assert e == "late", f"unexpected error in resolver thread: {e!r}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_kernel_delete_reference_and_tombstone_compact():
+    """Kernel.delete_reference() + SDK compact_tombstones() integration.
+
+    delete_reference() replaced the SDK's raw SQL reach-into root_db (which
+    bypassed _db_lock). Verifies tombstone compaction still works end-to-end.
+    """
+    import shutil
+    import tempfile
+
+    sys.path.insert(0, os.path.join(REPO_ROOT, "bindings", "python", "core"))
+    sys.path.insert(0, os.path.join(REPO_ROOT, "bindings", "python", "sdk"))
+    from kernel import PondMinimal
+    from maintenance import compact_tombstones, drop_name, is_dropped
+
+    tmp = tempfile.mkdtemp(prefix="pond_tombstone_")
+    try:
+        k = PondMinimal(tmp)
+        h = k.write(b"payload")
+        k.reference("live", h)
+        k.reference("dead", h)
+
+        # delete_reference: True for existing, False for missing.
+        assert k.delete_reference("dead") is True
+        assert k.delete_reference("dead") is False
+        assert k.resolve("dead") is None
+        assert k.resolve("live") == h
+
+        # Tombstone round-trip through the SDK maintenance path.
+        drop_name(k, "live")
+        assert is_dropped(k, "live") is True
+        stats = compact_tombstones(k)
+        assert stats["compacted"] == 1
+        assert k.resolve("live") is None
+        assert is_dropped(k, "live") is False  # unbound != tombstoned
+        k.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
