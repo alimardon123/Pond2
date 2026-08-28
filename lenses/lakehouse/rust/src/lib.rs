@@ -183,6 +183,12 @@ impl LakehouseLens {
                 manifest.row_groups.retain(|rg|
                     only.contains(&(rg.blob_hash.clone(), rg.slab_byte_offset)));
             }
+            // D7: skip CRDT-update RGs (upsert/delete packs, folded CRDT
+            // RGs — stats carry `_deleted`): this columnar pipeline has no
+            // CRDT merge, so base + update copies would DUPLICATE rows.
+            // Pre-D7 equivalence (shards were never read here); the
+            // CRDT-merged surface is read_rows_json_pruned.
+            manifest.row_groups.retain(|rg| !rg.is_crdt_update_rg());
 
             for rg in &manifest.row_groups {
                 // Architecture review GAP 6 fix: use slab-aware range reads instead of

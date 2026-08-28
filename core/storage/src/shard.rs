@@ -1,25 +1,44 @@
-// Shard module — CRDT shard management
+// Shard module — CRDT row layer
 //
-// CRDT shards allow concurrent multi-writer without coordination:
-//   - Each writer writes its own shard to a unique path
-//   - Readers union HEAD + all live shards
-//   - No CAS, no coordination — works on any object store
+// ARCHITECTURE.md D7 (settled, N+4): the CRDT ROW surface journals.
+//   - upsert_shard / delete_shard stamp rows (_rowid UUIDv7, _version HLC,
+//     _deleted tombstones — semantics unchanged) and append ONE PND2
+//     journal pack per call through journal::append_pack (unique
+//     per-writer path, plain PUT, zero shared objects). No JSON shard
+//     blob and no shards/ ref is written by these two functions.
+//   - Readers see upserts/deletes through the journal-aware pruned reader
+//     (read::read_rows_json_pruned), which CRDT-merges across packs with
+//     the SAME merge law this module defines (merge_rows_by_rowid).
 //
-// CRDT row-level operations:
+// LEGACY COMPAT (pre-D7 repos): the shards/ namespace stays READ-compat
+//   - list_shards / read_with_shards / shard_count read pre-migration
+//     JSON shards (old repos stay readable; compact folds them into the
+//     snapshot, which is how a legacy repo migrates: compact once).
+//   - append_shard (raw bytes) remains an explicit escape hatch for
+//     non-row payloads — it is the ONLY function here that still writes
+//     a shards/ ref.
+//   - clear_shards stays the fold-side cleanup (compact calls it).
+//
+// CRDT row-level operations (unchanged semantics, D7 transport):
 //   - upsert_shard: adds _rowid (UUIDv7) + _version (HLC) to each row,
 //     enabling row-level CRDT merge on conflict
-//   - delete_shard: writes tombstone shards (_deleted=True + _version)
+//   - delete_shard: writes tombstone rows (_deleted=true + _version)
 //   - merge_rows_by_rowid: CRDT merge — latest _version wins, tombstones suppress
 
 use crate::{branch_ref, shards_prefix};
-use pond_kernel::crdt::{uuidv7, HLC};
+use pond_kernel::crdt::HLC;
 use pond_kernel::PondKernel;
 use serde_json::{json, Value};
 
-/// Append a CRDT shard to a branch.
+/// Append a CRDT shard to a branch (LEGACY escape hatch).
 ///
-/// The shard is written to a unique path under the branch's shards/ directory.
-/// Readers will discover and merge it via read_with_shards.
+/// The shard is written to a unique path under the branch's shards/
+/// directory. Readers discover and merge it via read_with_shards.
+///
+/// D7 role: this is the RAW-BYTES escape hatch (arbitrary payloads, the
+/// pure-Python lens world, pre-D7 fixtures) — it is the only function in
+/// this module that still writes a shards/ ref. Row-level CRDT writes
+/// (upsert_shard/delete_shard) journal PND2 packs instead; prefer those.
 ///
 /// Matches Python UnifiedStorage.append_shard():
 ///   1. Write the shard data as a blob
@@ -43,9 +62,11 @@ pub fn append_shard(
     Ok(shard_hash)
 }
 
-/// List all shard hashes for a branch.
+/// List all shard hashes for a branch (LEGACY-COMPAT reader).
 ///
-/// Scans the branch's shards/ directory and resolves each ref.
+/// Scans the branch's shards/ directory and resolves each ref. Journal-era
+/// upserts/deletes (D7) never appear here — they live in the journal, not
+/// in shards/.
 pub fn list_shards(
     kernel: &PondKernel,
     collection: &str,
@@ -63,10 +84,12 @@ pub fn list_shards(
     shards
 }
 
-/// Read the collection's HEAD manifest + all live shards.
+/// Read the collection's HEAD manifest + all live shards (LEGACY-COMPAT).
 ///
-/// This is the CRDT read path: union HEAD + all unmerged shards.
-/// Returns the HEAD manifest hash and the list of shard hashes.
+/// Pre-D7 CRDT read path: union HEAD + all unmerged shards. Journal-era
+/// upserts/deletes are NOT visible through this surface (D7) — use
+/// read::read_rows_json_pruned (the journal-aware pruned reader) for the
+/// full state. Returns the HEAD manifest hash and the list of shard hashes.
 pub fn read_with_shards(
     kernel: &PondKernel,
     collection: &str,
@@ -127,7 +150,11 @@ fn delete_blob(kernel: &PondKernel, hash: &str) {
     let _ = kernel.delete_blob(hash);
 }
 
-/// Count the number of live shards for a branch.
+/// Count the number of live shards for a branch (LEGACY-COMPAT).
+///
+/// Counts pre-D7 JSON shards only — journal-era upserts/deletes keep the
+/// shard namespace empty (shard_count == 0 is the expected D7 steady
+/// state; live journal entries are reported by journal::status).
 pub fn shard_count(
     kernel: &PondKernel,
     collection: &str,
@@ -140,35 +167,129 @@ pub fn shard_count(
 // CRDT row-level operations (upsert_shard, delete_shard, merge_rows_by_rowid)
 // ---------------------------------------------------------------------------
 
-/// Upsert (insert-or-update) rows as a CRDT shard with _rowid + _version.
+/// Append stamped CRDT rows as ONE journal pack (ARCHITECTURE.md D7).
+///
+/// The rows (already stamped with `_rowid`/`_version`/`_deleted`) are
+/// encoded as a single PND2 row group via `journal::build_rg_from_json_rows`
+/// (the same encode machinery compaction uses for shard folds), wrapped in
+/// a `CollectionManifest`, and appended through `journal::append_pack` —
+/// one unique-path PUT at `journal/<writer_id>/<seq>`, zero shared objects,
+/// no CAS. NO JSON shard blob and NO shards/ ref is written.
+///
+/// The commit_obj mirrors `write::write_rows_inner`: parent = the branch
+/// ref resolve, index = parent index + 1, timestamp = now; the message
+/// carries the shard_name so `journal::history` keeps per-write visibility
+/// after folds (folded packs' messages survive via the `folds` list).
+///
+/// `key_fields` = key_col (the auto-compaction CRDT merge key).
+///
+/// Empty `rows`: an empty journal pack buys nothing (no data, no manifest
+/// columns, only log noise) — return early WITHOUT appending. Returns
+/// `Ok("")`, matching the Python-side `append_shard` `""` convention for
+/// "nothing written".
+fn append_rows_as_journal_pack(
+    kernel: &PondKernel,
+    collection: &str,
+    branch: &str,
+    shard_name: &str,
+    rows: &[Value],
+    key_col: Option<&str>,
+    message: &str,
+) -> Result<String, String> {
+    if rows.is_empty() {
+        return Ok(String::new());
+    }
+
+    // ONE PND2 row group from the stamped rows. Writes exactly ONE data
+    // blob (content-addressed), same shape as every write_rows path.
+    let rg = crate::journal::build_rg_from_json_rows(kernel, rows)?;
+
+    // Manifest: schema from the RG's column stats, key_col as declared.
+    let schema: Vec<(String, u8)> = rg
+        .columns
+        .iter()
+        .map(|c| (c.name.clone(), c.value_type))
+        .collect();
+    let mut manifest = crate::manifest::CollectionManifest::new(
+        schema,
+        key_col.unwrap_or("").to_string(),
+    );
+    manifest.add_row_group(rg);
+    let manifest_bytes = manifest.encode();
+
+    // Commit object mirroring write_rows_inner (write.rs): parent from the
+    // branch-ref resolve, index+1, timestamp. The message includes the
+    // shard_name for history visibility.
+    let parent = kernel.resolve(&branch_ref(collection, branch));
+    let parent_index = parent
+        .as_ref()
+        .and_then(|p| crate::commit::read_commit(kernel, p))
+        .map(|c| c.index + 1)
+        .unwrap_or(0);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let mut commit_obj = json!({
+        "parent": parent,
+        "second_parent": null,
+        "manifest": "packed",
+        "message": format!("{}:{}", message, shard_name),
+        "timestamp": timestamp,
+        "index": parent_index,
+    });
+
+    // key_fields = key_col — the auto-compaction merge key when the writer
+    // folds its log (merge_rows_by_rowid's legacy-row claim set).
+    let key_fields: Vec<String> = key_col
+        .map(|k| vec![k.to_string()])
+        .unwrap_or_default();
+    let (pack_hash, _seq) = crate::journal::append_pack(
+        kernel, collection, branch, &mut commit_obj, &manifest_bytes, &key_fields,
+    )?;
+
+    Ok(pack_hash)
+}
+
+/// Upsert (insert-or-update) rows as ONE journal pack with _rowid + _version
+/// (ARCHITECTURE.md D7 — the CRDT row surface journals).
 ///
 /// Each row gets:
 ///   - _rowid: UUIDv7 (stable across updates, generated if not provided)
 ///   - _version: HLC (new per write, used for CRDT merge — latest wins)
 ///   - _deleted: false (tombstone marker)
 ///
-/// On merge, rows with the same _rowid are deduplicated — the one with
-/// the latest _version wins. Tombstones (_deleted=true) suppress rows
-/// if their _version is latest.
+/// The stamped rows are encoded as ONE PND2 row group and appended as ONE
+/// journal pack (`journal::append_pack` — unique per-writer path, plain
+/// PUT, zero shared objects). Readers union them through the journal-aware
+/// pruned reader (`read::read_rows_json_pruned`), which dedups rows with
+/// the same _rowid — the one with the latest _version wins, tombstones
+/// (_deleted=true) suppress rows if their _version is latest.
 ///
 /// This is the CRDT-safe write path. Multiple writers can upsert
-/// concurrently without coordination — merge resolves conflicts.
+/// concurrently without coordination — merge resolves conflicts. No JSON
+/// shard blob is written (D7); `shard_count` stays 0.
+///
+/// Returns: the journal pack hash ("" when `rows` is empty — nothing
+/// written, matching the Python `append_shard` "" convention).
 pub fn upsert_shard(
     kernel: &PondKernel,
     collection: &str,
     branch: &str,
     shard_name: &str,
     rows: &[Value],
-    _key_col: Option<&str>,
+    key_col: Option<&str>,
     hlc: &mut HLC,
 ) -> Result<String, String> {
     let mut crdt_rows = Vec::with_capacity(rows.len());
 
     for row in rows {
         let mut crdt_row = row.clone();
-        // Generate _rowid if not present
+        // Generate _rowid if not present — MONOTONIC so a multi-row upsert's
+        // generated rowids follow insertion order (the CRDT merge sorts by
+        // rowid; plain uuidv7() randomizes same-millisecond order).
         if crdt_row.get("_rowid").is_none() {
-            crdt_row["_rowid"] = json!(uuidv7());
+            crdt_row["_rowid"] = json!(pond_kernel::crdt::uuidv7_monotonic());
         }
         // Generate _version (HLC — clock-skew-safe)
         crdt_row["_version"] = json!(hlc.tick());
@@ -177,18 +298,23 @@ pub fn upsert_shard(
         crdt_rows.push(crdt_row);
     }
 
-    // Serialize as JSON and write as a shard
-    let data = serde_json::to_vec(&crdt_rows)
-        .map_err(|e| format!("Failed to serialize CRDT rows: {}", e))?;
-
-    append_shard(kernel, collection, branch, shard_name, &data)
+    // D7: journal the stamped rows as ONE PND2 pack (no JSON shard blob,
+    // no shards/ ref). Readers see them via read::read_rows_json_pruned.
+    append_rows_as_journal_pack(
+        kernel, collection, branch, shard_name, &crdt_rows, key_col, "upsert_shard",
+    )
 }
 
-/// Delete rows by writing tombstone shards.
+/// Delete rows by writing tombstones in ONE journal pack
+/// (ARCHITECTURE.md D7 — the CRDT row surface journals).
 ///
 /// Each deleted _rowid gets a tombstone with _deleted=true and a new _version.
-/// On merge, if the tombstone's _version is later than any live row's _version,
-/// the row is suppressed.
+/// On merge (read::read_rows_json_pruned), if the tombstone's _version is
+/// later than any live row's _version, the row is suppressed; a later live
+/// version resurrects the row. No JSON shard blob is written (D7).
+///
+/// Returns: the journal pack hash ("" when `rowids` is empty — nothing
+/// written, matching the Python `append_shard` "" convention).
 pub fn delete_shard(
     kernel: &PondKernel,
     collection: &str,
@@ -212,10 +338,11 @@ pub fn delete_shard(
         tombstones.push(tombstone);
     }
 
-    let data = serde_json::to_vec(&tombstones)
-        .map_err(|e| format!("Failed to serialize tombstones: {}", e))?;
-
-    append_shard(kernel, collection, branch, shard_name, &data)
+    // D7: journal the tombstones as ONE PND2 pack (no JSON shard blob,
+    // no shards/ ref). Readers suppress the rows via the CRDT merge.
+    append_rows_as_journal_pack(
+        kernel, collection, branch, shard_name, &tombstones, key_col, "delete_shard",
+    )
 }
 
 /// Total-order comparison for CRDT row conflicts (C10 fix).
@@ -424,6 +551,10 @@ mod tests {
 
     #[test]
     fn test_upsert_shard_adds_rowid_version() {
+        // D7 (journal era): the stamped rows land as ONE PND2 journal pack,
+        // NOT as a JSON shard blob. Pinned surface: read_rows_json_pruned
+        // returns the live row with its CRDT metadata, and shard_count == 0
+        // (no shards/ ref is written).
         let dir = tempfile::tempdir().unwrap();
         let storage = UnifiedStorage::new_local(dir.path()).unwrap();
         let kernel = storage.kernel();
@@ -431,18 +562,29 @@ mod tests {
 
         let rows = vec![json!({"name": "alice", "age": 30})];
         let hash = upsert_shard(kernel, "users", "main", "s1", &rows, Some("name"), &mut hlc).unwrap();
+        assert!(!hash.is_empty(), "upsert returns the journal pack hash");
 
-        // Read the shard and verify it has _rowid, _version, _deleted
-        let data = kernel.read_blob(&hash).unwrap();
-        let crdt_rows: Vec<Value> = serde_json::from_slice(&data).unwrap();
-        assert_eq!(crdt_rows.len(), 1);
-        assert!(crdt_rows[0].get("_rowid").is_some(), "must have _rowid");
-        assert!(crdt_rows[0].get("_version").is_some(), "must have _version");
-        assert_eq!(crdt_rows[0].get("_deleted"), Some(&json!(false)));
+        // The upsert is visible through the journal-aware pruned reader —
+        // no shard was written.
+        let kc = vec!["_rowid".to_string()];
+        let live = crate::read::read_rows_json_pruned(kernel, "users", "main", &kc, None, &[])
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        let row = &live[0].1;
+        assert!(row.get("_rowid").is_some(), "must have _rowid");
+        assert!(row.get("_version").is_some(), "must have _version");
+        assert_eq!(row.get("_deleted"), Some(&json!(false)));
+        assert_eq!(row.get("name"), Some(&json!("alice")));
+
+        // D7: NO JSON shard blob, NO shards/ ref.
+        assert_eq!(shard_count(kernel, "users", "main"), 0);
     }
 
     #[test]
     fn test_delete_shard_writes_tombstones() {
+        // D7 (journal era): delete tombstones land as ONE PND2 journal pack.
+        // Pinned surface: the row is visible after upsert, suppressed after
+        // the tombstone, and shard_count == 0 throughout.
         let dir = tempfile::tempdir().unwrap();
         let storage = UnifiedStorage::new_local(dir.path()).unwrap();
         let kernel = storage.kernel();
@@ -450,18 +592,49 @@ mod tests {
 
         // First upsert a row
         let rows = vec![json!({"name": "alice", "age": 30})];
-        let hash = upsert_shard(kernel, "users", "main", "s1", &rows, Some("name"), &mut hlc).unwrap();
-        let data = kernel.read_blob(&hash).unwrap();
-        let crdt_rows: Vec<Value> = serde_json::from_slice(&data).unwrap();
-        let rowid = crdt_rows[0]["_rowid"].as_str().unwrap().to_string();
+        upsert_shard(kernel, "users", "main", "s1", &rows, Some("name"), &mut hlc).unwrap();
 
-        // Delete the row
+        let kc = vec!["_rowid".to_string()];
+        let live = crate::read::read_rows_json_pruned(kernel, "users", "main", &kc, None, &[])
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        let rowid = live[0].0.clone();
+
+        // Delete the row — tombstone pack, NOT a JSON shard blob.
         let del_hash = delete_shard(kernel, "users", "main", "del1", &[rowid], Some("name"), &mut hlc).unwrap();
-        let del_data = kernel.read_blob(&del_hash).unwrap();
-        let tombstones: Vec<Value> = serde_json::from_slice(&del_data).unwrap();
-        assert_eq!(tombstones.len(), 1);
-        assert_eq!(tombstones[0]["_deleted"], json!(true));
-        assert!(tombstones[0].get("_version").is_some());
+        assert!(!del_hash.is_empty(), "delete returns the journal pack hash");
+        assert_eq!(shard_count(kernel, "users", "main"), 0);
+
+        // The tombstone suppresses the row (same HLC — strictly later version).
+        let live = crate::read::read_rows_json_pruned(kernel, "users", "main", &kc, None, &[])
+            .unwrap();
+        assert_eq!(live.len(), 0, "tombstone must suppress the row");
+    }
+
+    #[test]
+    fn test_upsert_delete_empty_rows_write_nothing() {
+        // D7 empty-rows edge: an empty journal pack buys nothing — upsert
+        // with no rows / delete with no rowids must NOT append. Pinned as
+        // the "" return (the Python append_shard convention for "nothing
+        // written") + zero live journal entries + zero shards.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+        let mut hlc = HLC::new();
+
+        let h1 = upsert_shard(kernel, "users", "main", "s1", &[], Some("name"), &mut hlc).unwrap();
+        assert_eq!(h1, "", "empty upsert returns the nothing-written sentinel");
+        let h2 = delete_shard(kernel, "users", "main", "d1", &[], Some("name"), &mut hlc).unwrap();
+        assert_eq!(h2, "", "empty delete returns the nothing-written sentinel");
+
+        let status = crate::journal::status(kernel, "users", "main").unwrap();
+        assert_eq!(status.live_entries, 0, "no journal entries may be appended");
+        assert_eq!(shard_count(kernel, "users", "main"), 0);
+
+        let kc = vec!["_rowid".to_string()];
+        let live = crate::read::read_rows_json_pruned(kernel, "users", "main", &kc, None, &[])
+            .unwrap();
+        assert!(live.is_empty());
     }
 
     #[test]

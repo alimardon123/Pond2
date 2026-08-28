@@ -3,6 +3,61 @@
 > Crucible state file. The deep per-cycle log lives in `worklog.md`
 > (append-only); this file tracks iterations and why.
 
+## 2026-08-28 — Crucible iteration N+4: the C5 cycle (journal the CRDT row surface)
+
+- **D7 landed (C5-a)**: `upsert_shard`/`delete_shard` are journal writers —
+  stamped rows (`_rowid`/`_version`/`_deleted`, semantics unchanged) encode
+  as ONE PND2 row group (the shared `journal::build_rg_from_json_rows`
+  encoder) inside ONE journal pack per call (unique per-writer path, plain
+  PUT, zero shared objects). The JSON-shard write surface is GONE from the
+  Rust core; every pyo3/CLI/Go CRDT row write (incl. the high-level
+  update_rows/delete_rows/merge_rows/upload) is probeable, and
+  upsert/delete workloads need no LIST on warm reads (the last C2-compat
+  surface closes for Rust-written data). `shard_count == 0` is the steady
+  state; upsert visibility surfaces through `read_rows` +
+  `journal::status`. Legacy `shards/` namespaces stay READ-compat
+  (`read_with_shards`/`list_shards`) and compaction-foldable — old repos
+  migrate by compacting once. `append_shard` (raw bytes) stays the escape
+  hatch.
+- **C5-b landed**: `WriteBuffer::flush_internal` packs its staged RGs into
+  ONE PSLB slab (per-RG zstd + footer with offsets + incremental INT64
+  bloom built at stage time) — N buffered writes flush as ≤2 new blob
+  objects (slab + pack), down from N+1; RG entries carry
+  (slab_hash, offset, len) and read back through the slab-aware range
+  reader identically.
+- **FINDING (D7-exposed, fixed same cycle)**: moving CRDT updates into the
+  journal made them value-prunable — the pruned reader's pre-filter could
+  drop the UPDATE copy (moves OUT of the predicate range) while keeping
+  the stale base copy, so the CRDT merge RESURRECTED outdated state
+  (SQL `test_where_pushdown_shard_updated_row_disappears`: 3 rows for 2).
+  Pre-D7 the hole was unreachable (updates lived in the unfiltered shard
+  channel) but LATENT for folded shard RGs. Fix — the D7 reader rule:
+  `RowGroupEntry::is_crdt_update_rg()` (stats carry `_deleted`); MERGING
+  readers exempt CRDT RGs from zone-map/bloom/row-filter; NON-MERGING
+  readers (`read_rows_i64`, `read_all_row_groups`, lakehouse/vector
+  lenses) skip them (pre-D7 shard-invisible equivalence). Pinned by 3
+  regressions (live update-OUT-of-range, post-compact, i64-skip).
+- **FINDING (pre-existing flake, fixed)**: `write_rows` generated rowids
+  with plain `uuidv7()` (RANDOM within the same millisecond); the CRDT
+  merge sorts by rowid, so a fresh batch's read-back order was random per
+  run (test_write_rows_auto_crdt failed ~5/6 of runs). Fix:
+  `uuidv7_monotonic()` (existing kernel fn) in write_rows_inner AND
+  shard::upsert_shard's generated rowids — batch order is now
+  deterministic insertion order.
+- **Scoping discovery (recorded)**: the Python lens stack
+  (keyvalue/streaming/oltp + pure-Python UnifiedStorage on
+  PondMinimal/ObjectStoreNativeKernel) is a SEPARATE storage world from
+  the Rust core — shared path conventions, different ref mechanisms, no
+  interop with CLI/pyo3/Go today (verified: no test mixes the worlds).
+  C5-python residual: SDK delegation to the Rust core via pyo3 per D1 —
+  never a Python journal port.
+- Validation: pond_storage 216 tests green (163 unit + 26 journal + 8
+  upsert_journal + 5 chaos + laws ×13); full workspace 570 green / 0
+  failed; SQL integration 30/30 (incl. the fixed regression); clippy
+  `-D warnings` clean; pytest pyo3 suites 28/28 + test_all 25 pass / 2
+  env-skips; moto S3 32/32; live Cloudflare R2 35/35; lens laws (pure
+  Python world, untouched) all 6 laws compliant.
+
 ## 2026-08-28 — Crucible iteration N+3: the LAWS cycle (cron-2026-08-28-1100)
 
 - **D6 landed (C7 + C11)**: `journal::resolve_packs()` is THE reader entry

@@ -5,12 +5,17 @@
 //   journal-era writes touch ZERO shared refs — ARCHITECTURE.md D3). At
 //   50-300ms/RTT each write costs 100-600ms.
 //
-// The write buffer stages PND2-encoded row groups in memory.
-// On flush, all staged RGs are packed into a SINGLE PNPK commit and
-// appended to the per-writer journal (ONE unique-path PUT — no CAS, no
-// shared-object writes), reducing N writes from 2N S3 PUTs to N+2. For
-// N=100 small writes: 200 PUTs (10-60s) → 102 PUTs (5-30s) — a 2x
-// improvement on top of the journal's own savings.
+// The write buffer stages PND2-encoded row groups in memory. On flush,
+// all staged RGs are packed into ONE PSLB SLAB blob (C5-b — the same
+// slab format SlabWriter/write_rows_i64_slab produce: sequential RG
+// payloads + footer with offsets + optional bloom; per-RG zstd) and the
+// manifest references the RGs by (slab hash, byte offset, byte len).
+// The pack (commit JSON + manifest) is appended to the per-writer
+// journal (ONE unique-path PUT — no CAS, no shared-object writes).
+// N buffered writes therefore flush as ≤ 2 new blob objects (slab +
+// pack), down from N+1 (one blob per staged RG + the pack); N writes
+// cost 2N → 2 S3 PUTs. Readback goes through the slab-aware reader
+// (range GETs + coalescing) identically to SlabWriter output.
 //
 // The `write_rows_buffered()` call itself returns in ~20us (just PND2 encode +
 // hash). The actual S3 cost is deferred to flush().
@@ -29,6 +34,7 @@ use crate::commit;
 use crate::manifest::{CollectionManifest, ColumnStatsEntry, RowGroupEntry};
 use crate::branch_ref;
 use pond_core::pnd2_encode_multi_typed;
+use pond_core::TypedColumn;
 use pond_kernel::PondKernel;
 
 // ---------------------------------------------------------------------------
@@ -80,6 +86,13 @@ struct CollectionBuffer {
     /// Monotonic generation counter. Incremented on any branch operation
     /// (merge, undo, checkout) to invalidate buffered writes.
     generation: u64,
+    /// Incremental bloom over the INT64 column values staged for the
+    /// CURRENT flush's slab (C5-b — mirrors SlabWriter's slab bloom: the
+    /// read path's bloom pre-check is definitive for INT64 equality
+    /// exclusively, so only i64 values are inserted). Taken and reset at
+    /// every flush; sized adaptively from the first batch (rows × columns
+    /// × max_writes, clamped to [1024, SLAB_BLOOM_CAPACITY]).
+    slab_bloom: Option<crate::bloom::BloomFilter>,
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +216,7 @@ impl WriteBuffer {
             n_staged: 0,
             first_write_at: None,
             generation: 0,
+            slab_bloom: None,
         });
 
         // Validate schema matches on subsequent writes.
@@ -227,6 +241,39 @@ impl WriteBuffer {
                 .unwrap_or(0);
             buf.next_index = idx;
             buf.first_write_at = Some(Instant::now());
+        }
+
+        // C5-b — incremental slab bloom (mirrors SlabWriter's adaptive
+        // sizing): covers exactly the RGs staged for the CURRENT flush's
+        // slab. Only INT64 columns are inserted — the read path's bloom
+        // pre-check (read.rs slab_bloom_should_skip) is definitive for
+        // INT64 equality exclusively; non-i64 values have no bloom
+        // representation and every schema INT64 column IS inserted, so a
+        // bloom miss can never false-negative. Estimate from the first
+        // batch (rows × columns × max_writes, the count-trigger ceiling);
+        // bloom filters never false-negative, so under-sizing only costs
+        // false positives, never correctness.
+        if buf.slab_bloom.is_none() {
+            let est_elements = n_rows
+                .saturating_mul(columns.len().max(1))
+                .saturating_mul(self.config.max_writes.max(1));
+            if est_elements <= crate::write::SLAB_BLOOM_CAPACITY {
+                buf.slab_bloom = Some(crate::bloom::BloomFilter::new(
+                    est_elements.max(1024)));
+            }
+            // else: estimated elements exceed the 512 KB bitset ceiling —
+            // the bloom would saturate to ~100% FP and bloat the slab
+            // footer with zero pruning power. Skip it; zone-map pruning
+            // (the staged col_stats) still applies on reads.
+        }
+        if let Some(ref mut bloom) = buf.slab_bloom {
+            for (name, col) in columns {
+                if let TypedColumn::Int64(vals) = col {
+                    for v in vals {
+                        bloom.insert_col_value(name, &v.to_le_bytes());
+                    }
+                }
+            }
         }
 
         let data_bytes = blob.len();
@@ -276,12 +323,16 @@ impl WriteBuffer {
 
     /// Flush all staged writes for a (collection, branch) pair.
     ///
-    /// JOURNAL-ERA (ARCHITECTURE.md D3): all staged RGs are packed into ONE
-    /// PNPK commit and appended to the per-writer journal at a unique path
-    /// (plain PUT — no CAS, no shared-object writes). The branch ref moves
-    /// only when compaction folds a new snapshot (including the bootstrap
-    /// fold triggered by the first append on a fresh collection, which
-    /// lands the flushed manifest under the branch ref immediately).
+    /// JOURNAL-ERA (ARCHITECTURE.md D3 + C5-b): all staged RGs are packed
+    /// into ONE PSLB slab blob (the same format SlabWriter produces —
+    /// per-RG zstd + footer with offsets + bloom) and referenced from ONE
+    /// manifest inside ONE PNPK pack appended to the per-writer journal
+    /// at a unique path (plain PUT — no CAS, no shared-object writes).
+    /// N buffered writes flush as ≤ 2 new blob objects (slab + pack).
+    /// The branch ref moves only when compaction folds a new snapshot
+    /// (including the bootstrap fold triggered by the first append on a
+    /// fresh collection, which lands the flushed manifest under the
+    /// branch ref immediately).
     ///
     /// The staleness guard below stays as a conservative discard for
     /// generation-invalidated buffers (merge/undo/checkout): staged data was
@@ -313,6 +364,7 @@ impl WriteBuffer {
             buf.n_staged = 0;
             buf.base_head = None;
             buf.first_write_at = None;
+            buf.slab_bloom = None;
         }
     }
 
@@ -337,7 +389,7 @@ impl WriteBuffer {
     fn flush_internal(&self, collection: &str, branch: &str) -> Result<String, String> {
         let key = (collection.to_string(), branch.to_string());
 
-        let (parent, next_index, schema, key_col, staged_snapshot) = {
+        let (parent, next_index, schema, key_col, staged_snapshot, slab_bloom) = {
             let mut buffers = self.buffers.lock().unwrap();
             let buf = buffers.get_mut(&key)
                 .ok_or_else(|| format!(
@@ -364,6 +416,7 @@ impl WriteBuffer {
                 buf.n_staged = 0;
                 buf.base_head = None;
                 buf.first_write_at = None;
+                buf.slab_bloom = None;
                 return Err("Concurrent unbuffered write detected, buffer discarded".to_string());
             }
 
@@ -372,34 +425,69 @@ impl WriteBuffer {
             let schema = buf.schema.clone().unwrap_or_default();
             let key_col = buf.key_col.clone();
 
-            // Take all staged RGs out (drain).
+            // Take all staged RGs (drain) + the slab bloom covering exactly
+            // them — the next staged write starts a fresh bloom.
             let staged: Vec<StagedRowGroup> = std::mem::take(&mut buf.staged_rgs);
+            let slab_bloom = std::mem::take(&mut buf.slab_bloom);
             buf.staged_data_bytes = 0;
             buf.n_staged = 0;
             buf.base_head = None;
             buf.first_write_at = None;
 
-            (parent, next_index, schema, key_col, staged)
+            (parent, next_index, schema, key_col, staged, slab_bloom)
         };
         // Lock released — now do S3 I/O without holding the mutex.
 
-        // Write each staged RG blob to S3.
-        for rg in &staged_snapshot {
-            self.kernel.write(&rg.pnd2_bytes)
-                .map_err(|e| format!("Failed to write staged blob: {}", e))?;
-        }
+        // C5-b: pack ALL staged RGs into ONE PSLB slab blob (the same
+        // format SlabWriter/write_rows_i64_slab produce) — N buffered
+        // writes flush as ONE slab object instead of N standalone RG
+        // blobs. The staged blobs are uncompressed PND2; the slab encoder
+        // zstd-compresses each RG payload (PSLB v2).
+        //
+        // If the bloom is somehow absent (defensive — every staged write
+        // inserts into it unless the capacity guard skipped it), encode
+        // WITHOUT a bloom rather than embedding an empty one: an empty
+        // bloom would falsely prune the whole slab on reads.
+        let slab_inputs: Vec<(Vec<u8>, Vec<ColumnStatsEntry>, u32)> = staged_snapshot
+            .iter()
+            .map(|rg| (rg.pnd2_bytes.clone(), rg.col_stats.clone(), rg.n_rows))
+            .collect();
+        let (slab_bytes, has_bloom) = match slab_bloom {
+            Some(bloom) => (
+                crate::slab::encode_slab_compressed_with_bloom(&slab_inputs, &bloom),
+                true,
+            ),
+            None => (crate::slab::encode_slab_compressed(&slab_inputs), false),
+        };
+        let slab_hash = self.kernel.write(&slab_bytes)
+            .map_err(|e| format!("Failed to write flush slab: {}", e))?;
 
-        // Build manifest with all staged RGs.
+        // Decode the slab footer for the exact per-RG byte offsets — the
+        // same tail→footer decode write_rows_i64_slab and SlabWriter run
+        // after encoding (offsets are computed by the encoder, read back
+        // from the footer so the manifest and the bytes can never
+        // disagree).
+        let tail = crate::slab::decode_slab_tail(&slab_bytes)
+            .ok_or_else(|| "write buffer flush: slab tail decode failed".to_string())?;
+        let footer_end = slab_bytes.len() - crate::slab::PSLB_TAIL_LEN;
+        let footer = crate::slab::decode_slab_footer(&slab_bytes[tail.0 as usize..footer_end], has_bloom)
+            .ok_or_else(|| "write buffer flush: slab footer decode failed".to_string())?;
+
+        // Build the manifest: one RG entry per staged write, all pointing
+        // into the slab via (blob_hash, slab_byte_offset, slab_byte_len) —
+        // the slab-aware reader range-reads them exactly like SlabWriter
+        // output.
         let mut manifest = CollectionManifest::new(schema, key_col.clone());
 
         for (i, rg) in staged_snapshot.iter().enumerate() {
+            let entry = &footer.entries[i];
             manifest.add_row_group(RowGroupEntry {
                 key: format!("rg_buf_{:010}", i),
-                blob_hash: rg.blob_hash.clone(),
+                blob_hash: slab_hash.clone(),
                 n_rows: rg.n_rows,
                 columns: rg.col_stats.clone(),
-                slab_byte_offset: None,
-                slab_byte_len: None,
+                slab_byte_offset: Some(entry.byte_offset),
+                slab_byte_len: Some(entry.byte_len),
             });
         }
 
@@ -498,6 +586,33 @@ mod tests {
         assert_eq!(manifest.row_groups.len(), 2);
         assert_eq!(manifest.row_groups[0].n_rows, 3);
         assert_eq!(manifest.row_groups[1].n_rows, 3);
+
+        // C5-b: the flushed RGs are SLAB-BACKED — all point at ONE slab
+        // blob with per-RG (offset, len) windows (the branch head is the
+        // bootstrap fold of the flush pack; the fold copies RG entries
+        // verbatim, so the slab placement survives the fold).
+        let blob_hashes: std::collections::HashSet<&str> = manifest.row_groups.iter()
+            .map(|rg| rg.blob_hash.as_str()).collect();
+        assert_eq!(blob_hashes.len(), 1,
+            "all flushed RGs must share ONE slab blob, got {:?}", blob_hashes);
+        for rg in &manifest.row_groups {
+            assert!(rg.slab_byte_offset.is_some(),
+                "flushed RG must carry a slab offset (C5-b)");
+            assert!(rg.slab_byte_len.is_some() && rg.slab_byte_len.unwrap() > 0,
+                "flushed RG must carry a positive slab length");
+        }
+        // The slab blob is a real PSLB slab.
+        let slab_blob = kernel.read_blob(manifest.row_groups[0].blob_hash.as_str()).unwrap();
+        assert!(crate::slab::is_slab(&slab_blob), "flush slab must be PSLB");
+
+        // Readback through the slab-aware reader: identical rows.
+        let cols = crate::read::read_rows_i64(&kernel, "t", "main", None, None).unwrap();
+        let ids = cols.iter().find(|(n, _)| n == "id")
+            .map(|(_, v)| v.clone()).unwrap_or_default();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![1, 2, 3, 4, 5, 6],
+            "slab-backed readback must return every flushed row: got {:?}", ids);
     }
 
     #[test]
@@ -622,5 +737,162 @@ mod tests {
         let result = wb.write_rows_buffered("t", "main", &cols2, "w2");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Schema mismatch"));
+    }
+
+    // -----------------------------------------------------------------------
+    // C5-b — ONE PSLB slab per flush (byte/object-count + row-equality)
+    // -----------------------------------------------------------------------
+
+    /// ObjectStore wrapper that counts NEW BLOB OBJECTS (put_blob calls) —
+    /// the object-store footprint metric for the C5-b budget test.
+    struct BlobCountingStore {
+        inner: pond_kernel::LocalFSObjectStore,
+        put_blob_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl pond_kernel::ObjectStore for BlobCountingStore {
+        fn put_blob(&self, data: &[u8]) -> std::io::Result<String> {
+            self.put_blob_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.put_blob(data)
+        }
+        fn get_blob(&self, hash: &str) -> std::io::Result<Vec<u8>> {
+            self.inner.get_blob(hash)
+        }
+        fn put_path(&self, path: &str, hash: &str) -> std::io::Result<()> {
+            self.inner.put_path(path, hash)
+        }
+        fn get_path(&self, path: &str) -> Option<String> {
+            self.inner.get_path(path)
+        }
+        fn delete_path(&self, path: &str) -> std::io::Result<bool> {
+            self.inner.delete_path(path)
+        }
+        fn list_paths(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+            self.inner.list_paths(prefix)
+        }
+        fn list_dirs(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+            self.inner.list_dirs(prefix)
+        }
+        fn store_id(&self) -> String {
+            // Same identity as the wrapped store: the process-local journal
+            // registry keys writers by store — one store, one writer.
+            self.inner.store_id()
+        }
+        fn blob_exists(&self, hash: &str) -> bool {
+            self.inner.blob_exists(hash)
+        }
+        fn delete_blob(&self, hash: &str) -> std::io::Result<bool> {
+            self.inner.delete_blob(hash)
+        }
+    }
+
+    /// C5-b budget: 3 buffered writes + flush ⇒ ≤ 2 new blob objects
+    /// (ONE slab + ONE journal pack), down from 4 pre-change (three RG
+    /// blobs + the pack). The collection is pre-warmed with one
+    /// write_rows_i64 first so the bootstrap fold does not add its own
+    /// fold-pack blob inside the counted window.
+    #[test]
+    fn test_flush_blob_object_count_is_two() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let counter = std::sync::Arc::new(AtomicU64::new(0));
+        let kernel = PondKernel::new_with_store(Box::new(BlobCountingStore {
+            inner: pond_kernel::LocalFSObjectStore::new(dir.path()).unwrap(),
+            put_blob_calls: std::sync::Arc::clone(&counter),
+        }));
+        let wb = WriteBuffer::new(kernel.clone());
+
+        // Pre-warm: one structured write (its own blobs + bootstrap fold
+        // happen OUTSIDE the counted window; afterwards branch_ref exists
+        // and the writer is far below the auto-compact threshold).
+        write::write_rows_i64(&kernel, "t", "main",
+            &[("id", &[100i64]), ("val", &[7i64])], "warmup").unwrap();
+
+        let cols = |base: i64| vec![
+            ("id", TypedColumn::Int64(vec![base, base + 1])),
+            ("val", TypedColumn::Int64(vec![base * 10, base * 10 + 1])),
+        ];
+        counter.store(0, Ordering::SeqCst);
+        wb.write_rows_buffered("t", "main", &cols(1), "w1").unwrap();
+        wb.write_rows_buffered("t", "main", &cols(3), "w2").unwrap();
+        wb.write_rows_buffered("t", "main", &cols(5), "w3").unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 0,
+            "staging must perform ZERO blob I/O");
+
+        wb.flush("t", "main").unwrap();
+
+        let new_blobs = counter.load(Ordering::SeqCst);
+        assert!(new_blobs <= 2,
+            "3 buffered writes + flush must land ≤ 2 new blob objects \
+             (slab + pack), got {}", new_blobs);
+        assert!(new_blobs >= 2,
+            "expected exactly the slab + the journal pack (2), got {} — \
+             the flush must still persist data AND the pack", new_blobs);
+
+        // The rows are all readable (7 warmup rows + 6 buffered).
+        let got = crate::read::read_rows_i64(&kernel, "t", "main", None, None).unwrap();
+        let n = got.iter().find(|(n, _)| n == "id")
+            .map(|(_, v)| v.len()).unwrap_or(0);
+        assert_eq!(n, 7, "all rows readable after the slab flush");
+    }
+
+    /// C5-b row-equality: the same batches written through the buffered
+    /// path (slab-packed flush) and through direct write_rows_i64 calls
+    /// (standalone RG blobs) must read back IDENTICALLY.
+    #[test]
+    fn test_flush_rows_identical_to_direct_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = PondKernel::new_local(dir.path()).unwrap();
+        let wb = WriteBuffer::new(kernel.clone());
+
+        let batches: Vec<Vec<(&str, TypedColumn)>> = vec![
+            vec![
+                ("id", TypedColumn::Int64(vec![1, 2, 3])),
+                ("val", TypedColumn::Int64(vec![10, 20, 30])),
+                ("name", TypedColumn::String(vec!["a".into(), "b".into(), "c".into()])),
+            ],
+            vec![
+                ("id", TypedColumn::Int64(vec![4, 5])),
+                ("val", TypedColumn::Int64(vec![40, 50])),
+                ("name", TypedColumn::String(vec!["d".into(), "e".into()])),
+            ],
+        ];
+
+        // Path A: buffered + flush (slab-backed RGs).
+        for (i, cols) in batches.iter().enumerate() {
+            wb.write_rows_buffered("buf", "main", cols, &format!("w{}", i)).unwrap();
+        }
+        wb.flush("buf", "main").unwrap();
+
+        // Path B: direct write_rows-style appends (typed columns, one
+        // standalone blob per write) — the pre-C5-b flush shape.
+        for (i, cols) in batches.iter().enumerate() {
+            let col_refs: Vec<(&str, TypedColumn)> = cols.iter()
+                .map(|(n, c)| (*n, c.clone())).collect();
+            write::write_rows(&kernel, "direct", "main", &col_refs,
+                &format!("w{}", i)).unwrap();
+        }
+
+        let read_sorted = |collection: &str| -> Vec<(String, Vec<String>)> {
+            let rows = crate::read::read_rows_json_pruned(
+                &kernel, collection, "main", &[], None, &[]).unwrap();
+            let mut out: Vec<(String, String)> = rows.into_iter()
+                .map(|(_, row)| {
+                    let id = row["id"].to_string();
+                    let name = row["name"].as_str().unwrap_or("").to_string();
+                    (id, name)
+                })
+                .collect();
+            out.sort();
+            out.into_iter().map(|(id, name)| (id, vec![name])).collect()
+        };
+
+        let via_slab = read_sorted("buf");
+        let via_direct = read_sorted("direct");
+        assert_eq!(via_slab, via_direct,
+            "buffered (slab) and direct (standalone) writes must read back \
+             identically:\n  slab:    {:?}\n  direct:  {:?}", via_slab, via_direct);
+        assert_eq!(via_slab.len(), 5);
     }
 }

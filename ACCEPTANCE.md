@@ -69,8 +69,10 @@ The project is done only when every statement below is demonstrably true:
 - No reimplementation of SQL planning beyond what the pond_sql crate already
   does (pushdown into the reader, not a new optimizer).
 - Not this cycle: string zone maps, BPTX index wiring for journal entries,
-  cross-process HLC persistence, C5 shard-surface migration (python lenses
-  keep writing JSON shards until their own cycle), C8 executor error parity.
+  cross-process HLC persistence, C8 executor error parity, C5-python
+  (the pure-Python SDK/lens stack's shard surface — separate storage world,
+  see ARCHITECTURE.md D7 boundary note; endgame is SDK delegation to the
+  Rust core, not a Python journal port).
 
 ## Assumptions (recorded, autonomous mode)
 
@@ -82,50 +84,60 @@ The project is done only when every statement below is demonstrably true:
 - CI runners are 2-vCPU: keep the bitpack benchmark calibrated (f85a351) —
   do not add uncalibrated long benchmarks.
 
-## This-cycle acceptance (crucible iteration N+3 — the LAWS cycle)
+## This-cycle acceptance (crucible iteration N+4 — the C5 cycle)
 
-Mission for this cycle: **prove the CRDT/journal invariants with property
-tests (C3), and close the read-plan residuals (C7 + C11)**. The owner's
-directive behind it: the CRDT shards layer is the owner's own foundational
-work — review it by ATTACKING it with random inputs, not by re-reading it.
-Property tests either prove the laws or find real bugs; both outcomes are
-the review.
+Mission for this cycle: **kill the JSON-shard write surface in the Rust
+core** (C5-a): `upsert_shard`/`delete_shard` — and every high-level
+operation built on them (pyo3 update_rows/delete_rows/merge_rows/upload) —
+become journal writers (PND2 columnar packs at probeable per-writer paths,
+zero shared objects, warm reads without LIST). Plus C5-b: buffered
+multi-batch flushes land as ONE PSLB slab. Scoping discovery recorded
+this cycle: the Python lens stack (keyvalue/streaming/oltp + pure-Python
+UnifiedStorage on PondMinimal/ObjectStoreNativeKernel) is a SEPARATE
+storage world from the Rust core — it shares path CONVENTIONS but not ref
+mechanisms, and does not interop with CLI/pyo3/Go today. Its shard surface
+is the C5-python residual (D1 says delegate to Rust, never port the
+journal semantics to Python).
 
-1. **CRDT merge laws (proptest)**: for randomly generated row sets with
-   colliding `_rowid`s, arbitrary `_version`s (incl. ties), tombstones,
-   legacy rows, and arbitrary key_cols — `merge_rows_by_rowid` satisfies:
-   - **Commutativity/associativity-ish invariance**: the merged LIVE state
-     (`filter_live_rows ∘ merge`) is invariant under any permutation of the
-     input order (the C10 total tiebreak extended to exhaustive random
-     cases, not just seeded shuffles).
-   - **Idempotence**: merge(merge(S)) == merge(S) at the live-state level.
-   - **Tombstone law**: a tombstone with strictly-latest version always
-     suppresses; a live row with strictly-latest version always survives.
-   - **Determinism**: same input bytes ⇒ same output bytes, always.
-2. **Journal fold laws (proptest)**: for randomly generated multi-writer
-   interleavings — after `compact`, a fresh reader (empty caches) sees the
-   same CRDT-merged rows as before the compact (fold preserves state); and
-   read-after-N-appends sees the union of all appended rows (history law,
-   the C9 invariant). Both laws hold under shuffled writer interleavings.
-3. **PMAN format laws (proptest)**: `normalize_rgs_to_schema` output always
-   satisfies `stats.len() == schema.len()` per RG (the invariant whose
-   violation corrupted PMAN v2); manifest encode→decode roundtrips
-   byte-stably for normalized manifests; v3 roots resolve to the same RG
-   set as their flat equivalent.
-4. **C7 — one resolve_packs**: `journal::resolve_packs()` exported from
-   pond_storage; the 5 duplicated "snapshot + entries → pack list" loops
-   (read.rs ×3, lakehouse lens, vector lens) all delegate to it. No behavior
-   change beyond C11 filtering.
-5. **C11 — RG-level plan filtering**: resolve_packs returns a per-pack read
-   plan; a partially-covered COMPACT entry contributes ONLY its novel RG
-   blobs (per-entry `only_rgs` set), so concatenating readers
-   (read_rows_i64, read_all_row_groups) see each RG exactly once even
-   under racing compactors with partial overlap. Regression test with the
-   exact partial-overlap construction (compactor A folds writers {w1},
-   compactor B folds {w1,w2}, B loses the ref race).
+1. **C5-a — journal the CRDT row surface**: `shard::upsert_shard` and
+   `shard::delete_shard` stamp rows exactly as today (_rowid UUIDv7,
+   _version HLC, _deleted tombstones) but append ONE journal pack per call
+   (stamped rows → PND2 RG → manifest → `journal::append_pack`) instead of
+   a JSON blob at a `shards/` ref. No JSON shard blob is written anywhere
+   in the Rust core afterwards.
+2. **Semantics preserved, pinned by tests**: upsert → `read_rows` returns
+   the live rows (CRDT merge across journal packs — the existing
+   read.rs:1079 merge); tombstones suppress; resurrection (later live
+   version) works; two concurrent writers' upserts union; round-trip
+   through a FRESH process (empty caches) sees the same rows (the C9
+   law applied to the upsert surface). Existing shard tests' SEMANTICS
+   re-pinned against the journal-era surface (shard_count 0, rows
+   visible via read_rows).
+3. **Legacy compat**: `read_with_shards`/`list_shards`/`shard_count`
+   keep reading pre-migration shards (old repos stay readable);
+   `compact` still folds them; a test pins MIXED state (pre-existing
+   JSON shard + new journal upsert) reading correctly through both the
+   shard-compat reader and read_rows.
+4. **C5-b — SlabWriter default for buffered flush**:
+   `WriteBuffer::flush_internal` packs its staged RGs into ONE PSLB slab
+   blob (footer: offsets + bloom) before the journal append — N buffered
+   writes flush as ≤ 2 new blob objects (slab + pack), read back
+   identically through the slab-aware reader (byte-count + row-equality
+   tests). Descope path: if SlabWriter integration reveals a real format
+   blocker, record it in CRITIQUE with evidence and deliver C5-a alone —
+   the tribunal judges the honesty of the descope.
+5. **pyo3 surface honesty**: `shard_count`/`read_with_shards`/
+   `compact_shards` docstrings marked legacy-compat; upsert/delete
+   visibility surfaces through the journal (`read_rows`,
+   `journal::status` live_entries). Every pyo3/pytest assertion that
+   pinned shard-era behavior updated to journal-era expectations.
 6. Zero-warning build: `cargo clippy --workspace --all-targets -- -D
-   warnings` clean; `cargo test --workspace` all green (including the new
-   proptest suites — proptest cases must be seeded/deterministic in CI);
-   moto S3 suite green; live R2 suite green (streaming, small footprint).
+   warnings` clean; `cargo test --workspace` green; pytest green (incl.
+   the pyo3 suites that exercise upsert/update/delete/merge/upload);
+   moto S3 green; live R2 green (streaming, small footprint); lens laws
+   untouched-green.
 7. CI green on the pushed HEAD.
-8. Honest gap report in the cycle's worklog entry.
+8. Honest gap report: C5-python residual (separate world, SDK delegation
+   endgame), finding #1 disposition note (journal-era upserts/deletes
+   ALWAYS carry _rowid — the identity-less input class shrinks to
+   pre-migration data + explicit `write_rows_no_crdt`).

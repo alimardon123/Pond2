@@ -3091,23 +3091,35 @@ impl Storage {
     }
 
     // ===================================================================
-    // CRDT Shards — concurrent multi-writer without coordination
+    // CRDT row surface — LEGACY shard layer + JOURNAL-era row ops (D7)
     //
-    // Shards allow multiple writers to write concurrently without CAS:
-    //   - Each writer writes its own shard to a unique path
-    //   - Readers union HEAD + all live shards via read_with_shards
-    //   - compact_shards merges shards into HEAD (clears the shard list)
+    // ARCHITECTURE.md D7 (N+4): upsert_shard/delete_shard write ONE PND2
+    // journal pack per call (unique per-writer path, plain PUT, zero
+    // shared objects). The JSON-shard write surface is GONE from the
+    // high-level ops — readers see upserts/deletes through read_rows
+    // (the journal-aware pruned reader, CRDT-merged).
     //
-    // Row-level CRDT operations (upsert_shard, delete_shard) add _rowid
-    // + _version to each row, enabling deterministic merge on conflict
-    // (latest _version wins, tombstones suppress).
+    // LEGACY-COMPAT: append_shard (raw bytes — escape hatch),
+    // read_with_shards, shard_count stay for pre-D7 repos: they read the
+    // shards/ namespace, which journal-era upserts never touch
+    // (shard_count == 0 is the D7 steady state). compact_shards folds
+    // BOTH worlds (journal + shards) into one snapshot.
+    //
+    // Row-level CRDT semantics (unchanged): _rowid + _version per row,
+    // latest _version wins, tombstones suppress.
     // ===================================================================
 
-    /// Append a CRDT shard to the active branch.
+    /// Append a raw CRDT shard to the active branch (LEGACY escape hatch).
     ///
-    /// The shard is written to a unique path. Readers will discover and
-    /// merge it via read_with_shards. No CAS, no coordination — works
+    /// The shard (ARBITRARY bytes — JSON, PND2, anything) is written to a
+    /// unique path under the branch's shards/ directory. Readers discover
+    /// and merge it via read_with_shards. No CAS, no coordination — works
     /// on any object store (local FS, S3, R2, MinIO, ...).
+    ///
+    /// D7 note: this is the RAW-BYTES escape hatch for non-row payloads and
+    /// pre-D7 compatibility. Structured row writes should use
+    /// upsert_shard/delete_shard (journal packs, visible to read_rows) or
+    /// write_rows instead.
     ///
     /// Args:
     ///   - collection: Collection name
@@ -3123,23 +3135,30 @@ impl Storage {
             .map_err(pyo3::exceptions::PyIOError::new_err)
     }
 
-    /// Upsert rows as a CRDT shard with _rowid + _version.
+    /// Upsert rows as ONE journal pack with _rowid + _version (D7).
     ///
     /// Each row gets:
     ///   - _rowid: UUIDv7 (stable across updates, generated if not present)
     ///   - _version: HLC (new per write, used for CRDT merge — latest wins)
     ///   - _deleted: false (tombstone marker)
     ///
-    /// On merge (read_with_shards), rows with the same _rowid are
-    /// deduplicated — the one with the latest _version wins.
+    /// The stamped rows are encoded as ONE PND2 row group and appended as
+    /// ONE journal pack at a unique per-writer path (plain PUT — no CAS,
+    /// no shared objects; ARCHITECTURE.md D7). read_rows() merges them
+    /// with the rest of the collection: rows with the same _rowid are
+    /// deduplicated — the one with the latest _version wins. No JSON
+    /// shard blob is written; shard_count stays 0 (upsert visibility
+    /// surfaces through read_rows and journal_status live_entries).
     ///
     /// Args:
     ///   - collection: Collection name
-    ///   - shard_name: Unique name for this shard
+    ///   - shard_name: Unique name for this upsert (kept in the journal
+    ///       history message)
     ///   - rows: List of row dicts to upsert
     ///   - key_col: Optional key column name (for legacy non-CRDT rows)
     ///
-    /// Returns: shard blob hash
+    /// Returns: journal pack hash ("" when `rows` is empty — nothing
+    ///     written, matching the append_shard "" convention)
     #[pyo3(signature = (collection, shard_name, rows, key_col=None))]
     fn upsert_shard(&self, collection: &str, shard_name: &str, rows: Vec<PyObject>, key_col: Option<&str>) -> PyResult<String> {
         let storage = self.storage.lock().unwrap();
@@ -3157,19 +3176,24 @@ impl Storage {
             .map_err(pyo3::exceptions::PyIOError::new_err)
     }
 
-    /// Delete rows by writing a tombstone shard.
+    /// Delete rows by writing tombstones in ONE journal pack (D7).
     ///
     /// Each deleted _rowid gets a tombstone with _deleted=true and a new
-    /// _version. On merge, if the tombstone's _version is later than any
-    /// live row's _version, the row is suppressed.
+    /// _version, appended as ONE PND2 journal pack (unique per-writer
+    /// path — ARCHITECTURE.md D7). On read_rows() merge, if the
+    /// tombstone's _version is later than any live row's _version, the
+    /// row is suppressed; a later live version resurrects it. No JSON
+    /// shard blob is written; shard_count stays 0.
     ///
     /// Args:
     ///   - collection: Collection name
-    ///   - shard_name: Unique name for this tombstone shard
+    ///   - shard_name: Unique name for this tombstone write (kept in the
+    ///       journal history message)
     ///   - rowids: List of _rowid values to tombstone
     ///   - key_col: Optional key column name
     ///
-    /// Returns: shard blob hash
+    /// Returns: journal pack hash ("" when `rowids` is empty — nothing
+    ///     written, matching the append_shard "" convention)
     #[pyo3(signature = (collection, shard_name, rowids, key_col=None))]
     fn delete_shard(&self, collection: &str, shard_name: &str, rowids: Vec<String>, key_col: Option<&str>) -> PyResult<String> {
         let storage = self.storage.lock().unwrap();
@@ -3183,15 +3207,17 @@ impl Storage {
             .map_err(pyo3::exceptions::PyIOError::new_err)
     }
 
-    /// Read HEAD + all live shards (CRDT read path).
+    /// Read HEAD + all live LEGACY shards (pre-D7 CRDT read path).
     ///
     /// Returns a list of (shard_name, data_bytes) tuples. The first
     /// element is HEAD (name='__head__'), followed by all shards.
     /// The caller is responsible for merging rows by _rowid (latest
     /// _version wins, tombstones suppress).
     ///
-    /// For simple raw-byte reads, use `read()` instead. For structured
-    /// reads with auto-merge, use `read_rows()`.
+    /// LEGACY-COMPAT (D7): this reads the shards/ namespace only —
+    /// upsert_shard/delete_shard journal packs are NOT included (they are
+    /// visible through read_rows instead). Use this only for pre-D7
+    /// shard data; for structured reads with auto-merge, use `read_rows()`.
     fn read_with_shards<'py>(&self, py: Python<'py>, collection: &str) -> PyResult<Bound<'py, PyList>> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
@@ -3232,7 +3258,9 @@ impl Storage {
         Ok(result)
     }
 
-    /// Count the number of live shards for a collection's active branch.
+    /// Count the live LEGACY shards for a collection's active branch
+    /// (pre-D7 shard namespace only — D7 journal-era upserts/deletes keep
+    /// this at 0; their live entries are reported by `journal_status`).
     fn shard_count(&self, collection: &str) -> usize {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
@@ -3240,13 +3268,17 @@ impl Storage {
         pond_storage::shard::shard_count(kernel, collection, &active)
     }
 
-    /// Compact shards — merge all shards into HEAD and clear the shard list.
+    /// Compact — fold the journal + legacy shards into ONE snapshot.
     ///
-    /// After compaction, all shard data is absorbed into HEAD (a new commit),
-    /// and the shard refs are deleted. This reclaims storage space and
-    /// simplifies future reads (no shard merge needed).
+    /// JOURNAL ERA (D3/D7): folds the snapshot + every live journal entry
+    /// (including upsert_shard/delete_shard packs) + every legacy shard
+    /// into ONE pack, advances the branch ref, and clears what it folded.
+    /// After compaction all shard/journal data is absorbed into HEAD (a
+    /// new commit), reclaiming entry/shard overhead and simplifying future
+    /// reads. Old repos with legacy shards migrate by compacting once.
     ///
-    /// Returns: number of shards compacted
+    /// Returns: number of LEGACY shards folded (journal entries folded are
+    ///     reported via `journal_status`)
     fn compact_shards(&self, collection: &str) -> PyResult<usize> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();

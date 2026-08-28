@@ -97,6 +97,51 @@ commit after the first hid its parent's rows — CRITIQUE C9). It is REMOVED
 by the journal path. `put_path_if`/`reference_if` remain kernel primitives
 with existing tests but NO production callers.
 
+**D7 — The CRDT row surface journals (settled this cycle; C5-a).**
+
+`upsert_shard`/`delete_shard` are journal writers: they stamp rows
+(_rowid UUIDv7, _version HLC, _deleted tombstones — semantics unchanged)
+and append ONE PND2 pack per call through `journal::append_pack` (unique
+path, plain PUT, zero shared objects). The JSON-shard write surface is
+GONE from the Rust core; every pyo3/CLI/Go CRDT row write is probeable,
+and upsert/delete workloads need no LIST on warm reads (the last C2
+compat surface closes for Rust-written data). The shard module's
+row-level CRDT merge (`merge_rows_by_rowid`) is unchanged — it is also
+the merge law of the journal read path (read.rs read_rows_json_pruned).
+
+Legacy `shards/` namespaces stay READ-compat (`read_with_shards`,
+`list_shards`, `shard_count`) and compaction-foldable — old repos migrate
+by compacting once. `append_shard` (raw bytes) remains an explicit
+escape hatch for non-row payloads.
+
+**D7 reader rule (the pruning carve-out, found by the cycle's own SQL
+regression):** an RG whose stats carry `_deleted`
+(`RowGroupEntry::is_crdt_update_rg`) is a CRDT-update RG — its rows may
+be UPDATES of rows in other RGs, so value-based pruning (zone-map /
+bloom / row pre-filter) may drop the authoritative newer copy while the
+stale copy survives, resurrecting outdated state after the CRDT merge.
+Therefore: MERGING readers (`read_rows_json_pruned`) exempt CRDT-update
+RGs from value pruning entirely (the caller's post-merge filter is
+authoritative for them); NON-MERGING readers (`read_rows_i64`,
+`read_all_row_groups`, the lakehouse/vector columnar pipelines) SKIP
+them — without a CRDT merge, base + update copies would duplicate rows.
+This preserves every surface's pre-D7 behavior exactly (updates lived in
+the unfiltered shard channel; the non-merging readers never read
+shards). The latent hole pre-dates D7 for FOLDED shard RGs (compact's
+shard fold kept tombstones, so a folded update RG was value-prunable
+the same way) — the `_deleted`-stat rule fixes both eras uniformly.
+
+**Python stack boundary (recorded this cycle):** the pure-Python SDK/lens
+stack (PondMinimal SQLite kernel + ObjectStoreNativeKernel root-pointer
+kernel) is a SEPARATE storage world from the Rust core. It shares path
+CONVENTIONS (`collections/<c>/_branches/<b>/...`) but not ref mechanisms,
+and does not interop with CLI/pyo3/Go today (verified: no test mixes the
+worlds; the pyo3 suites use the Rust kernel exclusively). Its shard
+writes are the C5-python residual. D1 governs the endgame: the Python
+stack DELEGATES to the Rust core via pyo3 when available — never a
+Python port of the journal protocol (parallel semantics drift is the
+thing D1 exists to prevent).
+
 **D4 — One pruned read pipeline (settled).** There is exactly ONE production
 read pipeline: leaf pruning (PMAN v3) → zone-map pruning → parallel bloom
 pre-check → slab-aware range GETs + coalescing → projection pushdown →
@@ -151,7 +196,7 @@ slab_byte_offset)`:
 | `core/storage::read` | `read_rows_i64`, `read_rows_i64_indexed`, `read_rows_i64_range_indexed` | THE pruned pipeline (i64 today; this cycle generalizes it) |
 | `core/storage::journal` | `resolve_packs` (D6 read plan), `append_pack`, `compact`, `status`, `history` | per-writer immutable journal; ONE reader entry point |
 | `core/storage::manifest` | `CollectionManifest` (PMAN v1/v2 flat, v3 root+leaves) | zone-map stats, bloom refs, slab offsets |
-| `core/storage::shard` | `write_shard`, `list_shards`, `read_with_shards`, `clear_shards` | CRDT shard layer; per-read LIST is known debt (CRITIQUE C2) |
+| `core/storage::shard` | `upsert_shard`/`delete_shard` → journal packs (D7); `append_shard` (raw escape hatch); `read_with_shards`/`list_shards` legacy-compat readers; `merge_rows_by_rowid` = the CRDT merge law | CRDT row layer; the row merge is shared by the journal read path
 | `core/storage::commit` | `resolve_manifest_bytes`, `read_commit` | HEAD → manifest, single-GET resolve |
 | `core/codec` | `pnd2_encode/decode` | columnar codec: bitpack + zstd (native, ruzstd fallback) |
 | `core/s3` | SigV4 client, `put_path_if` (If-None-Match / If-Match) | hand-written; R2-validated |

@@ -81,6 +81,13 @@ pub fn read_all_row_groups(
                 .row_groups
                 .retain(|rg| only.contains(&(rg.blob_hash.clone(), rg.slab_byte_offset)));
         }
+        // D7: skip CRDT-update RGs — this raw-RG API has no merge
+        // semantics; base + update copies would concatenate as duplicates.
+        // Pre-D7 equivalence (shards were never read here); the CRDT-
+        // merged surface is read_rows_json_pruned.
+        manifest
+            .row_groups
+            .retain(|rg| !rg.is_crdt_update_rg());
         // An empty manifest (e.g. a legacy write() of empty data) simply
         // contributes no RGs — not an error in the union path.
         if manifest.row_groups.is_empty() {
@@ -837,6 +844,15 @@ fn read_rows_i64_from_head(
             .retain(|rg| only.contains(&(rg.blob_hash.clone(), rg.slab_byte_offset)));
     }
 
+    // D7 CRDT-update RGs (upsert/delete packs, folded CRDT RGs) are SKIPPED
+    // by this NON-MERGING reader: without a CRDT merge, base + update
+    // copies would DUPLICATE rows. Pre-D7 equivalence — updates lived in
+    // shards, which this reader never read. Upsert/delete visibility is
+    // read_rows_json_pruned's surface (it CRDT-merges).
+    manifest
+        .row_groups
+        .retain(|rg| !rg.is_crdt_update_rg());
+
     // Build projection set (which columns to decode)
     let projection: Option<std::collections::HashSet<&str>> = columns.map(|cols| {
         cols.iter().map(|s| s.as_str()).collect()
@@ -1020,19 +1036,30 @@ fn read_rows_i64_from_head(
 /// [`read_rows_json_pruned_with_head`], then CRDT-merges the rows (LWW by
 /// `_version`, total tiebreak `(_version, _rowid, payload)` — CRITIQUE
 /// C10 — tombstones suppressed).
-/// Shards remain the caller's CRDT responsibility (`shard::read_with_shards`
-/// + merge — the python lenses still write them).
+/// Legacy JSON shards (pre-D7 repos, the raw `append_shard` escape hatch,
+/// and the pure-Python lens stack — a separate storage world, see
+/// ARCHITECTURE.md's Python boundary note) remain the CALLER's CRDT
+/// responsibility: the pyo3/SQL read paths union `shard::read_with_shards`
+/// on top of this reader, and `journal::compact` folds shards into the
+/// snapshot. Journal-era `upsert_shard`/`delete_shard` packs (D7) are
+/// already merged HERE — no extra union needed for them.
 ///
 /// SAFETY ARGUMENT — pre-filter + merge (the invariant that makes the
 /// journal union safe under predicate pushdown): predicates are a
-/// CONSERVATIVE pre-filter applied PER PACK. If a snapshot copy of a row
-/// is pre-filtered out but a journal entry UPDATED that row to match, the
-/// entry's copy survives this merge and delivers the row — the same
-/// argument the shard layer has always relied on. The AUTHORITATIVE row
-/// filter still runs post-CRDT-merge in the caller (a row whose snapshot
-/// version matches but whose journal update no longer matches is
-/// correctly dropped by it). Callers that skip the post-merge re-check
-/// see false negatives on updated rows.
+/// CONSERVATIVE pre-filter applied PER PACK, and D7 carves one exemption —
+/// CRDT-update RGs (stats carry `_deleted`: upsert/delete packs and folded
+/// CRDT RGs) are never value-pruned, because a value filter can drop the
+/// authoritative NEWER copy of an updated row while the stale copy
+/// survives, resurrecting outdated state after the merge (the SQL
+/// update-OUT-of-range regression, caught by
+/// test_where_pushdown_shard_updated_row_disappears). For BASE RGs
+/// (single-version rows), if a snapshot copy is pre-filtered out but an
+/// update brought the row to match, the un-pruned CRDT-update copy
+/// survives the merge and delivers the row. The AUTHORITATIVE row filter
+/// still runs post-CRDT-merge in the caller (a row whose older version
+/// matches but whose update no longer matches is correctly dropped by
+/// it). Callers that skip the post-merge re-check see false positives on
+/// updated rows.
 ///
 /// A collection with no snapshot AND no entries has no rows — the caller
 /// proceeds to shards (matches the old "no HEAD" behavior of treating
@@ -1147,8 +1174,15 @@ fn read_rows_json_pruned_from_head(
     }
 
     // 4. Phase 1 — zone-map pruning (free: manifest stats, no I/O).
+    //    CRDT-update RGs (stats carry `_deleted` — upsert/delete packs,
+    //    folded CRDT RGs; see RowGroupEntry::is_crdt_update_rg) are EXEMPT:
+    //    their rows may be UPDATES of rows in other RGs, and a value filter
+    //    can drop the authoritative newer copy while the stale copy
+    //    survives — resurrecting outdated state after the CRDT merge (the
+    //    SQL update-OUT-of-range regression). The caller's post-merge
+    //    filter stays authoritative for them.
     let zone_map_survivors: Vec<&crate::manifest::RowGroupEntry> = manifest.row_groups.iter()
-        .filter(|rg| !rg.can_prune(&typed.zone))
+        .filter(|rg| rg.is_crdt_update_rg() || !rg.can_prune(&typed.zone))
         .collect();
 
     // 5. Phase 2 — parallel bloom pre-check (bounded, 32-way) on slabs that
@@ -1199,10 +1233,13 @@ fn read_rows_json_pruned_from_head(
         }
     }
 
-    // Final survivors: zone-map pass minus bloom-negative slabs.
+    // Final survivors: zone-map pass minus bloom-negative slabs. CRDT-update
+    // RGs are never bloom-skipped (same exemption as zone-map — the bloom is
+    // value-based, and the newer copy MUST reach the merge).
     let surviving_rgs: Vec<&crate::manifest::RowGroupEntry> = zone_map_survivors.into_iter()
         .filter(|rg| {
-            !(rg.slab_byte_offset.is_some() && bloom_skip_slabs.contains(&rg.blob_hash))
+            rg.is_crdt_update_rg()
+                || !(rg.slab_byte_offset.is_some() && bloom_skip_slabs.contains(&rg.blob_hash))
         })
         .collect();
 
@@ -1242,8 +1279,13 @@ fn read_rows_json_pruned_from_head(
 
     // 8. Decode + conservative columnar row pre-filter, then assemble JSON
     //    rows. Rows that fail the pre-filter are never converted to JSON.
+    //    CRDT-update RGs (surviving_rgs and blob_data_list are 1:1 in order)
+    //    skip the row pre-filter ENTIRELY — their rows must reach the
+    //    caller-side CRDT merge unfiltered (a value filter could drop the
+    //    newer copy of an updated row; the post-merge filter in the
+    //    CALLER — SQL executor / pyo3 — is authoritative for them).
     let mut rows: Vec<(String, JsonValue)> = Vec::new();
-    for blob_data in &blob_data_list {
+    for (rg, blob_data) in surviving_rgs.iter().zip(&blob_data_list) {
         // LENIENT SKIP for non-PND2 blobs (raw `write()` data — the legacy
         // base-snapshot path stores arbitrary bytes as an RG; every
         // pre-journal reader skipped them: the old full-scan JSON reader
@@ -1269,7 +1311,7 @@ fn read_rows_json_pruned_from_head(
         } else {
             cols
         };
-        if predicates.is_empty() {
+        if predicates.is_empty() || rg.is_crdt_update_rg() {
             rows.extend(json_rows_from_cols(&cols, key_fields, None));
         } else {
             let mask = columnar_filter_scalar(&cols, predicates);
@@ -2722,9 +2764,11 @@ mod tests {
 
     /// CRDT pre-filter safety: the RG/row-level pre-filter is an I/O
     /// optimization ONLY — a HEAD row it drops is still delivered via its
-    /// shard copy when a shard updated it to match (and a HEAD row it kept
-    /// is removed by the authoritative post-merge filter when a shard
-    /// updated it to no longer match).
+    /// updated copy when an update brought it to match (D7: a journal
+    /// upsert pack; pre-D7: a JSON shard), and a HEAD row it kept is
+    /// removed by the authoritative post-merge filter when an update moved
+    /// it away. Also pins the mixed-state caller pipeline (journal upsert
+    /// + legacy `append_shard` shard union) at the unit level.
     #[test]
     fn test_read_rows_json_pruned_crdt_prefilter_safety() {
         let dir = tempfile::tempdir().unwrap();
@@ -2747,7 +2791,7 @@ mod tests {
         let rid7 = rowid_of(7);
         let rid9 = rowid_of(9);
 
-        // Observe HEAD versions so the shard writes strictly-newer versions.
+        // Observe HEAD versions so the writes below are strictly-newer.
         let mut hlc = pond_kernel::crdt::HLC::new();
         for (_, row) in &full {
             if let Some(v) = row.get("_version").and_then(|v| v.as_str()) {
@@ -2755,17 +2799,29 @@ mod tests {
             }
         }
 
-        // Case A: HEAD row id=7 does NOT match `id = 5`; a shard updates it
-        // TO match. Case B: HEAD row id=9 does not match either, but its
-        // shard update moves it further away (id=99).
-        let shard_rows = vec![
+        // D7 journal upsert (upsert_shard appends ONE PND2 journal pack,
+        // visible through read_rows_json_pruned itself): Case A — HEAD row
+        // id=7 does NOT match `id = 5`; the upsert updates it TO match.
+        // Case B — HEAD row id=9's update moves it further away (id=99).
+        let upsert_rows = vec![
             serde_json::json!({"_rowid": rid7, "id": 5, "_deleted": false}),
             serde_json::json!({"_rowid": rid9, "id": 99, "_deleted": false}),
         ];
-        crate::shard::upsert_shard(kernel, "crdt", "main", "upd_1", &shard_rows, Some("_rowid"), &mut hlc).unwrap();
+        crate::shard::upsert_shard(kernel, "crdt", "main", "upd_1", &upsert_rows, Some("_rowid"), &mut hlc).unwrap();
 
-        // The caller-side pipeline: pruned HEAD read + shard read + CRDT
-        // merge + authoritative filter (mirrors pyo3 read_rows).
+        // LEGACY shard (raw `append_shard` escape hatch — pre-D7 shape):
+        // a row the caller-side union must deliver even though it lives in
+        // neither HEAD nor the journal.
+        let legacy_rows = vec![
+            serde_json::json!({"_rowid": "legacy-extra", "_version": hlc.tick(), "_deleted": false, "id": 5}),
+        ];
+        let legacy_bytes = serde_json::to_vec(&legacy_rows).unwrap();
+        crate::shard::append_shard(kernel, "crdt", "main", "legacy_s1", &legacy_bytes).unwrap();
+
+        // The caller-side pipeline: pruned journal read (which already
+        // CRDT-merges HEAD + upsert packs and pre-filters conservatively)
+        // + LEGACY shard union + mini CRDT merge + authoritative filter
+        // (mirrors the pyo3/SQL read path, D7 era).
         let preds = vec![("id".to_string(), "=".to_string(), serde_json::json!(5))];
         let mut all_rows = read_rows_json_pruned(kernel, "crdt", "main", &kc, None, &preds).unwrap();
 
@@ -2807,11 +2863,13 @@ mod tests {
             v.sort_unstable();
             v
         };
-        // id=5 (HEAD) AND the shard-updated former id=7 row both match; the
-        // former id=9 row (updated to 99) is gone.
-        assert_eq!(ids, vec![5, 5],
-            "shard-updated row must survive the HEAD pre-filter, and the \
-             shard-unmatched row must be dropped post-merge");
+        // id=5 (HEAD) AND the journal-updated former id=7 row both match;
+        // the former id=9 row (updated to 99) is gone; the legacy shard's
+        // id=5 row is delivered by the caller-side union.
+        assert_eq!(ids, vec![5, 5, 5],
+            "journal-updated row must survive the HEAD pre-filter, the \
+             shard-updated row must be delivered by the union, and the \
+             journal-unmatched row must be dropped post-merge");
     }
 
     /// Projection pushdown: requesting a single column decodes ONLY that

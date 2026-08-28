@@ -428,8 +428,13 @@ fn write_rows_inner(
     let mut final_columns: Vec<(&str, TypedColumn)> = columns.to_vec();
 
     if add_crdt_metadata && !has_rowid && n_rows > 0 {
+        // uuidv7_MONOTONIC: batch rowids follow insertion order (the counter
+        // occupies the bytes right after the timestamp), so the CRDT merge's
+        // rowid-sorted output preserves a fresh batch's write order — plain
+        // uuidv7() randomizes same-millisecond order and made read-back order
+        // random per run (caught by test_write_rows_auto_crdt).
         let rowids: Vec<String> = (0..n_rows).map(|_| {
-            pond_kernel::crdt::uuidv7()
+            pond_kernel::crdt::uuidv7_monotonic()
         }).collect();
         final_columns.push(("_rowid", TypedColumn::String(rowids)));
     }
@@ -709,7 +714,10 @@ const SLAB_TARGET_BYTES: usize = 128 * 1024 * 1024;
 /// the read path's MAX_FOOTER_READ window. Past the cap the false-positive
 /// rate grows (bloom filters never false-negative), so pruning stays
 /// CORRECT — just less selective.
-const SLAB_BLOOM_CAPACITY: usize = 419_430;
+///
+/// pub(crate): shared by SlabWriter and WriteBuffer::flush_internal (C5-b —
+/// buffered flushes pack ONE PSLB slab with the same bloom ceiling).
+pub(crate) const SLAB_BLOOM_CAPACITY: usize = 419_430;
 
 /// A stateful buffer that accumulates row groups and flushes them as PSLB slabs.
 ///

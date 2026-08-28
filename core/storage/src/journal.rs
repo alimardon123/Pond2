@@ -1173,16 +1173,21 @@ pub fn compact(
     })
 }
 
-/// Encode merged shard rows as one PND2 row group (the write_rows encode
+/// Encode stamped CRDT rows as one PND2 row group (the write_rows encode
 /// machinery: pnd2_encode_multi_typed + zstd + column stats) and return
 /// its manifest entry.
+///
+/// TWO callers share this encoder: `compact` (folding legacy JSON shards
+/// into the union manifest) and `shard::upsert_shard`/`delete_shard`
+/// (D7 — the CRDT row surface journals: stamped rows become ONE PND2 RG
+/// inside ONE journal pack). One encoder = one type-inference rule set.
 ///
 /// Type inference mirrors the CLI/SQL writers: the first non-null value
 /// fixes a column's type (bool/int/float/string; nested JSON becomes a
 /// VARIANT column); nulls decode to the type's default; heterogeneous
 /// values are stringified. Lens-written shard rows are uniform, so the
 /// lossy cases are edge-only.
-fn build_rg_from_json_rows(
+pub(crate) fn build_rg_from_json_rows(
     kernel: &PondKernel,
     rows: &[Value],
 ) -> Result<crate::manifest::RowGroupEntry, String> {
@@ -1208,7 +1213,7 @@ fn build_rg_from_json_rows(
     let blob = crate::write::maybe_compress_pnd2(&pond_core::pnd2_encode_multi_typed(&columns));
     let data_hash = kernel
         .write(&blob)
-        .map_err(|e| format!("compaction: shard pack write failed: {}", e))?;
+        .map_err(|e| format!("CRDT row-group write failed: {}", e))?;
 
     let n_rows = rows.len() as u32;
     let col_stats: Vec<crate::manifest::ColumnStatsEntry> = columns

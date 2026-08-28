@@ -152,6 +152,33 @@ pub struct RowGroupEntry {
 }
 
 impl RowGroupEntry {
+    /// Is this RG a CRDT-update RG (upsert/delete rows)?
+    ///
+    /// D7 rule (ARCHITECTURE.md, N+4): an RG whose per-RG stats carry a
+    /// `_deleted` column holds rows from the CRDT update surface —
+    /// `upsert_shard`/`delete_shard` packs (every stamped row carries
+    /// `_deleted`), compact's folded-shard RGs (tombstones are KEPT in the
+    /// fold), and fold-union'd CRDT pack RGs (RG entries copied verbatim,
+    /// stats included). Base `write_rows` RGs NEVER carry `_deleted`
+    /// (`write_rows_inner` adds only `_rowid` + `_version`) — a user who
+    /// manually writes a `_deleted` column opts into update semantics for
+    /// that RG (correctness preserved, pruning forfeited).
+    ///
+    /// Readers use this to keep the pre-D7 channel split under one journal:
+    ///   - MERGING readers (`read_rows_json_pruned`) exempt these RGs from
+    ///     value-based pruning (zone-map/bloom/row pre-filter): their rows
+    ///     may be UPDATES of rows in other RGs, and a value filter can drop
+    ///     the authoritative newer copy while the stale copy survives —
+    ///     resurrecting outdated state after the CRDT merge.
+    ///   - NON-MERGING readers (`read_rows_i64`, `read_all_row_groups`, the
+    ///     lakehouse/vector lens pipelines) SKIP these RGs: without a
+    ///     CRDT merge, base + update copies would DUPLICATE rows. This is
+    ///     exactly the pre-D7 behavior (updates lived in shards, which
+    ///     those readers never read).
+    pub fn is_crdt_update_rg(&self) -> bool {
+        self.columns.iter().any(|c| c.name == "_deleted")
+    }
+
     /// Can this row group be pruned given a list of predicates?
     /// Returns true if the row group CANNOT match ANY predicate.
     pub fn can_prune(&self, predicates: &[(String, String, Vec<u8>)]) -> bool {
