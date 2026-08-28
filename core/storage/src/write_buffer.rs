@@ -1,14 +1,16 @@
 // Write Buffer — stage multiple writes and flush as a single PNPK pack
 //
 // DESIGN RATIONALE:
-//   Every write currently does 2-3 S3 PUTs (data + manifest + commit as PNPK,
-//   then 3 ref updates = 4-5 S3 round-trips total. At 50-300ms/RTT,
-//   each write costs 200-1500ms.
+//   Every write does 2 S3 PUTs (data blob + journal entry pack as PNPK;
+//   journal-era writes touch ZERO shared refs — ARCHITECTURE.md D3). At
+//   50-300ms/RTT each write costs 100-600ms.
 //
 // The write buffer stages PND2-encoded row groups in memory.
-// On flush, all staged RGs are packed into a SINGLE PNPK commit,
-// reducing N writes from 4N S3 PUTs to N+3. For N=100 small writes:
-//   400 PUTs (40-150s) → 103 PUTs (10-30s) — a 4x improvement.
+// On flush, all staged RGs are packed into a SINGLE PNPK commit and
+// appended to the per-writer journal (ONE unique-path PUT — no CAS, no
+// shared-object writes), reducing N writes from 2N S3 PUTs to N+2. For
+// N=100 small writes: 200 PUTs (10-60s) → 102 PUTs (5-30s) — a 2x
+// improvement on top of the journal's own savings.
 //
 // The `write_rows_buffered()` call itself returns in ~20us (just PND2 encode +
 // hash). The actual S3 cost is deferred to flush().
@@ -25,8 +27,7 @@ use std::time::{Duration, Instant};
 
 use crate::commit;
 use crate::manifest::{CollectionManifest, ColumnStatsEntry, RowGroupEntry};
-use crate::pond_pack;
-use crate::{branch_ref, manifest_ref};
+use crate::branch_ref;
 use pond_core::pnd2_encode_multi_typed;
 use pond_kernel::PondKernel;
 
@@ -275,10 +276,18 @@ impl WriteBuffer {
 
     /// Flush all staged writes for a (collection, branch) pair.
     ///
-    /// Builds a single PNPK commit containing all staged RGs,
-    /// then does the 3 ref updates (branch_ref, manifest_ref, collection).
+    /// JOURNAL-ERA (ARCHITECTURE.md D3): all staged RGs are packed into ONE
+    /// PNPK commit and appended to the per-writer journal at a unique path
+    /// (plain PUT — no CAS, no shared-object writes). The branch ref moves
+    /// only when compaction folds a new snapshot (including the bootstrap
+    /// fold triggered by the first append on a fresh collection, which
+    /// lands the flushed manifest under the branch ref immediately).
     ///
-    /// Returns Ok(commit_hash) on success.
+    /// The staleness guard below stays as a conservative discard for
+    /// generation-invalidated buffers (merge/undo/checkout): staged data was
+    /// never committed, so discarding is always safe for the caller.
+    ///
+    /// Returns Ok(pack_hash) on success.
     pub fn flush(&self, collection: &str, branch: &str) -> Result<String, String> {
         self.flush_internal(collection, branch)
     }
@@ -381,7 +390,7 @@ impl WriteBuffer {
         }
 
         // Build manifest with all staged RGs.
-        let mut manifest = CollectionManifest::new(schema, key_col);
+        let mut manifest = CollectionManifest::new(schema, key_col.clone());
 
         for (i, rg) in staged_snapshot.iter().enumerate() {
             manifest.add_row_group(RowGroupEntry {
@@ -396,32 +405,34 @@ impl WriteBuffer {
 
         let manifest_bytes = manifest.encode();
 
-        // Build commit JSON.
+        // JOURNAL APPEND (ARCHITECTURE.md D3): the pack goes to a unique
+        // journal path via a plain PUT — same treatment as every write_rows
+        // path. The previous 3 ref PUTs (branch_ref + manifest_ref + bare
+        // collection) were shared-object writes (CRITIQUE C4) and would have
+        // clobbered a folded snapshot's history under HEAD-only readers;
+        // the bootstrap fold inside append_pack advances the branch ref to
+        // a valid folded state on fresh collections instead.
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
-        let commit_obj = serde_json::json!({
-            "parent": parent,
+        let mut commit_obj = serde_json::json!({
+            "parent": parent, // display-only chain link (journal appends never conflict)
             "second_parent": null,
             "manifest": "packed",
             "message": "write_buffered (flush)",
             "timestamp": timestamp,
             "index": next_index,
         });
-
-        // Encode as PNPK (commit + manifest combined) → 1 S3 PUT.
-        let pack_bytes = pond_pack::encode_pack(&commit_obj, &manifest_bytes, None);
-        let pack_hash = self.kernel.write(&pack_bytes)
-            .map_err(|e| format!("Failed to write PondPack: {}", e))?;
-
-        // Update branch refs (3 PUTs — Phase 1).
-        // Phase 2 will combine into 1 compound ref.
-        self.kernel.reference(&branch_ref(collection, branch), &pack_hash)
-            .map_err(|e| format!("Failed to update branch ref: {}", e))?;
-        self.kernel.reference(&manifest_ref(collection, branch), &pack_hash)
-            .map_err(|e| format!("Failed to update manifest ref: {}", e))?;
-        let _ = self.kernel.reference(collection, &pack_hash);
+        let key_fields: Vec<String> = if key_col.is_empty() {
+            Vec::new()
+        } else {
+            vec![key_col.clone()]
+        };
+        let (pack_hash, _seq) = crate::journal::append_pack(
+            &self.kernel, collection, branch,
+            &mut commit_obj, &manifest_bytes, &key_fields,
+        )?;
 
         Ok(pack_hash)
     }
@@ -435,6 +446,7 @@ impl WriteBuffer {
 mod tests {
     use super::*;
     use pond_core::TypedColumn;
+    use crate::pond_pack;
     use crate::write;
 
     fn make_test_buffer() -> (WriteBuffer, PondKernel) {
@@ -490,6 +502,12 @@ mod tests {
 
     #[test]
     fn test_flush_invalidated_by_staleness() {
+        // JOURNAL-ERA: `write_rows_i64` no longer moves the branch HEAD
+        // (journal appends never touch shared refs), so the concurrent
+        // committer in this test uses the `write()` raw-bytes path — the
+        // legacy base-snapshot writer that still advances branch_ref by
+        // design. The staleness guard therefore still protects against the
+        // ref-moving writers that exist in the journal era.
         let (wb, kernel) = make_test_buffer();
         let cols = vec![
             ("id", TypedColumn::Int64(vec![1])),
@@ -497,14 +515,8 @@ mod tests {
         ];
         wb.write_rows_buffered("t", "main", &cols, "w1").unwrap();
 
-        // Simulate a concurrent unbuffered write by changing the branch HEAD.
-        let ids: Vec<i64> = vec![99];
-        let vals: Vec<i64> = vec![999];
-        write::write_rows_i64(
-            &kernel, "t", "main",
-            &[("id", ids.as_slice()), ("val", vals.as_slice())],
-            "concurrent",
-        ).unwrap();
+        // Simulate a concurrent ref-moving write by changing the branch HEAD.
+        write::write(&kernel, "t", "main", b"concurrent", "concurrent").unwrap();
 
         // Invalidate the buffer to mark it as potentially stale,
         // then flush should fail.
@@ -516,14 +528,8 @@ mod tests {
         ];
         wb.write_rows_buffered("t", "main", &cols2, "w2").unwrap();
 
-        // Another concurrent write moves HEAD
-        let ids2: Vec<i64> = vec![88];
-        let vals2: Vec<i64> = vec![888];
-        write::write_rows_i64(
-            &kernel, "t", "main",
-            &[("id", ids2.as_slice()), ("val", vals2.as_slice())],
-            "concurrent2",
-        ).unwrap();
+        // Another ref-moving write moves HEAD
+        write::write(&kernel, "t", "main", b"concurrent2", "concurrent2").unwrap();
 
         let result = wb.flush("t", "main");
         assert!(result.is_err());

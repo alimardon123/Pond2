@@ -31,6 +31,7 @@ pub mod branch;
 pub mod shard;
 pub mod read;
 pub mod write;
+pub mod journal;
 pub mod transaction;
 pub mod maintenance;
 pub mod pond_pack;

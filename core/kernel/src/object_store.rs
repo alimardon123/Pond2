@@ -89,6 +89,50 @@ pub trait ObjectStore: Send + Sync {
     /// List all paths under a prefix. Returns relative paths (without prefix).
     fn list_paths(&self, prefix: &str) -> io::Result<Vec<String>>;
 
+    /// List immediate child DIRECTORY names under a prefix (ONE level).
+    ///
+    /// This is the journal's writer-discovery primitive (ARCHITECTURE.md D3):
+    /// `list_dirs("collections/<c>/_branches/<b>/journal/")` returns the
+    /// writer-id directory names and NOTHING else — no per-entry keys, no
+    /// recursion. On S3/R2 this maps to ListObjectsV2 with `delimiter=/`
+    /// (CommonPrefixes), so the response stays O(writers), never O(entries)
+    /// — writer set changes only when a NEW writer process appears, which
+    /// is exactly what the journal's TTL-cached discovery needs.
+    ///
+    /// Returns the directory names WITHOUT the prefix and WITHOUT a
+    /// trailing '/'. Empty Vec when the prefix has no children.
+    ///
+    /// **Default impl**: unsupported — only real backends (LocalFS, S3,
+    /// Caching wrapper) implement it. Test stores MUST delegate to their
+    /// inner store or journal reads through them will fail discovery.
+    fn list_dirs(&self, prefix: &str) -> io::Result<Vec<String>> {
+        let _ = prefix;
+        Err(io::Error::new(io::ErrorKind::Unsupported,
+            "list_dirs not supported by this ObjectStore"))
+    }
+
+    /// Stable identity of this store instance — used to key process-local
+    /// registries/caches (journal writer registry + discovery cache) so two
+    /// kernels over the SAME backing store share journal state while kernels
+    /// over DIFFERENT stores stay isolated.
+    ///
+    /// Backends override with a canonical location string (LocalFS: absolute
+    /// base dir; S3: endpoint+bucket+prefix; Caching: delegates to inner).
+    /// The default is the trait-object's address — unique per instance, which
+    /// is CORRECT (each instance gets its own registry slot) but means two
+    /// separate kernel instances on the same directory would NOT share a
+    /// journal writer. Real backends override to make same-store instances
+    /// converge.
+    fn store_id(&self) -> String {
+        // Trait-object address. `Self` is ?Sized here (object safety), so
+        // the cast goes through a raw pointer — the first `as` widens &Self
+        // to *const Self (fat for dyn), the second discards the metadata,
+        // yielding the data-pointer address. Unique per INSTANCE, which is
+        // the default semantics; backends with a real location override
+        // with a canonical location string so same-store instances converge.
+        format!("{:p}", self as *const Self as *const ())
+    }
+
     /// Check if a blob exists (for dedup checks).
     fn blob_exists(&self, hash: &str) -> bool;
 
@@ -321,6 +365,35 @@ impl ObjectStore for LocalFSObjectStore {
         let file = self.path_file(path);
         if file.exists() {
             fs::remove_file(&file)?;
+            // Clean up now-empty parent directories, best-effort, stopping
+            // at the store root (tribunal F6a): the journal deletes entry
+            // paths like `.../journal/<writer_id>/<seq>` — without this,
+            // every writer process ever seen left an empty `<writer_id>`
+            // dir behind, and `list_dirs` discovery (plus the per-read
+            // probe GETs) grew monotonically with processes-ever. Only
+            // EMPTY dirs are removed, so a writer with live entries keeps
+            // its dir; failures are ignored (a leftover empty dir is
+            // harmless).
+            if let Some(parent) = file.parent() {
+                let mut dir = parent.to_path_buf();
+                while dir.starts_with(&self.base_dir) && dir != self.base_dir {
+                    match fs::read_dir(&dir) {
+                        Ok(mut entries) => {
+                            if entries.next().is_some() {
+                                break; // not empty — stop
+                            }
+                            if fs::remove_dir(&dir).is_err() {
+                                break; // raced a concurrent create — stop
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                    match dir.parent() {
+                        Some(p) => dir = p.to_path_buf(),
+                        None => break,
+                    }
+                }
+            }
             Ok(true)
         } else {
             Ok(false)
@@ -335,6 +408,35 @@ impl ObjectStore for LocalFSObjectStore {
         }
         paths.sort();
         Ok(paths)
+    }
+
+    fn list_dirs(&self, prefix: &str) -> io::Result<Vec<String>> {
+        // One-level directory listing: read_dir on the prefix dir, keep
+        // entries that are directories, return their names. This is O(writers)
+        // for the journal layout — no recursion into per-writer logs.
+        let prefix_dir = self.base_dir.join(prefix);
+        let mut dirs = Vec::new();
+        let entries = match fs::read_dir(&prefix_dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(dirs),
+            Err(e) => return Err(e),
+        };
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                dirs.push(entry.file_name().to_string_lossy().replace('\\', "/"));
+            }
+        }
+        dirs.sort();
+        Ok(dirs)
+    }
+
+    fn store_id(&self) -> String {
+        // Canonical absolute path — two kernel instances over the same
+        // directory share the same store identity (and therefore the same
+        // process-local journal writer registry entry).
+        self.base_dir.canonicalize()
+            .map(|p| format!("localfs:{}", p.display()))
+            .unwrap_or_else(|_| format!("localfs:{}", self.base_dir.display()))
     }
 
     fn blob_exists(&self, hash: &str) -> bool {

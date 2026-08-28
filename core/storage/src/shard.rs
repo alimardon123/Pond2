@@ -218,6 +218,41 @@ pub fn delete_shard(
     append_shard(kernel, collection, branch, shard_name, &data)
 }
 
+/// Total-order comparison for CRDT row conflicts (C10 fix).
+///
+/// `true` when the incoming row should REPLACE the existing one:
+///   1. strictly greater `_version` (LWW — the normal case), else
+///   2. equal `_version` and greater `_rowid` (identity tiebreak — constant
+///      when the caller groups by `_rowid`, but keeps the order total for
+///      callers with fallback keys), else
+///   3. equal `(_version, _rowid)` and greater serialized payload — the
+///      term that makes the merge COMMUTATIVE: two concurrent rows with
+///      identical clocks and identical rowid but different payloads now
+///      converge to the same winner regardless of merge order.
+///
+/// The payload serialization only runs on a full tie, which is rare (HLC
+/// collisions), so the common path pays one string compare.
+fn crdt_row_greater(
+    version: &str,
+    rowid: &str,
+    row: &Value,
+    existing_version: &str,
+    existing_rowid: &str,
+    existing_row: &Value,
+) -> bool {
+    if version != existing_version {
+        return version > existing_version;
+    }
+    if rowid != existing_rowid {
+        return rowid > existing_rowid;
+    }
+    // Full tie on (version, rowid): break it on the payload so that
+    // permuting the input order cannot change the merged state.
+    let row_json = serde_json::to_string(row).unwrap_or_default();
+    let existing_json = serde_json::to_string(existing_row).unwrap_or_default();
+    row_json > existing_json
+}
+
 /// CRDT row-level merge: dedup by _rowid, latest _version wins.
 ///
 /// Tombstones (_deleted=true) suppress rows if their _version is latest.
@@ -225,6 +260,18 @@ pub fn delete_shard(
 ///
 /// This is the deterministic CRDT merge — same input always produces
 /// the same output, regardless of merge order.
+///
+/// **Total tiebreak (CRITIQUE C10)**: rows that tie on BOTH `_version` and
+/// `_rowid` are concurrent writes whose clocks collided (HLC ties across
+/// writers). Strict `version > existing` made the FIRST-SEEN row win, so
+/// permuting the entry order changed the merged state. The comparison is
+/// now a total order on `(_version, _rowid, serialized-row)`: the payload
+/// term is what actually breaks ties (the map key already equals `_rowid`,
+/// so the rowid term is constant within a key — kept for explicitness and
+/// for callers that group by a fallback key). The greater payload string
+/// wins; either direction is arbitrary but MUST be fixed so the merge is
+/// commutative — the determinism law (same entry set ⇒ byte-identical
+/// state) holds under any permutation, including tombstone-vs-live ties.
 pub fn merge_rows_by_rowid(rows: &[Value], key_col: Option<&str>) -> Vec<Value> {
     // Separate CRDT rows (with _rowid) from legacy rows (without)
     let mut latest: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
@@ -236,11 +283,11 @@ pub fn merge_rows_by_rowid(rows: &[Value], key_col: Option<&str>) -> Vec<Value> 
             has_crdt = true;
             let version = row.get("_version").and_then(|v| v.as_str()).unwrap_or("");
             let should_replace = match latest.get(rowid) {
-                Some(existing) => {
-                    let existing_version = existing.get("_version")
-                        .and_then(|v| v.as_str()).unwrap_or("");
-                    version > existing_version
-                }
+                Some(existing) => crdt_row_greater(
+                    version, rowid, row,
+                    existing.get("_version").and_then(|v| v.as_str()).unwrap_or(""),
+                    rowid, existing,
+                ),
                 None => true,
             };
             if should_replace {
@@ -288,10 +335,14 @@ pub fn merge_rows_by_rowid(rows: &[Value], key_col: Option<&str>) -> Vec<Value> 
         }
     }
 
-    // Add CRDT rows (INCLUDING tombstones for associativity — readers call filter_live_rows)
-    for row in latest.values() {
-        result.push(row.clone());
-    }
+    // Add CRDT rows (INCLUDING tombstones for associativity — readers call
+    // filter_live_rows). Output is sorted by rowid: HashMap iteration order
+    // is arbitrary, and the C10 total tiebreak guarantees the merged SET is
+    // permutation-invariant — a sorted output makes the merged STATE
+    // (same rows, same order) byte-identical under any input permutation.
+    let mut crdt_rows: Vec<(String, Value)> = latest.into_iter().collect();
+    crdt_rows.sort_by(|a, b| a.0.cmp(&b.0));
+    result.extend(crdt_rows.into_iter().map(|(_, row)| row));
 
     result
 }
@@ -455,5 +506,70 @@ mod tests {
 
         let merged = merge_rows_by_rowid(&rows, Some("name"));
         assert_eq!(merged.len(), 2, "different rowids should both be kept");
+    }
+
+    #[test]
+    fn test_merge_deterministic_equal_version_equal_rowid() {
+        // C10 regression: two rows with the SAME _rowid and SAME _version
+        // but DIFFERENT payloads must merge to the SAME winner in BOTH
+        // input orders (strict `version >` used to make first-seen win,
+        // so permutation changed the result).
+        let a = json!({"_rowid": "tie-1", "_version": "00000000000000010000000000000001", "name": "aaa", "_deleted": false});
+        let b = json!({"_rowid": "tie-1", "_version": "00000000000000010000000000000001", "name": "zzz", "_deleted": false});
+
+        let ab = merge_rows_by_rowid(&[a.clone(), b.clone()], Some("name"));
+        let ba = merge_rows_by_rowid(&[b.clone(), a.clone()], Some("name"));
+        assert_eq!(ab.len(), 1);
+        assert_eq!(ba.len(), 1);
+        assert_eq!(ab[0], ba[0], "merged state must be permutation-invariant");
+        // The tiebreak direction is fixed (greater payload wins) — assert it
+        // so accidental flips are caught.
+        assert_eq!(ab[0]["name"], json!("zzz"));
+    }
+
+    #[test]
+    fn test_merge_deterministic_tombstone_vs_live_equal_version() {
+        // Equal versions, one tombstone one live: permutation must not
+        // decide whether the row survives.
+        let live = json!({"_rowid": "tie-2", "_version": "00000000000000020000000000000001", "name": "alive", "_deleted": false});
+        let dead = json!({"_rowid": "tie-2", "_version": "00000000000000020000000000000001", "name": "alive", "_deleted": true});
+
+        let ld = merge_rows_by_rowid(&[live.clone(), dead.clone()], Some("name"));
+        let dl = merge_rows_by_rowid(&[dead.clone(), live.clone()], Some("name"));
+        assert_eq!(ld, dl, "tombstone-vs-live at equal versions must be order-independent");
+        // Deterministic outcome: same winner in both orders...
+        let live_ld = filter_live_rows(&ld).len();
+        let live_dl = filter_live_rows(&dl).len();
+        assert_eq!(live_ld, live_dl, "visibility must not depend on merge order");
+    }
+
+    #[test]
+    fn test_merge_deterministic_under_permutation_loop() {
+        // Property-style (seeded std shuffle — no proptest dependency):
+        // a set of rows with colliding (version, rowid) pairs merged in
+        // many shuffled orders must ALWAYS produce the identical state.
+        let mut rows = vec![
+            json!({"_rowid": "p1", "_version": "v1", "name": "x", "_deleted": false}),
+            json!({"_rowid": "p1", "_version": "v1", "name": "a", "_deleted": false}),
+            json!({"_rowid": "p1", "_version": "v1", "name": "m", "_deleted": true}),
+            json!({"_rowid": "p2", "_version": "v1", "name": "q", "_deleted": false}),
+            json!({"_rowid": "p2", "_version": "v2", "name": "r", "_deleted": false}),
+            json!({"_rowid": "p2", "_version": "v2", "name": "s", "_deleted": false}),
+            json!({"_rowid": "p3", "_version": "v0", "name": "t", "_deleted": false}),
+        ];
+
+        let reference = merge_rows_by_rowid(&rows, Some("name"));
+        // Simple LCG shuffle — deterministic across runs/platforms.
+        let mut seed: u64 = 0x9E3779B97F4A7C15;
+        for round in 0..32 {
+            for i in (1..rows.len()).rev() {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let j = (seed >> 33) as usize % (i + 1);
+                rows.swap(i, j);
+            }
+            let merged = merge_rows_by_rowid(&rows, Some("name"));
+            assert_eq!(merged, reference,
+                "round {}: merged state changed under permutation", round);
+        }
     }
 }

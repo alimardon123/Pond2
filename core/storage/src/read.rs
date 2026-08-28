@@ -60,12 +60,32 @@ pub fn read_all_row_groups(
     collection: &str,
     branch: &str,
 ) -> Result<Vec<Vec<u8>>, String> {
-    let head = kernel.resolve(&branch_ref(collection, branch))
-        .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
-    let manifest_bytes = commit::resolve_manifest_bytes(kernel, &head)
-        .map_err(|e| format!("Failed to read manifest: {}", e))?;
-    let manifest = resolve_manifest(kernel, &manifest_bytes, None)?;
-    read_all_row_groups_from_manifest(kernel, &manifest)
+    // JOURNAL-AWARE (ARCHITECTURE.md D3): snapshot + live entry packs, RG
+    // byte vectors concatenated in (writer, seq) entry order. See
+    // read_rows_json_pruned for the CRDT-merge variant; this raw-RG API
+    // has no merge semantics — concatenation is the union.
+    let view = crate::journal::resolve_view(kernel, collection, branch, false)?;
+    let mut packs: Vec<String> = Vec::with_capacity(view.entries.len() + 1);
+    if let Some(snapshot) = &view.snapshot {
+        packs.push(snapshot.clone());
+    }
+    packs.extend(view.entries.iter().map(|e| e.pack_hash.clone()));
+    if packs.is_empty() {
+        return Err(format!("Collection '{}' has no commits", collection));
+    }
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for pack_hash in &packs {
+        let manifest_bytes = commit::resolve_manifest_bytes(kernel, pack_hash)
+            .map_err(|e| format!("Failed to read manifest: {}", e))?;
+        let manifest = resolve_manifest(kernel, &manifest_bytes, None)?;
+        // An empty manifest (e.g. a legacy write() of empty data) simply
+        // contributes no RGs — not an error in the union path.
+        if manifest.row_groups.is_empty() {
+            continue;
+        }
+        out.extend(read_all_row_groups_from_manifest(kernel, &manifest)?);
+    }
+    Ok(out)
 }
 
 /// Slab-aware row group reader from an already-loaded manifest.
@@ -274,7 +294,7 @@ enum RgSource {
 /// Without predicates, all leaves are fetched. With predicates, we prune
 /// leaves by key_min/key_max BEFORE issuing I/O. At PB scale (8K leaves),
 /// a 1% selective query prunes from 8K → ~80 leaf fetches (100x reduction).
-fn resolve_manifest(
+pub(crate) fn resolve_manifest(
     kernel: &PondKernel,
     manifest_bytes: &[u8],
     predicates: Option<&[(String, String, Vec<u8>)]>,
@@ -736,10 +756,44 @@ pub fn read_rows_i64(
     columns: Option<&[String]>,
     predicates: Option<&[(&str, &str, i64)]>,
 ) -> Result<Vec<(String, Vec<i64>)>, String> {
-    // Resolve HEAD commit
-    let head = kernel.resolve(&branch_ref(collection, branch))
-        .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
+    // JOURNAL-AWARE (ARCHITECTURE.md D3): the union of the snapshot pack
+    // and every live journal entry, read through the same per-pack i64
+    // pipeline and CONCATENATED. This layer has no CRDT merge by design —
+    // write_rows_i64 data carries no _rowid/_version (dedup is the JSON
+    // pipeline's job via read_rows_json_pruned), so concatenation IS the
+    // correct union semantics here. It also keeps the C9 history-loss
+    // fix visible at this API level: before the journal, every
+    // write_rows_i64 after the first silently hid its predecessors.
+    let view = crate::journal::resolve_view(kernel, collection, branch, false)?;
+    let mut packs: Vec<String> = Vec::with_capacity(view.entries.len() + 1);
+    if let Some(snapshot) = &view.snapshot {
+        packs.push(snapshot.clone());
+    }
+    packs.extend(view.entries.iter().map(|e| e.pack_hash.clone()));
+    if packs.is_empty() {
+        return Err(format!("Collection '{}' has no commits", collection));
+    }
 
+    use std::collections::HashMap;
+    let mut result_cols: HashMap<String, Vec<i64>> = HashMap::new();
+    for pack_hash in &packs {
+        let cols = read_rows_i64_from_head(kernel, pack_hash, columns, predicates)?;
+        for (name, data) in cols {
+            result_cols.entry(name).or_default().extend(data);
+        }
+    }
+    let mut result: Vec<(String, Vec<i64>)> = result_cols.into_iter().collect();
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(result)
+}
+
+/// The per-pack i64 pruned pipeline (see [`read_rows_i64`]).
+fn read_rows_i64_from_head(
+    kernel: &PondKernel,
+    head: &str,
+    columns: Option<&[String]>,
+    predicates: Option<&[(&str, &str, i64)]>,
+) -> Result<Vec<(String, Vec<i64>)>, String> {
     // Resolve manifest bytes from HEAD in a SINGLE code path.
     //
     // The previous "G6 magic optimization" fetched 4 bytes first to peek at
@@ -749,7 +803,7 @@ pub fn read_rows_i64(
     // are small too) and fetches the manifest blob only for plain commits:
     //   plain commit: 2 GETs (HEAD + manifest) — was 3 with the magic peek
     //   PNPK pack:    1 GET (manifest is inline) — was 2 with the magic peek
-    let manifest_bytes = crate::commit::resolve_manifest_bytes(kernel, &head)
+    let manifest_bytes = crate::commit::resolve_manifest_bytes(kernel, head)
         .map_err(|e| format!("Failed to resolve manifest from HEAD: {}", e))?;
 
     // Decode manifest (handles v2 flat and v3 tree)
@@ -935,32 +989,31 @@ pub fn read_rows_i64(
 //   row pre-filter.
 // ---------------------------------------------------------------------------
 
-/// Pruned, projection-pushed-down JSON row reader for a collection's HEAD data.
+/// Pruned, projection-pushed-down JSON row reader for a collection —
+/// JOURNAL-AWARE (ARCHITECTURE.md D3: reads = snapshot ∪ live entries).
 ///
-/// Returns `(rowid, JsonValue)` pairs from HEAD row groups ONLY — shards are
-/// the caller's CRDT responsibility (`shard::read_with_shards` + merge).
+/// Resolves the branch's journal view (branch_ref snapshot pack + every
+/// live journal entry discovered above its watermarks), runs the ONE
+/// pruned pipeline per pack via [`read_rows_json_pruned_with_head`], then
+/// CRDT-merges the rows (LWW by `_version`, total tiebreak
+/// `(_version, _rowid, payload)` — CRITIQUE C10 — tombstones suppressed).
+/// Shards remain the caller's CRDT responsibility (`shard::read_with_shards`
+/// + merge — the python lenses still write them).
 ///
-/// Predicates are applied as a CONSERVATIVE pre-filter (PMAN v3 leaf pruning,
-/// zone maps, slab blooms, columnar filter): a HEAD row dropped here can
-/// still be delivered by its shard copy, because the AUTHORITATIVE row
-/// filter must run post-CRDT-merge in the caller (a row whose HEAD version
-/// doesn't match can be updated in a shard to match, and vice versa).
-/// Callers that don't re-check predicates after the merge WILL see
-/// false negatives on shard-updated rows.
+/// SAFETY ARGUMENT — pre-filter + merge (the invariant that makes the
+/// journal union safe under predicate pushdown): predicates are a
+/// CONSERVATIVE pre-filter applied PER PACK. If a snapshot copy of a row
+/// is pre-filtered out but a journal entry UPDATED that row to match, the
+/// entry's copy survives this merge and delivers the row — the same
+/// argument the shard layer has always relied on. The AUTHORITATIVE row
+/// filter still runs post-CRDT-merge in the caller (a row whose snapshot
+/// version matches but whose journal update no longer matches is
+/// correctly dropped by it). Callers that skip the post-merge re-check
+/// see false negatives on updated rows.
 ///
-/// Args:
-///   - kernel: The PondKernel handle
-///   - collection: Collection name
-///   - branch: Branch to read from
-///   - key_fields: rowid fallback fields (mirrors the pyo3 `determine_rowid`
-///     order: `_rowid` first, then `key_fields[0]`, then `_key`/`id`/`key`)
-///   - projection: Optional requested columns (None = all columns). CRDT
-///     metadata (`_rowid`/`_version`/`_deleted`/`_tenant`), the rowid
-///     fallback columns and predicate columns are ALWAYS decoded so
-///     post-merge CRDT/RLS/rowid logic sees the same fields the old
-///     full-decode path produced.
-///   - predicates: `(column, op, value)` triples; ops `= == != <> > >= < <=`
-///     are row-filterable, of which `= == < <= > >=` also prune row groups.
+/// A collection with no snapshot AND no entries has no rows — the caller
+/// proceeds to shards (matches the old "no HEAD" behavior of treating
+/// that case as empty, not as an error).
 pub fn read_rows_json_pruned(
     kernel: &PondKernel,
     collection: &str,
@@ -969,15 +1022,46 @@ pub fn read_rows_json_pruned(
     projection: Option<&[String]>,
     predicates: &[(String, String, JsonValue)],
 ) -> Result<Vec<(String, JsonValue)>, String> {
-    // 1. Resolve HEAD — a collection with no commits has no HEAD rows; the
-    //    caller proceeds to shards (matches the old pyo3/executor behavior
-    //    of treating "no HEAD" as empty, not as an error).
-    let head = kernel.resolve(&branch_ref(collection, branch));
-    let head_hash = match head {
-        Some(h) => h,
-        None => return Ok(Vec::new()),
-    };
-    read_rows_json_pruned_with_head(kernel, &head_hash, key_fields, projection, predicates)
+    // 1. Resolve the journal view (snapshot + live entries). This is the
+    //    C9 fix: HEAD-only resolution used to hide every commit after the
+    //    first; the journal unions ALL committed data.
+    let view = crate::journal::resolve_view(kernel, collection, branch, false)?;
+    let mut packs: Vec<String> = Vec::with_capacity(view.entries.len() + 1);
+    if let Some(snapshot) = &view.snapshot {
+        packs.push(snapshot.clone());
+    }
+    packs.extend(view.entries.iter().map(|e| e.pack_hash.clone()));
+    if packs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 2. ONE pruned pipeline per pack. Each pack is exactly what
+    //    read_rows_json_pruned_with_head already handles (PNPK packs and
+    //    legacy JSON commits alike); a pack with zero surviving RGs simply
+    //    contributes zero rows (that function returns Ok(vec![]) when
+    //    every RG is pruned or the manifest is empty — it never errors on
+    //    empty manifests).
+    let mut all_rows: Vec<JsonValue> = Vec::new();
+    for pack_hash in &packs {
+        let rows = read_rows_json_pruned_with_head(
+            kernel,
+            pack_hash,
+            key_fields,
+            projection,
+            predicates,
+        )?;
+        all_rows.extend(rows.into_iter().map(|(_, row)| row));
+    }
+
+    // 3. CRDT-merge across packs (deterministic under any pack order after
+    //    the C10 total tiebreak), drop tombstones, recompute output rowids.
+    let key_col = key_fields.first().map(|s| s.as_str());
+    let merged = shard::merge_rows_by_rowid(&all_rows, key_col);
+    let live = shard::filter_live_rows(&merged);
+    Ok(live
+        .into_iter()
+        .map(|row| (determine_rowid_json(&row, key_fields), row))
+        .collect())
 }
 
 /// Head-override variant of [`read_rows_json_pruned`]: run the SAME pruned
@@ -1110,6 +1194,17 @@ pub fn read_rows_json_pruned_with_head(
     //    rows. Rows that fail the pre-filter are never converted to JSON.
     let mut rows: Vec<(String, JsonValue)> = Vec::new();
     for blob_data in &blob_data_list {
+        // LENIENT SKIP for non-PND2 blobs (raw `write()` data — the legacy
+        // base-snapshot path stores arbitrary bytes as an RG; every
+        // pre-journal reader skipped them: the old full-scan JSON reader
+        // ignored non-`[`-prefixed HEADs, `pond read` serves them raw).
+        // The journal-era union fold pulls such RGs into fold manifests,
+        // so the pipeline must tolerate them: they contribute ZERO rows,
+        // not an error (an error would make every collection that ever
+        // had a raw write unreadable through read-rows).
+        if blob_data.len() < 4 || &blob_data[0..4] != b"PND2" {
+            continue;
+        }
         let cols = pond_core::pnd2_decode_projected(blob_data, decode_set.as_ref())
             .map_err(|e| format!("Failed to decode PND2 blob: {}", e))?;
         // Degenerate-intersection guard (tribunal r1 finding 3): if the
@@ -2049,9 +2144,12 @@ mod tests {
     /// measured through this). Counts only blob payloads (get_blob /
     /// get_blob_range / get_blob_suffix / get_blob_batch); ref-path reads
     /// are identical on both sides of every comparison, so they cancel.
+    /// `list_dirs_calls` counts journal writer-discovery LISTs (the C2
+    /// warm-path budget primitive) — zero on a TTL-warm read.
     struct CountingStore {
         inner: pond_kernel::LocalFSObjectStore,
         bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        list_dirs_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl CountingStore {
@@ -2059,6 +2157,8 @@ mod tests {
             Self {
                 inner: pond_kernel::LocalFSObjectStore::new(dir).unwrap(),
                 bytes_read: std::sync::Arc::new(
+                    std::sync::atomic::AtomicU64::new(0)),
+                list_dirs_calls: std::sync::Arc::new(
                     std::sync::atomic::AtomicU64::new(0)),
             }
         }
@@ -2092,6 +2192,16 @@ mod tests {
         }
         fn list_paths(&self, prefix: &str) -> std::io::Result<Vec<String>> {
             self.inner.list_paths(prefix)
+        }
+        fn list_dirs(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+            // Delegate AND count — journal writer discovery goes through
+            // this primitive (ARCHITECTURE.md D3); the count is the C2
+            // warm-path budget metric (zero LISTs on a TTL-warm read).
+            self.list_dirs_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.list_dirs(prefix)
+        }
+        fn store_id(&self) -> String {
+            self.inner.store_id()
         }
         fn blob_exists(&self, hash: &str) -> bool {
             self.inner.blob_exists(hash)
@@ -2182,13 +2292,25 @@ mod tests {
     /// read_collection_as_json_rows_filtered did before the pruned-reader
     /// routing (and for slab-backed RGs it fetched the ENTIRE slab once per
     /// RG — 16 RGs in one slab = 16 full-slab GETs).
+    ///
+    /// Journal-aware: the "HEAD" of the emulation is the journal view's
+    /// pack set (snapshot + live entries) — for the single-pack layouts
+    /// these tests write, that is exactly the one pack the old path read.
     fn old_full_scan_bytes(kernel: &PondKernel, collection: &str, branch: &str) -> usize {
-        let head = kernel.resolve(&branch_ref(collection, branch)).unwrap();
-        let manifest_bytes = crate::commit::resolve_manifest_bytes(kernel, &head).unwrap();
-        let manifest = crate::manifest::CollectionManifest::decode(&manifest_bytes).unwrap();
+        let view = crate::journal::resolve_view(kernel, collection, branch, true).unwrap();
+        let mut packs: Vec<String> = Vec::new();
+        if let Some(snapshot) = &view.snapshot {
+            packs.push(snapshot.clone());
+        }
+        packs.extend(view.entries.iter().map(|e| e.pack_hash.clone()));
+        assert!(!packs.is_empty(), "emulated old path needs at least one pack");
         let mut total = 0usize;
-        for rg in &manifest.row_groups {
-            total += kernel.read_blob(&rg.blob_hash).unwrap().len();
+        for pack_hash in &packs {
+            let manifest_bytes = crate::commit::resolve_manifest_bytes(kernel, pack_hash).unwrap();
+            let manifest = crate::manifest::CollectionManifest::decode(&manifest_bytes).unwrap();
+            for rg in &manifest.row_groups {
+                total += kernel.read_blob(&rg.blob_hash).unwrap().len();
+            }
         }
         total
     }

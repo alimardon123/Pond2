@@ -67,23 +67,24 @@ impl Rng {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Read all live rows from a branch (HEAD + shards, CRDT-merged, tombstones filtered).
+/// Read all live rows from a branch (CRDT-merged, tombstones filtered).
 ///
-/// HEAD data that isn't valid JSON (e.g., placeholder `b"init"` commits) is
-/// silently skipped — only JSON array blobs and shard data contribute rows.
+/// JOURNAL ERA (D3): the production read path — the journal-aware pruned
+/// reader (snapshot ∪ live entry packs) — UNIONED with the legacy shard
+/// layer, mirroring the pyo3 read path exactly. The old helper read raw
+/// HEAD blobs as JSON arrays directly; it cannot see journal entries or
+/// columnar packs (which is where merged/folded rows now live), so every
+/// merge-order test would see 0 rows.
 fn read_live_rows(kernel: &PondKernel, collection: &str, branch: &str) -> Vec<Value> {
-    let mut all_rows: Vec<Value> = Vec::new();
+    // 1. Journal-aware pruned read (snapshot + live entries, merged).
+    let mut all_rows: Vec<Value> =
+        pond_storage::read::read_rows_json_pruned(kernel, collection, branch, &[], None, &[])
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect();
 
-    // Read HEAD data (skip non-JSON)
-    if let Ok(head_data) = pond_storage::read::read(kernel, collection, branch) {
-        if head_data.first() == Some(&b'[') {
-            if let Ok(arr) = serde_json::from_slice::<Vec<Value>>(&head_data) {
-                all_rows.extend(arr);
-            }
-        }
-    }
-
-    // Read all shards (CRDT)
+    // 2. Legacy shard union (the CRDT layer the python lenses still write).
     let (_, shards) = shard::read_with_shards(kernel, collection, branch);
     for (_, shard_hash) in shards {
         if let Ok(data) = kernel.read_blob(&shard_hash) {

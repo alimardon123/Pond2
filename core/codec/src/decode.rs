@@ -247,7 +247,16 @@ pub fn decode_raw(payload: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
     let data = &payload[1..];
 
     match vtype {
-        VT_INT64 => {
+        // BOOLEAN/DATE/TIMESTAMP share INT64's wire format: the encoder
+        // (TypedColumn::encode_payload) maps them to 0/1-or-epoch i64
+        // columns via encode_i64_auto, and the payload's own value_type
+        // byte is VT_INT64. Decoding them into i64_data is exactly what
+        // the readers expect (json_rows_from_cols maps VT_BOOLEAN back to
+        // bools from i64_data). Before this arm existed these vtypes fell
+        // to the catch-all and silently produced EMPTY columns — a
+        // journal compaction shard-fold RG (all-`_deleted` columns) read
+        // back as ZERO rows.
+        VT_INT64 | VT_BOOLEAN | VT_DATE | VT_TIMESTAMP => {
             let n = (data.len() / 8).min(n_rows);
             let mut vals = Vec::with_capacity(n);
             #[cfg(target_endian = "little")]
@@ -740,7 +749,9 @@ pub fn decode_rle(payload: &[u8], vtype: u8, n_rows: usize) -> PondColumn {
         if total_rows >= n_rows { break; }
 
         match vtype {
-            VT_INT64 => {
+            // Same wire format as INT64 (see decode_raw): booleans are 0/1
+            // i64 runs, dates/timestamps are epoch i64 runs.
+            VT_INT64 | VT_BOOLEAN | VT_DATE | VT_TIMESTAMP => {
                 if off + 8 > data.len() { break; }
                 let v = i64::from_le_bytes([
                     data[off], data[off+1], data[off+2], data[off+3],
@@ -1018,5 +1029,84 @@ mod tests {
         for s in &col.str_data {
             assert_eq!(s.to_bytes(), b"a");
         }
+    }
+
+    #[test]
+    fn test_boolean_date_timestamp_decode_all_encodings() {
+        // Regression (journal cycle): TypedColumn::Boolean/Date/Timestamp
+        // encode to i64 wire format but kept their own schema vtype, so
+        // decode_raw/decode_rle's strict `VT_INT64` match silently produced
+        // EMPTY columns — a compaction shard-fold RG whose first column was
+        // `_deleted` decoded to ZERO rows. Every encoding the auto-encoder
+        // can pick for these vtypes must round-trip.
+        use crate::encode::TypedColumn;
+
+        let cases: Vec<(&str, TypedColumn)> = vec![
+            // all-same → RLE
+            ("all-false", TypedColumn::Boolean(vec![false; 10])),
+            ("all-true", TypedColumn::Boolean(vec![true; 10])),
+            // low cardinality → DICT (2 unique over 30)
+            (
+                "mixed",
+                TypedColumn::Boolean(
+                    (0..30).map(|i| i % 3 == 0).collect(),
+                ),
+            ),
+            // run-heavy with two runs → RLE
+            (
+                "two-runs",
+                TypedColumn::Boolean(
+                    [vec![true; 12], vec![false; 12]].concat(),
+                ),
+            ),
+            // Date/Timestamp: same i64 wire format
+            ("dates", TypedColumn::Date((0..20).map(|i| 19000 + i).collect())),
+            ("stamps", TypedColumn::Timestamp((0..20).map(|i| 1700000000 + i * 1000).collect())),
+        ];
+
+        for (name, col) in &cases {
+            let vtype = col.vtype();
+            let enc = col.encode_encoding();
+            let payload = col.encode_payload();
+            let n = col.len();
+
+            let decoded = decode_column(&payload, vtype, enc, n);
+            assert_eq!(decoded.n_values, n,
+                "{}: decoded {} of {} values (enc={} vtype={})",
+                name, decoded.n_values, n, enc, vtype);
+            assert_eq!(decoded.i64_data.len(), n, "{}: i64_data populated", name);
+
+            // And the full-blob round-trip (schema vtype + payload together)
+            // — the path every reader takes. decode_inner stamps the SCHEMA
+            // vtype onto the decoded column, so VT_BOOLEAN survives intact.
+            let blob = crate::encode::pnd2_encode_multi_typed(&[(name, col.clone())]);
+            let cols = pnd2_decode(&blob).unwrap();
+            assert_eq!(cols.len(), 1, "{}: one column", name);
+            assert_eq!(cols[0].vtype, vtype, "{}: schema vtype survives the round-trip", name);
+            assert_eq!(cols[0].n_values, n, "{}: blob round-trip row count", name);
+            assert_eq!(cols[0].i64_data.len(), n, "{}: blob round-trip values", name);
+
+            // Value fidelity: booleans come back as the same 0/1 pattern.
+            if let TypedColumn::Boolean(vals) = col {
+                for (i, want) in vals.iter().enumerate() {
+                    assert_eq!(decoded.i64_data[i], if *want { 1 } else { 0 },
+                        "{}: value {} mismatch", name, i);
+                }
+            }
+        }
+
+        // Direct RAW decode with a VT_BOOLEAN vtype. The auto-encoder never
+        // picks RAW for booleans (range ≤ 1 always fits BITPACK/DICT/RLE
+        // heuristics), so hand-build the RAW payload exactly as
+        // encode_raw_i64_payload writes it (value_type byte + LE i64s) —
+        // that is the wire format the new VT_BOOLEAN arm documents.
+        let bools = vec![true, false, true, false, true, false, true, false];
+        let mut payload = vec![VT_INT64];
+        for b in &bools {
+            payload.extend_from_slice(&(if *b { 1i64 } else { 0i64 }).to_le_bytes());
+        }
+        let col = decode_raw(&payload, VT_BOOLEAN, bools.len());
+        assert_eq!(col.n_values, bools.len());
+        assert_eq!(col.i64_data, vec![1, 0, 1, 0, 1, 0, 1, 0]);
     }
 }

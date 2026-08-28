@@ -84,8 +84,15 @@ impl LakehouseLens {
 
     /// Insert rows into a table (append — preserves existing data).
     ///
-    /// Reads the current table data, appends the new rows, and writes
-    /// the merged result as a new commit.
+    /// JOURNAL ERA (ARCHITECTURE.md D3): writes are ADDITIVE — the entry
+    /// carries ONLY the new rows, and readers union the snapshot with every
+    /// live entry (see `read_columns`). The old read-merge-write produced a
+    /// full-table commit per insert, which only worked when reads resolved
+    /// HEAD alone; under the journal the union of two full-table entries
+    /// duplicates every pre-existing row.
+    ///
+    /// The existing-table read stays as the existence check (insert into a
+    /// missing table still errors with "no commits").
     ///
     /// Args:
     ///   - table_name: Collection name (must already exist)
@@ -101,49 +108,15 @@ impl LakehouseLens {
     ) -> Result<String, String> {
         let active = self.storage.get_active_branch(table_name);
 
-        // Read existing data
-        let existing = self.read_table(table_name)?;
-
-        // Merge: append new values to existing
-        let mut merged: Vec<(&str, TypedColumn)> = Vec::new();
-
-        for (name, new_col) in new_columns {
-            // Find matching existing column
-            let existing_col = existing.iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, c)| c.clone());
-
-            let merged_col = match (existing_col, new_col) {
-                (Some(TypedColumn::Int64(mut ex)), TypedColumn::Int64(new_vals)) => {
-                    ex.extend_from_slice(new_vals);
-                    TypedColumn::Int64(ex)
-                }
-                (Some(TypedColumn::Float64(mut ex)), TypedColumn::Float64(new_vals)) => {
-                    ex.extend_from_slice(new_vals);
-                    TypedColumn::Float64(ex)
-                }
-                (Some(TypedColumn::String(mut ex)), TypedColumn::String(new_vals)) => {
-                    ex.extend_from_slice(new_vals);
-                    TypedColumn::String(ex)
-                }
-                // Type mismatch or new column — just use the new data
-                _ => new_col.clone(),
-            };
-            merged.push((name, merged_col));
-        }
-
-        // Also keep columns that exist but aren't in new_columns
-        for (name, col) in &existing {
-            if !new_columns.iter().any(|(n, _)| n == name) {
-                merged.push((name.as_str(), col.clone()));
-            }
-        }
+        // Existence check (and schema validation hook): insert requires the
+        // table to already exist.
+        let _existing = self.read_table(table_name)?;
 
         storage_write::write_rows(
             self.storage.kernel(),
             table_name,
             &active,
-            &merged,
+            new_columns,
             if message.is_empty() { "insert" } else { message },
         )
     }
@@ -174,15 +147,23 @@ impl LakehouseLens {
     ) -> Result<Vec<(String, TypedColumn)>, String> {
         let active = self.storage.get_active_branch(table_name);
 
-        // Resolve HEAD
-        let head = self.storage.kernel().resolve(&pond_storage::branch_ref(table_name, &active))
-            .ok_or_else(|| format!("Table '{}' has no commits", table_name))?;
-
-        let manifest_bytes = storage_commit::resolve_manifest_bytes(self.storage.kernel(), &head)
-            .map_err(|e| format!("Failed to read manifest: {}", e))?;
-
-        let manifest = CollectionManifest::decode(&manifest_bytes)
-            .ok_or_else(|| "Failed to decode manifest".to_string())?;
+        // JOURNAL-AWARE (ARCHITECTURE.md D3): plain journal writes never
+        // move the branch ref — it is a CACHE of the last folded snapshot.
+        // Resolving only branch_ref would hide every live entry written
+        // since the last compaction (the C9 history-loss shape at the lens
+        // level). Resolve the journal view instead: snapshot pack + every
+        // live entry, RGs concatenated.
+        let view = pond_storage::journal::resolve_view(
+            self.storage.kernel(), table_name, &active, false,
+        )?;
+        let mut packs: Vec<String> = Vec::with_capacity(view.entries.len() + 1);
+        if let Some(snapshot) = &view.snapshot {
+            packs.push(snapshot.clone());
+        }
+        packs.extend(view.entries.iter().map(|e| e.pack_hash.clone()));
+        if packs.is_empty() {
+            return Err(format!("Table '{}' has no commits", table_name));
+        }
 
         // Build projection set
         let projection: Option<std::collections::HashSet<String>> = columns.map(|cols| {
@@ -193,45 +174,53 @@ impl LakehouseLens {
         type ColAccum = (u8, Vec<i64>, Vec<f64>, Vec<String>);
         let mut result_cols: HashMap<String, ColAccum> = HashMap::new();
 
-        for rg in &manifest.row_groups {
-            // Architecture review GAP 6 fix: use slab-aware range reads instead of
-            // full blob GETs when slab_byte_offset is set. For a 128 MB slab with
-            // 128 KB RGs, this reduces data transfer by 1000x per RG.
-            let blob_data = if let (Some(off), Some(len)) = (rg.slab_byte_offset, rg.slab_byte_len) {
-                self.storage.kernel().read_blob_range(&rg.blob_hash, off, off + len as u64)
-                    .map_err(|e| format!("Failed to read slab range for RG {}: {}", rg.key, e))?
-            } else {
-                self.storage.kernel().read_blob(&rg.blob_hash)
-                    .map_err(|e| format!("Failed to read data blob: {}", e))?
-            };
+        for pack_hash in &packs {
+            let manifest_bytes = storage_commit::resolve_manifest_bytes(self.storage.kernel(), pack_hash)
+                .map_err(|e| format!("Failed to read manifest: {}", e))?;
 
-            let cols = pond_core::pnd2_decode(&blob_data)
-                .map_err(|e| format!("Failed to decode PND2: {}", e))?;
+            let manifest = CollectionManifest::decode(&manifest_bytes)
+                .ok_or_else(|| "Failed to decode manifest".to_string())?;
 
-            for col in &cols {
-                let name = col.name.to_string_lossy().to_string();
+            for rg in &manifest.row_groups {
+                // Architecture review GAP 6 fix: use slab-aware range reads instead of
+                // full blob GETs when slab_byte_offset is set. For a 128 MB slab with
+                // 128 KB RGs, this reduces data transfer by 1000x per RG.
+                let blob_data = if let (Some(off), Some(len)) = (rg.slab_byte_offset, rg.slab_byte_len) {
+                    self.storage.kernel().read_blob_range(&rg.blob_hash, off, off + len as u64)
+                        .map_err(|e| format!("Failed to read slab range for RG {}: {}", rg.key, e))?
+                } else {
+                    self.storage.kernel().read_blob(&rg.blob_hash)
+                        .map_err(|e| format!("Failed to read data blob: {}", e))?
+                };
 
-                if let Some(ref proj) = projection {
-                    if !proj.contains(&name) { continue; }
-                }
+                let cols = pond_core::pnd2_decode(&blob_data)
+                    .map_err(|e| format!("Failed to decode PND2: {}", e))?;
 
-                let entry = result_cols.entry(name.clone()).or_insert_with(|| {
-                    (col.vtype, Vec::new(), Vec::new(), Vec::new())
-                });
+                for col in &cols {
+                    let name = col.name.to_string_lossy().to_string();
 
-                match col.vtype {
-                    VT_INT64 => {
-                        entry.1.extend_from_slice(&col.i64_data);
+                    if let Some(ref proj) = projection {
+                        if !proj.contains(&name) { continue; }
                     }
-                    VT_FLOAT64 => {
-                        entry.2.extend_from_slice(&col.f64_data);
-                    }
-                    VT_STRING => {
-                        for s in &col.str_data {
-                            entry.3.push(s.to_string_lossy().to_string());
+
+                    let entry = result_cols.entry(name.clone()).or_insert_with(|| {
+                        (col.vtype, Vec::new(), Vec::new(), Vec::new())
+                    });
+
+                    match col.vtype {
+                        VT_INT64 => {
+                            entry.1.extend_from_slice(&col.i64_data);
                         }
+                        VT_FLOAT64 => {
+                            entry.2.extend_from_slice(&col.f64_data);
+                        }
+                        VT_STRING => {
+                            for s in &col.str_data {
+                                entry.3.push(s.to_string_lossy().to_string());
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }

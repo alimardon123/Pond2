@@ -3,6 +3,57 @@
 > Crucible state file. The deep per-cycle log lives in `worklog.md`
 > (append-only); this file tracks iterations and why.
 
+## 2026-08-28 — Crucible iteration N+2: THE no-CAS journal cycle (cron-2026-08-28-0353)
+
+- **The P0 that framed everything**: discovered + verified empirically that
+  `write_rows`/SQL INSERT LOST HISTORY — every commit's manifest held only
+  its own row group while reads resolved only HEAD (2 writes × 10 rows →
+  10 readable). The CAS loop was semantically vacuous. Recorded as C9.
+- **D3 landed (the owner's core architectural directive)**: per-writer
+  immutable journal at
+  `collections/<c>/_branches/<b>/journal/<writer_id>/<seq:012>` — every
+  structured write path (write_rows, write_rows_i64, _packed, _slab,
+  SlabWriter) appends a PNPK pack at a unique path via plain PUT: always
+  succeeds, zero retries, identical on localfs/S3/R2, ZERO shared-object
+  writes. The CAS loop is DELETED; `put_path_if` has no production callers.
+- Readers = snapshot ∪ live entries: `read_rows_json_pruned` (and the i64 /
+  raw-RG / lakehouse / vector paths) resolve the journal view — branch-ref
+  snapshot + parallel per-writer epoch probes from the `upto` watermark —
+  and CRDT-merge (LWW by _version, total tiebreak (_version, _rowid,
+  payload) — C10 fixed in shard.rs + pyo3). Warm path: ZERO LISTs on a
+  fresh discovery cache (TTL default 1s, `POND_JOURNAL_TTL_MS=0` for exact
+  freshness); CountingStore proves the exact GET/LIST counts.
+- Compaction: manifest-level union fold (O(metadata), never reads data
+  blobs), fold pack appended to the compactor's log FIRST then branch ref
+  LWW-advanced (benign race — every ref value is a valid folded state),
+  delta-only entry deletes, upto-map pruning, LocalFS empty-writer-dir
+  cleanup, auto-compact at `POND_JOURNAL_AUTO_COMPACT` (default 32) with a
+  bootstrap fold on first write. Tombstones are deletion-as-data (kept in
+  folds — no resurrection). CLI: `pond journal-status` + `pond compact` +
+  journal-aware `history` (folds list preserves folded write messages).
+- **Three latent bugs surfaced by the journal and fixed**: (1) PMAN v2
+  corrupts when RG stats count ≠ schema count (manifest::
+  normalize_rgs_to_schema now guards every multi-origin manifest);
+  (2) branch-merge's re-encoder had no bool arm — `_deleted: true` encoded
+  as i64 1 and VT_BOOLEAN columns vanished on decode → deleted rows
+  RESURRECTED after every merge; (3) pyo3 compact_shards deleted shards
+  without folding them (data-loss footgun) — now a real fold.
+- **Tribunal r2 verdict: FAIL (repairable) → repaired same-cycle**:
+  F1 raw-`write()` journal blindness (probes died at fold-deleted gaps;
+  fixed by watermark carry into write()/merge() commits + plain-commit
+  upto parsing + child-process regression test), F2 compactor-race row
+  duplication for concatenating readers (resolve_view drops fully-covered
+  compact entries; partial-overlap residual = C11), F3 quadratic delete
+  loop, F6 unbounded writer growth, F8 test-honesty (child-process and
+  fabricated-multi-writer tests added). Harness: 511 → 542 tests, clippy
+  clean, moto 32/32, live R2 35/35.
+- Behavior changes (honest): `write-rows` now APPENDS (journal semantics)
+  where it previously REPLACED the branch HEAD — the old behavior was the
+  C9 data-loss bug, and the moto/R2 tests asserted it (updated with the
+  rationale); `pond history` may show `journal compaction` entries between
+  user writes; raw `write()` still replaces the folded base but carries
+  the journal watermark.
+
 ## 2026-08-28 — Crucible iteration N+1 (cycle cron-2026-08-28-0120)
 
 - Phase 0/1: wrote `ACCEPTANCE.md` + `ARCHITECTURE.md` + `SCORECARD.md` +

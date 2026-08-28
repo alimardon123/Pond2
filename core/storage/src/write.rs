@@ -2,14 +2,21 @@
 //
 // Two write paths:
 //   1. write() — raw bytes (JSON or any format). Simple, used by CLI.
-//   2. write_rows() — structured rows encoded as PND2. Production path
+//      LEGACY base-snapshot path: sets the branch ref (plain reference(),
+//      no CAS — it always was CAS-free).
+//   2. write_rows()* — structured rows encoded as PND2. Production paths
 //      with column stats, auto-encoding (RLE/DICT/BITPACK/RAW), and
 //      proper manifest entries for pruning/projection.
 //
-// Both paths create a commit and update branch refs identically.
+// JOURNAL ERA (ARCHITECTURE.md D3): every structured write path appends
+// its pack (commit JSON + manifest in ONE PNPK blob) to the per-writer
+// journal at a UNIQUE path via a plain PUT — no CAS, no retries, no
+// shared-object writes (CRITIQUE C4). The branch ref moves only when
+// `journal::compact` folds a new snapshot. History preservation (the C9
+// P0: every commit after the first used to hide its predecessors) comes
+// from readers unioning the snapshot with every live journal entry.
 
 use crate::commit;
-use crate::pond_pack;
 use crate::manifest::{CollectionManifest, ColumnStatsEntry, LeafEntry, MAX_LEAF_RGS, RootManifest, RowGroupEntry, compute_key_range};
 use crate::slab;
 use crate::{branch_ref, manifest_ref};
@@ -74,6 +81,14 @@ pub fn maybe_compress_pnd2(blob: &[u8]) -> Vec<u8> {
 ///
 /// The data is stored as-is (no PND2 encoding). Use write_rows() for
 /// structured data that benefits from columnar encoding + pruning.
+///
+/// JOURNAL-ERA ROLE (ARCHITECTURE.md D3): this is the LEGACY base-snapshot
+/// path — it sets the branch ref to a base snapshot pack (plain
+/// `reference()`, no CAS; it was always CAS-free). Journal entries written
+/// AFTER such a call union in on top of this base at read time (reads =
+/// snapshot ∪ live entries), so raw writes and journal writes compose.
+/// Only `compact` and this path ever write the branch ref; plain journal
+/// writes touch ZERO shared objects (CRITIQUE C4).
 pub fn write(
     kernel: &PondKernel,
     collection: &str,
@@ -92,6 +107,18 @@ pub fn write(
         .map(|c| c.index + 1)
         .unwrap_or(0);
 
+    // JOURNAL WATERMARK CARRY (tribunal F1 fix): the new base snapshot
+    // REPLACES the previous ref's folded data, but must inherit its
+    // `journal.upto` watermark — the live journal tail above that
+    // watermark still unions in on top of this base. Without the carry,
+    // the plain commit would read as upto={}: after any fold deleted a
+    // writer's early entries, probes from seq 1 would die at the first
+    // gap and the writer's live tail would be INVISIBLE forever (a fresh
+    // process read 0 rows for 10 committed — verified by the tribunal).
+    let carried_upto = parent.as_ref()
+        .map(|p| crate::journal::read_snapshot_upto(kernel, p))
+        .unwrap_or_default();
+
     // Build a simple manifest with one row group pointing at the data blob
     let mut manifest = CollectionManifest::new(vec![], String::new());
     manifest.add_row_group(RowGroupEntry {
@@ -106,11 +133,25 @@ pub fn write(
     let manifest_hash = kernel.write(&manifest_bytes)
         .map_err(|e| format!("Failed to write manifest: {}", e))?;
 
-    // Write the commit
-    let commit_hash = commit::write_commit(
-        kernel, collection, &manifest_hash, parent.as_deref(), None,
-        if message.is_empty() { "write" } else { message }, parent_index,
-    ).map_err(|e| format!("Failed to write commit: {}", e))?;
+    // Write the commit — inline JSON (not commit::write_commit) so the
+    // carried watermark can be stamped into `journal.upto`.
+    let mut commit_obj = serde_json::json!({
+        "parent": parent,
+        "second_parent": null,
+        "manifest": manifest_hash,
+        "message": if message.is_empty() { "write" } else { message },
+        "timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0),
+        "index": parent_index,
+    });
+    if !carried_upto.is_empty() {
+        commit_obj["journal"] = serde_json::json!({ "upto": carried_upto });
+    }
+    let commit_bytes = commit_obj.to_string().into_bytes();
+    let commit_hash = kernel.write(&commit_bytes)
+        .map_err(|e| format!("Failed to write commit: {}", e))?;
 
     // Update branch refs
     kernel.reference(&branch_ref(collection, active_branch), &commit_hash)
@@ -151,13 +192,6 @@ pub fn write_rows_i64(
     let blob = maybe_compress_pnd2(&blob);
     let data_hash = kernel.write(&blob)
         .map_err(|e| format!("Failed to write PND2 blob: {}", e))?;
-
-    // Get parent commit
-    let parent = kernel.resolve(&branch_ref(collection, active_branch));
-    let parent_index = parent.as_ref()
-        .and_then(|p| commit::read_commit(kernel, p))
-        .map(|c| c.index + 1)
-        .unwrap_or(0);
 
     // Build manifest with schema + column stats
     let schema: Vec<(String, u8)> = columns.iter()
@@ -200,23 +234,38 @@ pub fn write_rows_i64(
     });
 
     let manifest_bytes = manifest.encode();
-    let manifest_hash = kernel.write(&manifest_bytes)
-        .map_err(|e| format!("Failed to write manifest: {}", e))?;
 
-    // Write the commit
-    let commit_hash = commit::write_commit(
-        kernel, collection, &manifest_hash, parent.as_deref(), None,
-        if message.is_empty() { "write_rows" } else { message }, parent_index,
-    ).map_err(|e| format!("Failed to write commit: {}", e))?;
+    // JOURNAL APPEND (ARCHITECTURE.md D3): the pack (commit JSON +
+    // manifest in ONE blob) is appended at a UNIQUE path
+    // journal/<writer_id>/<seq> via a plain PUT — always succeeds, zero
+    // retries, on localfs and S3/R2 identically. No branch_ref write, no
+    // derived refs: journal-era writes touch ZERO shared objects (C4),
+    // and readers union the snapshot with every live entry (C9 fix).
+    let parent = kernel.resolve(&branch_ref(collection, active_branch));
+    let parent_index = parent.as_ref()
+        .and_then(|p| commit::read_commit(kernel, p))
+        .map(|c| c.index + 1)
+        .unwrap_or(0);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let mut commit_obj = serde_json::json!({
+        "parent": parent,
+        "second_parent": null,
+        "manifest": "packed",
+        "message": if message.is_empty() { "write_rows" } else { message },
+        "timestamp": timestamp,
+        "index": parent_index,
+    });
+    let key_fields: Vec<String> = columns.first()
+        .map(|(name, _)| vec![name.to_string()])
+        .unwrap_or_default();
+    let (pack_hash, _seq) = crate::journal::append_pack(
+        kernel, collection, active_branch, &mut commit_obj, &manifest_bytes, &key_fields,
+    )?;
 
-    // Update branch refs
-    kernel.reference(&branch_ref(collection, active_branch), &commit_hash)
-        .map_err(|e| format!("Failed to update branch ref: {}", e))?;
-    kernel.reference(&manifest_ref(collection, active_branch), &manifest_hash)
-        .map_err(|e| format!("Failed to update manifest ref: {}", e))?;
-    let _ = kernel.reference(collection, &commit_hash);
-
-    Ok(commit_hash)
+    Ok(pack_hash)
 }
 
 /// Write structured rows as PND2 + PondPack (commit+manifest in ONE blob).
@@ -296,25 +345,25 @@ pub fn write_rows_i64_packed(
     let manifest_bytes = manifest.encode();
 
     // 4. Build commit object
-    let commit_obj = serde_json::json!({
+    let mut commit_obj = serde_json::json!({
         "parent": parent,
-        "manifest": "",
+        "manifest": "packed",
         "message": if message.is_empty() { "write_rows_packed" } else { message },
         "timestamp": 0,
         "index": parent_index,
     });
 
-    // 5. Encode as PondPack (commit JSON + manifest bytes in ONE blob)
-    let pack_bytes = crate::pond_pack::encode_pack(&commit_obj, &manifest_bytes, None);
-    let pack_hash = kernel.write(&pack_bytes)
-        .map_err(|e| format!("Failed to write pack blob: {}", e))?;
-
-    // 6. Update branch refs — both point to the pack hash
-    kernel.reference(&branch_ref(collection, active_branch), &pack_hash)
-        .map_err(|e| format!("Failed to update branch ref: {}", e))?;
-    kernel.reference(&manifest_ref(collection, active_branch), &pack_hash)
-        .map_err(|e| format!("Failed to update manifest ref: {}", e))?;
-    let _ = kernel.reference(collection, &pack_hash);
+    // 5. JOURNAL APPEND (ARCHITECTURE.md D3): the pack goes to a unique
+    //    journal path via a plain PUT — always succeeds, zero retries, no
+    //    shared-object writes (C4). Readers union the snapshot with every
+    //    live entry (C9 fix). The pack blob itself is written inside
+    //    append_pack (one write, same as before — but no ref PUTs after it).
+    let key_fields: Vec<String> = columns.first()
+        .map(|(name, _)| vec![name.to_string()])
+        .unwrap_or_default();
+    let (pack_hash, _seq) = crate::journal::append_pack(
+        kernel, collection, active_branch, &mut commit_obj, &manifest_bytes, &key_fields,
+    )?;
 
     Ok(pack_hash)
 }
@@ -433,67 +482,51 @@ fn write_rows_inner(
 
     let manifest_bytes = manifest.encode();
 
-    // CAS COMMIT LOOP — closes the multi-writer lost-update hole (review bug #1).
+    // JOURNAL APPEND (ARCHITECTURE.md D3) — the CAS loop is GONE.
     //
-    // The old unconditional `reference()` meant two concurrent write_rows that
-    // both parented off H0 would both succeed: the second PUT silently
-    // overwrote the first commit's parent link, ORPHANING one commit chain
-    // (rows lost from HEAD's history). reference_if() is a true CAS:
-    //   - S3/R2: conditional PUT with If-Match ETag (atomic at the store)
-    //   - CachingObjectStore forwards to inner + refreshes/drops its ref cache
-    //   - LocalFS: read-check-write (default impl; single-process safe)
+    // History: the CAS loop (172a3da) closed the ref-race lost-update hole
+    // on S3/R2, but it was SEMANTICALLY VACUOUS for data (CRITIQUE C9):
+    // a "loser" rebuilt its pack, but the rebuilt pack still contained only
+    // the loser's own row group — while the read path resolved only HEAD,
+    // so every commit after the first silently hid its predecessors'
+    // rows. CAS serialized the ref while the data was still lost.
     //
-    // The branch ref is the linearization point and the read path's source of
-    // truth. Losers of the race re-read HEAD and rebuild their pack (the data
-    // blob is content-addressed and NOT rewritten; the superseded pack blobs
-    // become unreferenced garbage that GC/vacuum can reclaim).
+    // The journal removes the need for serialization entirely:
+    //   - the pack (commit JSON + manifest, ONE blob) is appended at a
+    //     UNIQUE path journal/<writer_id>/<seq:012> via a plain PUT —
+    //     always succeeds, zero retries, identical semantics on localfs
+    //     and S3/R2 (put_path_if has NO production callers anymore);
+    //   - the writer's own seq counter (registry-serialized) keeps its log
+    //     strictly sequential, which is what makes epoch probing total;
+    //   - readers union the snapshot with every live entry (C9 fixed).
+    //
+    // The branch ref is NOT touched: journal-era writes touch ZERO shared
+    // objects (CRITIQUE C4) — no branch_ref, no manifest_ref, no bare
+    // collection ref. Those stay where the legacy paths left them until
+    // `journal::compact` LWW-advances the branch ref to a folded snapshot.
+    let parent = kernel.resolve(&branch_ref(collection, active_branch));
+    let parent_index = parent.as_ref()
+        .and_then(|p| commit::read_commit(kernel, p))
+        .map(|c| c.index + 1)
+        .unwrap_or(0);
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
-    let b_ref = branch_ref(collection, active_branch);
-    const MAX_CAS_ATTEMPTS: usize = 5;
-    let mut pack_hash: Option<String> = None;
-    for _attempt in 0..MAX_CAS_ATTEMPTS {
-        let parent = kernel.resolve(&b_ref);
-        let parent_index = parent.as_ref()
-            .and_then(|p| commit::read_commit(kernel, p))
-            .map(|c| c.index + 1)
-            .unwrap_or(0);
-
-        let commit_obj = serde_json::json!({
-            "parent": parent,
-            "second_parent": null,
-            "manifest": "packed",
-            "message": if message.is_empty() { "write_rows" } else { message },
-            "timestamp": timestamp,
-            "index": parent_index,
-        });
-
-        // Encode as PondPack (commit + manifest combined) → saves 1 S3 PUT
-        let pack_bytes = pond_pack::encode_pack(&commit_obj, &manifest_bytes, None);
-        let candidate = kernel.write(&pack_bytes)
-            .map_err(|e| format!("Failed to write PondPack: {}", e))?;
-
-        let won = kernel.reference_if(&b_ref, parent.as_deref(), &candidate)
-            .map_err(|e| format!("Failed to CAS branch ref: {}", e))?;
-        if won {
-            pack_hash = Some(candidate);
-            break;
-        }
-        // Lost the race — HEAD moved under us. Retry against the new HEAD.
-    }
-    let pack_hash = pack_hash.ok_or_else(|| {
-        format!("Lost {} concurrent-writer races on '{}' — retry the write", MAX_CAS_ATTEMPTS, b_ref)
-    })?;
-
-    // Derived refs (legacy/compat readers): the branch ref is authoritative
-    // for the read path; these are refreshed only AFTER winning the CAS so
-    // they can never claim a commit that lost the linearization point.
-    // manifest_ref → pack_hash (load_manifest in branch.rs handles PNPK)
-    kernel.reference(&manifest_ref(collection, active_branch), &pack_hash)
-        .map_err(|e| format!("Failed to update manifest ref: {}", e))?;
-    let _ = kernel.reference(collection, &pack_hash);
+    let mut commit_obj = serde_json::json!({
+        "parent": parent,
+        "second_parent": null,
+        "manifest": "packed",
+        "message": if message.is_empty() { "write_rows" } else { message },
+        "timestamp": timestamp,
+        "index": parent_index,
+    });
+    let key_fields: Vec<String> = final_columns.first()
+        .map(|(name, _)| vec![name.to_string()])
+        .unwrap_or_default();
+    let (pack_hash, _seq) = crate::journal::append_pack(
+        kernel, collection, active_branch, &mut commit_obj, &manifest_bytes, &key_fields,
+    )?;
 
     Ok(pack_hash)
 }
@@ -629,23 +662,31 @@ pub fn write_rows_i64_slab<'a>(
     }
 
     let manifest_bytes = manifest.encode();
-    let manifest_hash = kernel.write(&manifest_bytes)
-        .map_err(|e| format!("Failed to write manifest: {}", e))?;
 
-    // 7. Write the commit
-    let commit_hash = commit::write_commit(
-        kernel, collection, &manifest_hash, parent.as_deref(), None,
-        if message.is_empty() { "write_rows_slab" } else { message }, parent_index,
-    ).map_err(|e| format!("Failed to write commit: {}", e))?;
+    // 7. JOURNAL APPEND (ARCHITECTURE.md D3): same treatment as the other
+    //    structured write paths — pack (commit JSON + manifest) appended at
+    //    a unique journal path, ZERO shared-object writes, no CAS. Readers
+    //    union the snapshot with every live entry (C9 fix).
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let mut commit_obj = serde_json::json!({
+        "parent": parent,
+        "second_parent": null,
+        "manifest": "packed",
+        "message": if message.is_empty() { "write_rows_slab" } else { message },
+        "timestamp": timestamp,
+        "index": parent_index,
+    });
+    let key_fields: Vec<String> = row_groups[0].first()
+        .map(|(name, _)| vec![name.to_string()])
+        .unwrap_or_default();
+    let (pack_hash, _seq) = crate::journal::append_pack(
+        kernel, collection, active_branch, &mut commit_obj, &manifest_bytes, &key_fields,
+    )?;
 
-    // 8. Update branch refs
-    kernel.reference(&branch_ref(collection, active_branch), &commit_hash)
-        .map_err(|e| format!("Failed to update branch ref: {}", e))?;
-    kernel.reference(&manifest_ref(collection, active_branch), &manifest_hash)
-        .map_err(|e| format!("Failed to update manifest ref: {}", e))?;
-    let _ = kernel.reference(collection, &commit_hash);
-
-    Ok(commit_hash)
+    Ok(pack_hash)
 }
 
 
@@ -851,7 +892,9 @@ impl<'a> SlabWriter<'a> {
     ///
     /// If ≤ 1024 RGs, produces a single PMAN v2 manifest (backward compatible).
     ///
-    /// Returns the commit hash. Consumes self (cannot write more after flush).
+    /// Returns the pack hash (journal-era semantics: the flush lands as ONE
+    /// journal entry; the branch ref moves only at compaction). Consumes
+    /// self (cannot write more after flush).
     pub fn flush(mut self, message: &str) -> Result<String, String> {
         self.flush_slab()?; // flush partial buffer
 
@@ -862,17 +905,18 @@ impl<'a> SlabWriter<'a> {
         let schema = self.schema.clone().unwrap();
         let key_col = self.key_col.clone().unwrap_or_default();
 
-        // Determine manifest hash: v3 root if > MAX_LEAF_RGS, v2 leaf otherwise
-        let manifest_hash = if self.completed_rgs.len() > MAX_LEAF_RGS {
+        // Determine pack: v3 root manifest if > MAX_LEAF_RGS, v2 flat otherwise
+        let pack_hash = if self.completed_rgs.len() > MAX_LEAF_RGS {
             self.flush_as_tree(&schema, &key_col, message)?
         } else {
             self.flush_as_flat(&schema, &key_col, message)?
         };
 
-        Ok(manifest_hash)
+        Ok(pack_hash)
     }
 
-    /// Flat flush: single PMAN v2 manifest (backward compatible, ≤1024 RGs).
+    /// Flat flush: single PMAN v2 manifest (backward compatible, ≤1024 RGs),
+    /// packed + journal-appended (ARCHITECTURE.md D3).
     fn flush_as_flat(
         &self,
         schema: &[(String, u8)],
@@ -885,19 +929,15 @@ impl<'a> SlabWriter<'a> {
         }
 
         let manifest_bytes = manifest.encode();
-        let manifest_hash = self.kernel.write(&manifest_bytes)
-            .map_err(|e| format!("SlabWriter: failed to write manifest: {}", e))?;
-
-        let commit_hash = self.commit(&manifest_hash, message)?;
-        Ok(commit_hash)
+        self.commit(&manifest_bytes, message)
     }
 
     /// Tree flush: PMAN v3 root + PMAN v2 leaves (>1024 RGs).
     ///
     /// Chunks completed_rgs into leaves of MAX_LEAF_RGS each, writes each
-    /// leaf as a PMAN v2 manifest, then writes a PMAN v3 root pointing to
-    /// all leaves. The root is tiny (~100 B/leaf) and stays under 1 MB even
-    /// at 8K leaves (8.2M RGs, 1 TB of data).
+    /// leaf as a PMAN v2 manifest, then packs a PMAN v3 root pointing to
+    /// all leaves into the journal entry. The root is tiny (~100 B/leaf)
+    /// and stays under 1 MB even at 8K leaves (8.2M RGs, 1 TB of data).
     fn flush_as_tree(
         &self,
         schema: &[(String, u8)],
@@ -932,37 +972,44 @@ impl<'a> SlabWriter<'a> {
             });
         }
 
-        // Write root manifest
+        // Pack the root manifest into the journal entry (leaf manifests
+        // remain separate blobs referenced by the root).
         let root_bytes = root.encode();
-        let root_hash = self.kernel.write(&root_bytes)
-            .map_err(|e| format!("SlabWriter: failed to write root manifest: {}", e))?;
-
-        let commit_hash = self.commit(&root_hash, message)?;
-        Ok(commit_hash)
+        self.commit(&root_bytes, message)
     }
 
-    /// Shared commit flow: write commit JSON + update branch refs.
-    fn commit(&self, manifest_hash: &str, message: &str) -> Result<String, String> {
+    /// Shared commit flow: journal-append the pack (commit JSON + manifest
+    /// bytes in ONE blob) — same D3 treatment as every write path: unique
+    /// path, plain PUT, zero shared-object writes (the branch ref moves
+    /// only at compaction).
+    fn commit(&self, manifest_bytes: &[u8], message: &str) -> Result<String, String> {
         let parent = self.kernel.resolve(&branch_ref(self.collection, self.active_branch));
         let parent_index = parent.as_ref()
             .and_then(|p| commit::read_commit(self.kernel, p))
             .map(|c| c.index + 1)
             .unwrap_or(0);
 
-        let commit_hash = commit::write_commit(
-            self.kernel, self.collection, manifest_hash,
-            parent.as_deref(), None,
-            if message.is_empty() { "slab_write" } else { message },
-            parent_index,
-        ).map_err(|e| format!("SlabWriter: commit failed: {}", e))?;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let mut commit_obj = serde_json::json!({
+            "parent": parent,
+            "second_parent": null,
+            "manifest": "packed",
+            "message": if message.is_empty() { "slab_write" } else { message },
+            "timestamp": timestamp,
+            "index": parent_index,
+        });
+        let key_fields: Vec<String> = self.key_col.clone()
+            .map(|kc| vec![kc])
+            .unwrap_or_default();
+        let (pack_hash, _seq) = crate::journal::append_pack(
+            self.kernel, self.collection, self.active_branch,
+            &mut commit_obj, manifest_bytes, &key_fields,
+        )?;
 
-        self.kernel.reference(&branch_ref(self.collection, self.active_branch), &commit_hash)
-            .map_err(|e| format!("SlabWriter: branch ref failed: {}", e))?;
-        self.kernel.reference(&manifest_ref(self.collection, self.active_branch), manifest_hash)
-            .map_err(|e| format!("SlabWriter: manifest ref failed: {}", e))?;
-        let _ = self.kernel.reference(self.collection, &commit_hash);
-
-        Ok(commit_hash)
+        Ok(pack_hash)
     }
 
     /// Returns the number of row groups currently buffered (not yet flushed).
@@ -981,6 +1028,7 @@ mod tests {
     use super::*;
     use crate::UnifiedStorage;
     use crate::commit;
+    use crate::pond_pack;
 
     #[test]
     fn test_maybe_compress_pnd2_small_blob_unchanged() {
@@ -1069,14 +1117,20 @@ mod tests {
             "insert 5 users",
         ).unwrap();
 
-        // Verify commit exists
+        // Verify the journal entry pack exists (journal-era semantics:
+        // the returned hash is the PNPK entry pack; the branch ref points
+        // at the bootstrap FOLD of it — a different pack — never at the
+        // latest entry itself).
         let commit = commit::read_commit(kernel, &hash).unwrap();
         assert_eq!(commit.message, "insert 5 users");
         assert_eq!(commit.index, 0);
+        assert_eq!(commit.manifest, "packed", "pack carries the manifest inline");
+        let branch = kernel.resolve(&branch_ref("users", "main"))
+            .expect("bootstrap fold advanced the branch ref (sanctioned writer: compact)");
+        assert_ne!(branch, hash, "branch_ref is the FOLD pack, not the entry pack");
 
-        // Verify the PND2 blob can be decoded
-        let manifest_hash = &commit.manifest;
-        let manifest_data = kernel.read_blob(manifest_hash).unwrap();
+        // Verify the PND2 blob can be decoded (manifest comes from the pack)
+        let manifest_data = commit::resolve_manifest_bytes(kernel, &hash).unwrap();
         let manifest = CollectionManifest::decode(&manifest_data).expect("manifest should decode");
         assert_eq!(manifest.row_groups.len(), 1);
         assert_eq!(manifest.row_groups[0].n_rows, 5);
@@ -1137,10 +1191,11 @@ mod tests {
         assert_eq!(cols[0].i64_data, ids);
         assert_eq!(cols[1].i64_data, scores);
 
-        // Verify only 2 blobs were written (1 pack + 1 data) — NOT 3 (commit + manifest + data)
-        // The pack replaces both commit and manifest with ONE blob
+        // Verify blob count: 1 entry pack + 1 data blob + 1 bootstrap-fold
+        // pack (the first write on a fresh collection folds immediately —
+        // the fold is metadata-level and reuses the SAME data blob).
         let all_blobs = kernel.list_names_prefix("blobs/");
-        assert_eq!(all_blobs.len(), 2, "packed write should create 2 blobs (pack + data), got {}", all_blobs.len());
+        assert_eq!(all_blobs.len(), 3, "packed write should create 3 blobs (entry pack + data + bootstrap fold), got {}", all_blobs.len());
     }
 
     #[test]
@@ -1167,12 +1222,13 @@ mod tests {
 
         let hash = write_rows_i64_slab(kernel, "slab_test", "main", &rgs, "3 RGs as slab").unwrap();
 
-        // Verify commit exists
+        // Verify the journal entry pack exists
         let commit_obj = commit::read_commit(kernel, &hash).unwrap();
         assert_eq!(commit_obj.message, "3 RGs as slab");
 
         // Verify the manifest is decodable and has correct RG count
-        let manifest_bytes = kernel.read_blob(&commit_obj.manifest).unwrap();
+        // (journal-era: manifest bytes live INSIDE the PNPK pack)
+        let manifest_bytes = commit::resolve_manifest_bytes(kernel, &hash).unwrap();
         let manifest = CollectionManifest::decode(&manifest_bytes).expect("slab manifest should decode");
         assert_eq!(manifest.row_groups.len(), 3);
 
@@ -1224,8 +1280,7 @@ mod tests {
         let hash = write_rows_i64_slab(kernel, "slab_bloom", "main", &rgs, "bloom slab").unwrap();
 
         // 1. The slab blob must have the PSLB bloom flag set.
-        let commit_obj = commit::read_commit(kernel, &hash).unwrap();
-        let manifest_bytes = kernel.read_blob(&commit_obj.manifest).unwrap();
+        let manifest_bytes = commit::resolve_manifest_bytes(kernel, &hash).unwrap();
         let manifest = CollectionManifest::decode(&manifest_bytes).unwrap();
         let slab_hash = manifest.row_groups[0].blob_hash.clone();
         let header = kernel.read_blob_range(&slab_hash, 0, slab::PSLB_HEADER_LEN as u64).unwrap();
@@ -1271,14 +1326,16 @@ mod tests {
 
         let mut sw = SlabWriter::new(kernel, "sw_test", "main");
         sw.write_rows_i64(&[("id", &ids), ("val", &vals)]).unwrap();
-        let commit_hash = sw.flush("single batch").unwrap();
+        let pack_hash = sw.flush("single batch").unwrap();
 
-        // Verify commit exists
-        let commit = commit::read_commit(kernel, &commit_hash).unwrap();
+        // Verify the journal entry pack exists (journal-era: flush lands as
+        // ONE journal entry; the branch ref moves only at compaction).
+        let commit = commit::read_commit(kernel, &pack_hash).unwrap();
         assert_eq!(commit.message, "single batch");
 
-        // Verify manifest has 1 RG with slab offsets
-        let manifest_bytes = kernel.read_blob(&commit.manifest).unwrap();
+        // Verify manifest has 1 RG with slab offsets (manifest bytes live
+        // INSIDE the PNPK pack)
+        let manifest_bytes = commit::resolve_manifest_bytes(kernel, &pack_hash).unwrap();
         let manifest = CollectionManifest::decode(&manifest_bytes).unwrap();
         assert_eq!(manifest.row_groups.len(), 1);
         assert!(manifest.row_groups[0].slab_byte_offset.is_some());
@@ -1305,11 +1362,11 @@ mod tests {
         }
         assert_eq!(sw.buffered_count(), 5);
         assert_eq!(sw.completed_count(), 0);
-        let commit_hash = sw.flush("5 batches").unwrap();
+        let pack_hash = sw.flush("5 batches").unwrap();
 
         // Verify manifest has 5 RGs all pointing to the same slab
-        let commit = commit::read_commit(kernel, &commit_hash).unwrap();
-        let manifest_bytes = kernel.read_blob(&commit.manifest).unwrap();
+        // (journal-era: manifest bytes live INSIDE the PNPK pack)
+        let manifest_bytes = commit::resolve_manifest_bytes(kernel, &pack_hash).unwrap();
         let manifest = CollectionManifest::decode(&manifest_bytes).unwrap();
         assert_eq!(manifest.row_groups.len(), 5);
 
@@ -1359,20 +1416,19 @@ mod tests {
         let storage = UnifiedStorage::new_local(dir.path()).unwrap();
         let kernel = storage.kernel();
 
-        // Write 3 RGs via SlabWriter (creates a v2 manifest since ≤1024 RGs)
+        // Write 3 RGs via SlabWriter (journal-era: the flush lands as ONE
+        // journal entry pack carrying a v2 manifest, since ≤1024 RGs)
         let mut sw = SlabWriter::new(kernel, "tree_test", "main");
         for i in 0..3 {
             let ids = vec![(i * 3 + 1) as i64, (i * 3 + 2) as i64, (i * 3 + 3) as i64];
             let vals = vec![(i * 30 + 10) as i64, (i * 30 + 20) as i64, (i * 30 + 30) as i64];
             sw.write_rows_i64(&[("id", &ids), ("val", &vals)]).unwrap();
         }
-        let _commit_hash = sw.flush("v2 baseline").unwrap();
+        let v2_pack_hash = sw.flush("v2 baseline").unwrap();
 
-        // Now manually create a v3 tree: split the 3 RGs into 2 leaves
-        // Read the v2 manifest to get the RG entries
-        let head = kernel.resolve(&branch_ref("tree_test", "main")).unwrap();
-        let commit_obj = commit::read_commit(kernel, &head).unwrap();
-        let manifest_bytes = kernel.read_blob(&commit_obj.manifest).unwrap();
+        // Now manually create a v3 tree: split the 3 RGs into 2 leaves.
+        // Read the v2 manifest out of the journal entry pack.
+        let manifest_bytes = commit::resolve_manifest_bytes(kernel, &v2_pack_hash).unwrap();
         let v2_manifest = CollectionManifest::decode(&manifest_bytes).unwrap();
         assert_eq!(v2_manifest.row_groups.len(), 3);
 
@@ -1405,29 +1461,37 @@ mod tests {
         // Write root and point commit at it
         let root_hash = kernel.write(&root.encode()).unwrap();
         let new_commit = commit::write_commit(
-            kernel, "tree_test", &root_hash, Some(&head), None,
+            kernel, "tree_test", &root_hash, Some(&v2_pack_hash), None,
             "v3 tree commit", 1,
         ).unwrap();
         kernel.reference(&branch_ref("tree_test", "main"), &new_commit).unwrap();
 
-        // Now read back via the standard read path — it should transparently
-        // resolve the v3 root → fetch leaves → merge RGs → read data
-        let cols = crate::read::read_rows_i64(kernel, "tree_test", "main", None, None).unwrap();
-        let id_col = cols.iter().find(|(n, _)| n == "id").unwrap();
-        let val_col = cols.iter().find(|(n, _)| n == "val").unwrap();
-        assert_eq!(id_col.1.len(), 9, "should have 9 rows total");
-        assert_eq!(val_col.1.len(), 9);
+        // Now read back via the pruned pipeline — it should transparently
+        // resolve the v3 root → fetch leaves → merge RGs → read data. The
+        // head-override variant is PURE (no journal resolution), so this
+        // reads exactly the v3 tree (the journal entry from sw.flush holds
+        // the same rows and would double-count in the union — the manual
+        // branch_ref here does not carry an `upto` map saying it folds it).
+        let cols = crate::read::read_rows_json_pruned_with_head(
+            kernel, &new_commit, &["_rowid".to_string()], None, &[],
+        ).unwrap();
+        let id_vals: Vec<i64> = cols.iter().map(|(_, r)| r["id"].as_i64().unwrap_or(-1)).collect();
+        let val_vals: Vec<i64> = cols.iter().map(|(_, r)| r["val"].as_i64().unwrap_or(-1)).collect();
+        let mut sorted_ids = id_vals.clone();
+        sorted_ids.sort_unstable();
+        assert_eq!(sorted_ids, vec![1, 2, 3, 4, 5, 6, 7, 8, 9], "should have 9 rows total");
         // Verify first and last values
-        assert_eq!(id_col.1[0], 1);
-        assert_eq!(id_col.1[8], 9);
-        assert_eq!(val_col.1[0], 10);
-        assert_eq!(val_col.1[8], 90);
+        assert_eq!(*id_vals.iter().min().unwrap(), 1);
+        assert_eq!(*id_vals.iter().max().unwrap(), 9);
+        assert!(val_vals.contains(&10) && val_vals.contains(&90));
     }
 
     #[test]
     fn test_write_rows_packed_commit_chain() {
-        // Verify write_rows (PondPack path) chains commits correctly.
-        // Parent is a PNPK pack, child should be able to read parent's commit.
+        // Journal-era semantics (ARCHITECTURE.md D3): write_rows appends to
+        // the per-writer journal; each returned hash is a readable PNPK pack,
+        // and reads union BOTH entries (the C9 history-loss bug is what this
+        // test used to paper over by asserting HEAD-only visibility).
         let dir = tempfile::tempdir().unwrap();
         let storage = UnifiedStorage::new_local(dir.path()).unwrap();
         let kernel = storage.kernel();
@@ -1446,7 +1510,7 @@ mod tests {
         let pack_data = kernel.read_blob(&c1).unwrap();
         assert!(pond_pack::is_pack(&pack_data), "write_rows should produce PNPK pack");
 
-        // Verify commit chain: c2's parent = c1
+        // Second write through the same registry writer (same process)
         let ids2 = vec![4i64, 5];
         let vals2 = vec![40.0f64, 50.0];
         let c2 = write_rows(
@@ -1454,40 +1518,44 @@ mod tests {
             &[("id", TypedColumn::Int64(ids2)), ("val", TypedColumn::Float64(vals2))],
             "second commit",
         ).unwrap();
+        assert_ne!(c1, c2, "each write is its own pack");
 
         let commit2 = commit::read_commit(kernel, &c2).unwrap();
-        assert_eq!(commit2.parent, Some(c1.clone()));
-        assert_eq!(commit2.index, 1);
         assert_eq!(commit2.message, "second commit");
+        // The pack's journal metadata proves the append order of one
+        // writer's log: seq 1 = first data entry, seq 2 = the bootstrap
+        // fold (the first write on a fresh collection folds immediately),
+        // seq 3 = this second data entry.
+        let journal_meta = pond_pack::decode_pack(&kernel.read_blob(&c2).unwrap()).unwrap().0;
+        assert_eq!(journal_meta["journal"]["seq"], 3, "second data append is seq 3 (seq 2 = bootstrap fold)");
 
         // Verify parent (c1) is also readable as a commit via commit::read_commit
         let commit1 = commit::read_commit(kernel, &c1).unwrap();
-        assert!(commit1.parent.is_none());
         assert_eq!(commit1.index, 0);
         assert_eq!(commit1.message, "first commit");
 
-        // Verify data is readable through the standard read path
-        // Note: read_rows_i64 reads HEAD manifest only (latest commit's data)
+        // Verify HISTORY is preserved through the standard read path
+        // (journal union: 3 rows from the first write + 2 from the second).
         let cols = crate::read::read_rows_i64(kernel, "chain_test", "main", None, None).unwrap();
         let id_col = cols.iter().find(|(n, _)| n == "id").unwrap();
-        assert_eq!(id_col.1.len(), 2, "HEAD should have 2 rows from second commit");
+        assert_eq!(id_col.1.len(), 5, "journal read must return BOTH writes' rows");
+        assert!(id_col.1.contains(&1) && id_col.1.contains(&5));
     }
 
     #[test]
     fn test_reference_if_cas_semantics() {
-        // Deterministic CAS semantics on LocalFS (the S3/R2 If-Match /
-        // If-None-Match paths are exercised end-to-end by the moto + R2
-        // suites through write_rows' CAS commit loop).
+        // Deterministic CAS semantics on LocalFS for the KERNEL PRIMITIVE
+        // (reference_if keeps its tests — it has no production callers in
+        // the journal era; the moto + R2 suites exercise the S3 conditional
+        // PUT paths directly).
         let dir = tempfile::tempdir().unwrap();
         let storage = UnifiedStorage::new_local(dir.path()).unwrap();
         let kernel = storage.kernel();
 
-        let c1 = write_rows(kernel, "cas_sem", "main",
-            &[("id", TypedColumn::Int64(vec![1i64]))], "c1").unwrap();
-        let c2 = write_rows(kernel, "cas_sem", "main",
-            &[("id", TypedColumn::Int64(vec![2i64]))], "c2").unwrap();
+        let c1 = kernel.write(b"blob-one").unwrap();
+        let c2 = kernel.write(b"blob-two").unwrap();
         let b_ref = branch_ref("cas_sem", "main");
-        assert_eq!(kernel.resolve(&b_ref), Some(c2.clone()));
+        kernel.reference(&b_ref, &c2).unwrap();
 
         // Stale writer (holds the pre-c2 view): CAS must FAIL and leave
         // HEAD untouched — this is the guard against lost updates.
@@ -1515,13 +1583,11 @@ mod tests {
 
     #[test]
     fn test_write_rows_concurrent_threads_all_succeed() {
-        // Behavioral smoke: N threads commit to the same collection through
-        // the CAS loop. Every write must return Ok (retries converge), the
-        // final HEAD must resolve, and the chain must be walkable. On
-        // LocalFS put_path_if is read-check-write (non-atomic), so a truly
-        // simultaneous check window can still orphan a commit — the atomic
-        // guarantee lives in the S3/R2 If-Match path; this test proves the
-        // loop itself never wedges, errors, or corrupts state under races.
+        // Behavioral smoke (journal-era): N threads commit to the same
+        // collection through the journal. Every write must return Ok
+        // (unique-path appends cannot lose races — no CAS, no retries),
+        // and a journal-aware read must see EVERY thread's rows (the
+        // multi-writer no-CAS correctness claim of ARCHITECTURE.md D3).
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1549,20 +1615,17 @@ mod tests {
         }
         assert_eq!(ok_count.load(Ordering::SeqCst), 4, "all concurrent writes must succeed");
 
-        // HEAD resolves and is one of the commits.
-        let head = kernel.resolve(&branch_ref("cas_threads", "main")).expect("HEAD must resolve");
-        assert!(hashes.contains(&head));
+        // A journal-aware read unions every thread's pack: 4 rows total.
+        let cols = crate::read::read_rows_i64(kernel, "cas_threads", "main", None, None).unwrap();
+        let id_col = cols.iter().find(|(n, _)| n == "id").unwrap();
+        let mut got = id_col.1.clone();
+        got.sort_unstable();
+        assert_eq!(got, vec![0i64, 1, 2, 3], "no writer's row may be lost");
 
-        // The chain from HEAD is walkable and terminates (no cycles).
-        let mut cur = Some(head);
-        let mut hops = 0;
-        while let Some(h) = cur {
-            let c = commit::read_commit(kernel, &h).expect("commit must be readable");
-            cur = c.parent;
-            hops += 1;
-            assert!(hops < 100, "commit chain must terminate (possible cycle)");
+        // Every pack is still individually readable.
+        for h in &hashes {
+            assert!(commit::read_commit(kernel, h).is_some(), "pack {} must be readable", h);
         }
-        assert!(hops >= 1);
     }
 
 }

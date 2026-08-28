@@ -13,14 +13,30 @@ use crate::{branch_ref, manifest_ref};
 use pond_kernel::PondKernel;
 use std::collections::HashMap;
 
-/// Create a branch — O(1) ref copy.
+/// Create a branch — O(1) ref copy after a fold.
 /// Copies BOTH the commit ref AND the manifest ref from the active branch.
+///
+/// JOURNAL ERA (ARCHITECTURE.md D3): the branch point is the SOURCE's FULL
+/// current state, not just its last folded snapshot — the source is
+/// compacted first so live journal entries + shards are folded into the
+/// snapshot the new branch copies. Without this, writes made since the
+/// last fold would stay on the source branch's journal and the new branch
+/// would silently miss them.
 pub fn branch(
     kernel: &PondKernel,
     collection: &str,
     branch_name: &str,
     active_branch: &str,
 ) -> Result<String, String> {
+    // Fold the source's live state into its snapshot first — the branch
+    // point must be the source's FULL current state (live journal entries
+    // + shards), not just the last folded snapshot. Skipped when nothing
+    // is live: compact would be a pointless rewrite, and legacy fixtures
+    // may carry non-PMAN manifests that correctly refuse to fold.
+    if crate::journal::has_live_state(kernel, collection, active_branch) {
+        crate::journal::compact(kernel, collection, active_branch, &[])?;
+    }
+
     let source_commit = kernel.resolve(&branch_ref(collection, active_branch))
         .ok_or_else(|| format!("Collection '{}' has no commits to branch from", collection))?;
 
@@ -96,6 +112,20 @@ pub fn merge(
     target_branch: &str,
     message: &str,
 ) -> Result<String, String> {
+    // JOURNAL ERA (ARCHITECTURE.md D3): fold BOTH branches' live journal
+    // entries + shards into their snapshots first. This merge reads branch
+    // refs, and journal-era writes never touch branch refs — without the
+    // fold, writes made since each branch's last compaction would be
+    // silently dropped from the merge (the moto merge test's exact
+    // failure: dave written to feat existed only as a live journal entry).
+    // Skipped when nothing is live (see has_live_state).
+    if crate::journal::has_live_state(kernel, collection, source_branch) {
+        crate::journal::compact(kernel, collection, source_branch, &[])?;
+    }
+    if crate::journal::has_live_state(kernel, collection, target_branch) {
+        crate::journal::compact(kernel, collection, target_branch, &[])?;
+    }
+
     // Resolve both branch HEADs
     let target_head = kernel.resolve(&branch_ref(collection, target_branch))
         .ok_or_else(|| format!("Target branch '{}' not found", target_branch))?;
@@ -163,11 +193,33 @@ pub fn merge(
         }
     }
 
-    // Build the merged manifest
-    let schema = source_manifest.as_ref()
-        .or(target_manifest.as_ref())
-        .map(|m| m.columns.clone())
-        .unwrap_or_default();
+    // Build the merged manifest.
+    //
+    // PMAN v2 CORRECTNESS (see manifest::normalize_rgs_to_schema): the two
+    // branches' manifests may carry DIFFERENT schemas (journal-era folds of
+    // heterogeneous rows — e.g. a tombstone-only shard folds 4 columns
+    // where a live-row shard folds 5). A manifest must have exactly
+    // schema.len() stats entries per RG, so the merged schema is the UNION
+    // of both sides (first declaration wins the type tag) and every merged
+    // RG is normalized to it — RGs from either side keep their stats for
+    // columns they have and get placeholders for the rest.
+    let mut union_schema: Vec<(String, u8)> = Vec::new();
+    for m in [&target_manifest, &source_manifest].into_iter().flatten() {
+        for (name, vtype) in &m.columns {
+            if !union_schema.iter().any(|(n, _)| n == name) {
+                union_schema.push((name.clone(), *vtype));
+            }
+        }
+    }
+    let schema = if union_schema.is_empty() {
+        source_manifest.as_ref()
+            .or(target_manifest.as_ref())
+            .map(|m| m.columns.clone())
+            .unwrap_or_default()
+    } else {
+        union_schema
+    };
+    crate::manifest::normalize_rgs_to_schema(&mut merged_entries, &schema);
 
     let mut new_manifest = CollectionManifest::new(schema, key_col.clone());
     for entry in merged_entries {
@@ -177,23 +229,38 @@ pub fn merge(
     let manifest_hash = kernel.write(&manifest_bytes)
         .map_err(|e| format!("Failed to write merged manifest: {}", e))?;
 
-    // Write the merge commit with TWO parents
+    // Write the merge commit with TWO parents.
+    //
+    // JOURNAL WATERMARK CARRY (tribunal F1/F2 family): the merge commit
+    // REPLACES the target's ref, so it must inherit the target's
+    // post-compact `journal.upto` — the pre-merge compacts above left fold
+    // packs in the target's journal at seqs ≤ that watermark, and probes
+    // must start ABOVE them (re-reading a fold pack would duplicate its
+    // RGs in every non-CRDT-merging reader: read_rows_i64, read_all_row_groups).
     let commit_index = target_commit.index + 1;
     let merge_message = if message.is_empty() {
         format!("Merge '{}' into '{}'", source_branch, target_branch)
     } else {
         message.to_string()
     };
+    let carried_upto = crate::journal::read_snapshot_upto(kernel, &target_head);
 
-    let merge_hash = commit::write_commit(
-        kernel,
-        collection,
-        &manifest_hash,
-        Some(&target_head),       // parent = target
-        Some(&source_head),       // second_parent = source
-        &merge_message,
-        commit_index,
-    ).map_err(|e| format!("Failed to write merge commit: {}", e))?;
+    let mut commit_obj = serde_json::json!({
+        "parent": target_head,          // parent = target
+        "second_parent": source_head,   // second_parent = source
+        "manifest": manifest_hash,
+        "message": merge_message,
+        "timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0),
+        "index": commit_index,
+    });
+    if !carried_upto.is_empty() {
+        commit_obj["journal"] = serde_json::json!({ "upto": carried_upto });
+    }
+    let merge_hash = kernel.write(&commit_obj.to_string().into_bytes())
+        .map_err(|e| format!("Failed to write merge commit: {}", e))?;
 
     // Point target branch at the merge commit
     kernel.reference(&branch_ref(collection, target_branch), &merge_hash)
@@ -311,16 +378,45 @@ fn try_crdt_merge_row_groups(
     all_rows.extend(source_rows);
 
     let merged_rows = crate::shard::merge_rows_by_rowid(&all_rows, None);
-    let live_rows = crate::shard::filter_live_rows(&merged_rows);
+    let _live_rows = crate::shard::filter_live_rows(&merged_rows);
 
-    // Re-encode as PND2 using simple type inference
-    let (blob, col_stats) = encode_json_rows_to_pnd2(&live_rows, &target_rg.columns)?;
+    // Re-encode as PND2 using simple type inference.
+    //
+    // DELETION-AS-DATA + EMPTY RESULT IS A RESULT:
+    //   - TOMBSTONES ARE KEPT in the re-encoded RG (merged_rows, not
+    //     live_rows): the read path's CRDT merge + filter_live_rows does the
+    //     suppression, and a tombstone surviving here keeps suppressing the
+    //     row if a THIRD branch later merges the live copy back in.
+    //   - When the merge leaves ZERO rows (nothing conflicted, both sides
+    //     empty) the correct merged RG is an EMPTY row group — NOT a
+    //     fallback to the source RG. encode_json_rows_to_pnd2 returns None
+    //     for empty rows, and the old None-fallback pushed the SOURCE's
+    //     live rows instead: the losing row RESURRECTED and the winning
+    //     tombstone was silently dropped (chaos test
+    //     test_delete_then_merge_no_resurrection). Write a 0-row PND2 blob
+    //     so "everything tombstoned" survives the merge as "no live rows".
+    let (blob, col_stats, n_out) = if merged_rows.is_empty() {
+        let blob = pond_core::pnd2_encode_multi_typed(&[]);
+        let col_stats: Vec<crate::manifest::ColumnStatsEntry> = target_rg.columns.iter()
+            .map(|c| crate::manifest::ColumnStatsEntry {
+                name: c.name.clone(),
+                value_type: c.value_type,
+                min: None,
+                max: None,
+                null_count: 0,
+            })
+            .collect();
+        (blob, col_stats, 0usize)
+    } else {
+        let (blob, col_stats) = encode_json_rows_to_pnd2(&merged_rows, &target_rg.columns)?;
+        (blob, col_stats, merged_rows.len())
+    };
     let new_hash = kernel.write(&blob).ok()?;
 
     Some(crate::manifest::RowGroupEntry {
         key: target_rg.key.clone(),
         blob_hash: new_hash,
-        n_rows: live_rows.len() as u32,
+        n_rows: n_out as u32,
         columns: col_stats,
         slab_byte_offset: None,
         slab_byte_len: None,
@@ -359,6 +455,13 @@ fn pnd2_columns_to_json_rows(cols: &[pond_core::PondColumn]) -> Vec<serde_json::
                 1 => col.i64_data.get(i).map(|x| serde_json::json!(x)), // VT_INT64
                 2 => col.f64_data.get(i).map(|x| serde_json::json!(x)), // VT_FLOAT64
                 3 | 6 => col.str_data.get(i).map(|s| serde_json::json!(s.to_str().unwrap_or(""))), // VT_STRING/VT_VARIANT
+                // VT_BOOLEAN — the tombstone marker round-trip: without this
+                // arm, `_deleted: true` decoded from a fold RG VANISHED from
+                // the row, and filter_live_rows saw a tombstone as LIVE
+                // (chaos test_delete_then_merge_no_resurrection: a deleted
+                // row resurrected after every branch merge). VT_BOOLEAN
+                // decodes into i64_data as 0/1 (see codec decode.rs).
+                7 => col.i64_data.get(i).map(|b| serde_json::json!(*b != 0)),
                 _ => None,
             };
             if let Some(v) = val { row.insert(name, v); }
@@ -394,12 +497,19 @@ fn encode_json_rows_to_pnd2(
     let mut col_stats: Vec<crate::manifest::ColumnStatsEntry> = Vec::new();
 
     for name in &col_names {
-        // Infer type: check if all values are i64, f64, or string
+        // Infer type: check if all values are bool, i64, f64, or string.
+        // BOOL must be inferred BEFORE the numeric arms: a bool column
+        // encoded as i64 (true→1) decodes as NUMBER 1, which
+        // filter_live_rows does not recognize as `_deleted` — the
+        // tombstone marker would be silently dropped on every merge
+        // re-encode (deletion-as-data requires the bool round-trip).
+        let mut has_bool = false;
         let mut has_i64 = false;
         let mut has_f64 = false;
         let mut has_string = false;
         for row in rows {
             match row.get(name) {
+                Some(serde_json::Value::Bool(_)) => has_bool = true,
                 Some(serde_json::Value::Number(n)) if n.is_i64() => has_i64 = true,
                 Some(serde_json::Value::Number(n)) if n.is_f64() => has_f64 = true,
                 Some(serde_json::Value::Number(_)) => has_f64 = true,
@@ -413,6 +523,11 @@ fn encode_json_rows_to_pnd2(
                 r.get(name).and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_default()
             }).collect();
             (TypedColumn::String(vals), 3u8)
+        } else if has_bool {
+            let vals: Vec<bool> = rows.iter().map(|r| {
+                r.get(name).and_then(|v| v.as_bool()).unwrap_or(false)
+            }).collect();
+            (TypedColumn::Boolean(vals), 7u8) // VT_BOOLEAN
         } else if has_f64 {
             let vals: Vec<f64> = rows.iter().map(|r| {
                 r.get(name).and_then(|v| v.as_f64()).unwrap_or(0.0)

@@ -166,6 +166,50 @@ impl RowGroupEntry {
     }
 }
 
+/// Normalize a set of row-group entries' per-RG stats to a target schema.
+///
+/// PMAN v2 encodes each RG's stats count as the MANIFEST's schema count
+/// (the count is never stored per-RG): the decoder reads exactly
+/// `schema.len()` stats entries per RG and then the slab fields. A manifest
+/// whose RGs carry a DIFFERENT number of stats entries than its schema
+/// corrupts on the encode→decode roundtrip — the decoder consumes stats
+/// bytes as slab offsets (observed live in journal compaction + branch
+/// merge: an RG with 5 stat entries against a 4- or 0-column schema
+/// decoded with garbage slab offsets, and the reader then range-read a
+/// garbage blob hash).
+///
+/// This is the shared guard for every code path that assembles a manifest
+/// from RGs of MULTIPLE origins (journal compaction's union fold, branch
+/// merge's manifest union): stats are aligned to the target schema BY NAME
+/// (semantically attached to the right columns), columns the RG's blob has
+/// but the schema lacks get no stats (no pruning — always safe), and
+/// missing entries become no-stats placeholders.
+pub fn normalize_rgs_to_schema(rgs: &mut [RowGroupEntry], schema: &[(String, u8)]) {
+    for rg in rgs.iter_mut() {
+        let mut normalized: Vec<ColumnStatsEntry> = Vec::with_capacity(schema.len());
+        for (name, vtype) in schema {
+            let existing = rg.columns.iter().find(|c| &c.name == name);
+            normalized.push(match existing {
+                Some(c) => ColumnStatsEntry {
+                    name: name.clone(),
+                    value_type: *vtype,
+                    min: c.min.clone(),
+                    max: c.max.clone(),
+                    null_count: c.null_count,
+                },
+                None => ColumnStatsEntry {
+                    name: name.clone(),
+                    value_type: *vtype,
+                    min: None,
+                    max: None,
+                    null_count: 0,
+                },
+            });
+        }
+        rg.columns = normalized;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CollectionManifest — the full manifest for a collection
 // ---------------------------------------------------------------------------

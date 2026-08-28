@@ -208,53 +208,70 @@ impl VectorLens {
     /// Returns: HashMap<id, (vector, metadata_json)>
     pub fn get_all(&self, collection: &str) -> Result<HashMap<String, (Vec<f64>, String)>, String> {
         let active = self.storage.get_active_branch(collection);
-        let head = self.storage.kernel().resolve(&pond_storage::branch_ref(collection, &active))
-            .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
 
-        let manifest_bytes = pond_storage::commit::resolve_manifest_bytes(self.storage.kernel(), &head)
-            .map_err(|e| format!("Failed to read manifest: {}", e))?;
-
-        let manifest = CollectionManifest::decode(&manifest_bytes)
-            .ok_or_else(|| "Failed to decode manifest".to_string())?;
+        // JOURNAL-AWARE (ARCHITECTURE.md D3): the branch ref is a CACHE of
+        // the last folded snapshot, not the current state — plain journal
+        // writes never move it. Resolve the full journal view (snapshot +
+        // live entries) so vectors inserted after the last compaction are
+        // visible; ids are last-write-wins per insert order.
+        let view = pond_storage::journal::resolve_view(
+            self.storage.kernel(), collection, &active, false,
+        )?;
+        let mut packs: Vec<String> = Vec::with_capacity(view.entries.len() + 1);
+        if let Some(snapshot) = &view.snapshot {
+            packs.push(snapshot.clone());
+        }
+        packs.extend(view.entries.iter().map(|e| e.pack_hash.clone()));
+        if packs.is_empty() {
+            return Err(format!("Collection '{}' has no commits", collection));
+        }
 
         let mut result: HashMap<String, (Vec<f64>, String)> = HashMap::new();
 
-        for rg in &manifest.row_groups {
-            let blob_data = self.storage.kernel().read_blob(&rg.blob_hash)
-                .map_err(|e| format!("Failed to read data blob: {}", e))?;
+        for pack_hash in &packs {
+            let manifest_bytes = pond_storage::commit::resolve_manifest_bytes(self.storage.kernel(), pack_hash)
+                .map_err(|e| format!("Failed to read manifest: {}", e))?;
 
-            let cols = pond_core::pnd2_decode(&blob_data)
-                .map_err(|e| format!("Failed to decode PND2: {}", e))?;
+            let manifest = CollectionManifest::decode(&manifest_bytes)
+                .ok_or_else(|| "Failed to decode manifest".to_string())?;
 
-            // Find ID column (INT64 or STRING)
-            let ids: Vec<String> = if let Some(id_col) = cols.iter().find(|c| c.name.to_string_lossy() == "id") {
-                if id_col.vtype == VT_INT64 {
-                    id_col.i64_data.iter().map(|v| v.to_string()).collect()
+            for rg in &manifest.row_groups {
+                let blob_data = self.storage.kernel().read_blob(&rg.blob_hash)
+                    .map_err(|e| format!("Failed to read data blob: {}", e))?;
+
+                let cols = pond_core::pnd2_decode(&blob_data)
+                    .map_err(|e| format!("Failed to decode PND2: {}", e))?;
+
+                // Find ID column (INT64 or STRING)
+                let ids: Vec<String> = if let Some(id_col) = cols.iter().find(|c| c.name.to_string_lossy() == "id") {
+                    if id_col.vtype == VT_INT64 {
+                        id_col.i64_data.iter().map(|v| v.to_string()).collect()
+                    } else {
+                        id_col.str_data.iter().map(|s| s.to_string_lossy().to_string()).collect()
+                    }
                 } else {
-                    id_col.str_data.iter().map(|s| s.to_string_lossy().to_string()).collect()
-                }
-            } else {
-                Vec::new()
-            };
+                    Vec::new()
+                };
 
-            // Find dimension columns
-            let mut dim_cols: Vec<&pond_core::PondColumn> = cols.iter()
-                .filter(|c| c.name.to_string_lossy().starts_with("dim_"))
-                .collect();
-            dim_cols.sort_by_key(|c| c.name.to_string_lossy().to_string());
-
-            // Find metadata column
-            let meta_col = cols.iter().find(|c| c.name.to_string_lossy() == "metadata");
-
-            for (i, id) in ids.iter().enumerate() {
-                let vector: Vec<f64> = dim_cols.iter()
-                    .filter_map(|c| c.f64_data.get(i).copied())
+                // Find dimension columns
+                let mut dim_cols: Vec<&pond_core::PondColumn> = cols.iter()
+                    .filter(|c| c.name.to_string_lossy().starts_with("dim_"))
                     .collect();
-                let metadata = meta_col
-                    .and_then(|c| c.str_data.get(i))
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "{}".to_string());
-                result.insert(id.clone(), (vector, metadata));
+                dim_cols.sort_by_key(|c| c.name.to_string_lossy().to_string());
+
+                // Find metadata column
+                let meta_col = cols.iter().find(|c| c.name.to_string_lossy() == "metadata");
+
+                for (i, id) in ids.iter().enumerate() {
+                    let vector: Vec<f64> = dim_cols.iter()
+                        .filter_map(|c| c.f64_data.get(i).copied())
+                        .collect();
+                    let metadata = meta_col
+                        .and_then(|c| c.str_data.get(i))
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "{}".to_string());
+                    result.insert(id.clone(), (vector, metadata));
+                }
             }
         }
 

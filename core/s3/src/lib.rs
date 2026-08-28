@@ -1243,6 +1243,96 @@ impl ObjectStore for S3ObjectStore {
         }
     }
 
+    fn list_dirs(&self, prefix: &str) -> io::Result<Vec<String>> {
+        // ONE-LEVEL listing via ListObjectsV2 `delimiter=/` (ARCHITECTURE.md
+        // D3 writer discovery): S3 groups all keys sharing the first '/'
+        // after the prefix into a single <CommonPrefixes> entry, so the
+        // response is O(distinct child dirs) — O(writers) for the journal
+        // layout, never O(journal entries). Same string-searching XML style
+        // as list_paths.
+        let list_prefix = self.path_key(prefix);
+        // The delimiter grouping requires the prefix to END with '/' so the
+        // common prefixes are exactly "<prefix><child>/". The journal module
+        // always passes a trailing-slash prefix; enforce it defensively.
+        let list_prefix = if list_prefix.ends_with('/') {
+            list_prefix
+        } else {
+            format!("{}/", list_prefix)
+        };
+
+        let mut dirs = Vec::new();
+        let mut cont: Option<String> = None;
+        loop {
+            let mut query = format!(
+                "list-type=2&delimiter=/&prefix={}",
+                urlencoding::encode(&list_prefix)
+            );
+            if let Some(ref token) = cont {
+                query.push_str(&format!(
+                    "&continuation-token={}",
+                    urlencoding::encode(token)
+                ));
+            }
+
+            let resp = self.s3_request("GET", "", Some(&query), None, &[])?;
+            let body = resp.into_string().map_err(io::Error::other)?;
+
+            // Extract <Prefix>...</Prefix> values. NOTE: the response's
+            // top-level <Prefix> element ECHOES the request prefix (S3
+            // ListObjectsV2 convention); it strips to the empty string and
+            // is skipped below. Only <CommonPrefixes> children carry
+            // "<prefix><child>/" values that survive the strip.
+            let mut search_from = 0;
+            while search_from < body.len() {
+                let start = match body[search_from..].find("<Prefix>") {
+                    Some(p) => search_from + p + 8, // skip "<Prefix>"
+                    None => break,
+                };
+                let end = match body[start..].find("</Prefix>") {
+                    Some(p) => start + p,
+                    None => break,
+                };
+                let common = url_decode(&body[start..end]);
+                // Common prefix shape: "<list_prefix><writer>/". Strip the
+                // list prefix and the trailing '/' to get the child name.
+                if let Some(child) = common
+                    .strip_prefix(&list_prefix)
+                    .map(|c| c.trim_end_matches('/'))
+                {
+                    if !child.is_empty() {
+                        dirs.push(child.to_string());
+                    }
+                }
+                search_from = end + 9; // skip "</Prefix>"
+            }
+
+            // Pagination (same markers as list_paths).
+            let mut next_token: Option<String> = None;
+            if body.contains("<IsTruncated>true</IsTruncated>") {
+                if let Some(tok_start) = body.find("<NextContinuationToken>") {
+                    if let Some(tok_end) = body[tok_start..].find("</NextContinuationToken>") {
+                        next_token =
+                            Some(body[tok_start + 23..tok_start + tok_end].to_string());
+                    }
+                }
+            }
+            if next_token.is_none() {
+                break;
+            }
+            cont = next_token;
+        }
+
+        dirs.sort();
+        dirs.dedup();
+        Ok(dirs)
+    }
+
+    fn store_id(&self) -> String {
+        // endpoint+bucket+prefix uniquely names the backing bucket subtree —
+        // two S3 kernels over the same bucket/prefix share journal state.
+        format!("s3:{}/{}/{}", self.endpoint, self.bucket, self.prefix)
+    }
+
     fn delete_blob(&self, hash: &str) -> io::Result<bool> {
         let key = self.blob_key(hash);
         match self.s3_request("DELETE", &key, None, None, &[]) {

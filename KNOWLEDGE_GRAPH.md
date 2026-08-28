@@ -335,6 +335,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `docs/BINARY_ENCODING_FORMAT.md` | 165 | **Format spec v1.0:** SIMD-ready binary encoding for all 4 encodings (RAW, RLE, DICT, BITPACK). Stable, documented, directly mmappable to numpy/Arrow. Any execution engine (DuckDB, Polars, DataFusion) can read Pond's encoded chunks natively. |
 | `docs/README.md` | 58 | Doc index. |
 | `docs/STATUS.md` | — | **Current migration status.** What's done (Rust core, S3, CLI, Go SDK), what's in progress (Python lenses), what's next (Rust lenses, parallel S3, Java/Node SDKs). Replaces the archived `MIGRATION_STRATEGY.md` and `NEXT_STEPS_DEEP_REVIEW.md`. |
+| `docs/builder-spec-journal.md` | — | **D3 no-CAS journal builder spec** (task cron-2026-08-28-0353-a): the write-path builder's contract for the per-writer immutable journal — P0 (C9 history loss) probe, design points (unique-path appends, journal commit metadata, snapshot ∪ live reads, C10 tiebreak, compaction, list_dirs/store_id, discovery cache, env knobs), the 10-test harness, constraints, and validation gates. |
 | `docs/archive/` | (18+ files) | Historical docs (Phase reports, red teams, RFCs, etc.). |
 
 ### 2.9 Top-level files
@@ -383,9 +384,11 @@ for Go/Java/Node/C/C++/Zig SDK ports. The CLI is the DuckDB-philosophy binary.
 | `core/storage/src/commit.rs` | — | Commit format: write_commit, read_commit, history (walk commit DAG). |
 | `core/storage/src/manifest.rs` | — | CollectionManifest: one manifest blob per commit, inline stats + chunk hashes. |
 | `core/storage/src/branch.rs` | — | Branch operations: branch, checkout, list_branches, merge (three-level CRDT merge). |
-| `core/storage/src/shard.rs` | — | Shard operations: append_shard, upsert_shard, delete_shard, list_shards, read_with_shards, compact_shards. |
-| `core/storage/src/write.rs` | — | Write path: write collection data, create commit, update manifest. |
-| `core/storage/src/read.rs` | — | Read path: read, read_at_snapshot, read_full (HEAD + shards). |
+| `core/storage/src/shard.rs` | — | Shard operations: append_shard, upsert_shard, delete_shard, list_shards, read_with_shards, compact_shards. CRDT merge (merge_rows_by_rowid) with the C10 total tiebreak `(_version, _rowid, payload)` — permutation-invariant state, rowid-sorted output. |
+| `core/storage/src/journal.rs` | — | **THE D3 no-CAS journal** (ARCHITECTURE.md D3): per-writer immutable journal + benign snapshot cache. journal_prefix/entry_path (unique `journal/<writer_id>/<seq:012>` paths), JournalWriter + process-local writer registry (writer_for), TTL-cached writer discovery (POND_JOURNAL_TTL_MS), resolve_view (snapshot ∪ live entries, parallel epoch probes), append_pack (unique-path PUT, zero retries, auto-compaction via POND_JOURNAL_AUTO_COMPACT), compact (manifest-level fold of entries+shards, LWW branch-ref advance, folded-entry deletes; tombstones ride along — no resurrection), status (journal introspection). 5 unit tests; behavior pinned in tests/journal_test.rs. |
+| `core/storage/src/write.rs` | — | Write paths (JOURNAL ERA): write() raw-bytes legacy base-snapshot path (sets branch_ref); write_rows*/write_rows_i64*/slab paths build PNPK packs and append them to the per-writer journal via plain PUT — no CAS loop, zero shared-ref writes. |
+| `core/storage/src/read.rs` | — | Read paths: read_rows_i64 (pruned i64 pipeline), read_rows_json_pruned (journal-aware: snapshot ∪ live entries, per-pack pruned pipeline + CRDT merge), read_rows_json_pruned_with_head (pure per-pack reader), read_all_row_groups, indexed lookups. |
+| `core/storage/tests/journal_test.rs` | — | D3 journal integration harness (16 tests): history-preservation P0 probe (C9), N sequential writes, 8×8 concurrent writers (no lost rows), C10 permutation determinism, warm-read zero-LIST budget (CountingStore), legacy-repo compat, compaction folds entries+shards (tombstone-safe, benign race, upto watermark), journal status, shared-ref immutability of appends, TTL=0 fresh-list env knob (child-process), deterministic entry order. |
 | `core/storage/src/transaction.rs` | — | Transaction markers: begin_tx, commit_tx, abort_tx, is_tx_committed. |
 | `core/storage/src/maintenance.rs` | — | Maintenance: drop_name, is_dropped, resolve_active, compact_tombstones. |
 | `core/arrow/Cargo.toml` | — | PND2 → Arrow bridge crate. Deps: pond_codec, arrow. |

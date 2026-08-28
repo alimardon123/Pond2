@@ -215,6 +215,23 @@ impl PondKernel {
         self.store.list_paths(prefix).unwrap_or_default()
     }
 
+    /// One-level directory listing under a prefix (journal writer discovery).
+    ///
+    /// Delegates to `ObjectStore::list_dirs` — on S3/R2 this is a
+    /// delimiter-LIST (O(child dirs)), on localfs a single `read_dir`.
+    /// Returns `Err` if the backend doesn't support directory listing.
+    pub fn list_dirs(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        self.store.list_dirs(prefix)
+    }
+
+    /// Stable identity of the backing store (see `ObjectStore::store_id`).
+    ///
+    /// Keys the process-local journal writer registry and discovery cache:
+    /// same store ⇒ same journal state, different stores ⇒ isolated state.
+    pub fn store_id(&self) -> String {
+        self.store.store_id()
+    }
+
     pub fn delete_ref(&self, name: &str) -> io::Result<bool> {
         self.store.delete_path(name)
     }

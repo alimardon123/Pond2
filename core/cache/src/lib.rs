@@ -544,6 +544,19 @@ impl ObjectStore for CachingObjectStore {
         self.inner.list_paths(prefix)
     }
 
+    fn list_dirs(&self, prefix: &str) -> io::Result<Vec<String>> {
+        // Delegate to inner — the journal module owns the TTL-bounded
+        // discovery cache on top of this primitive (ARCHITECTURE.md D3);
+        // caching here too would just add a second uncoordinated TTL.
+        self.inner.list_dirs(prefix)
+    }
+
+    fn store_id(&self) -> String {
+        // Same backing store ⇒ same journal state: delegate identity to
+        // the wrapped store (the cache layer is transparent).
+        self.inner.store_id()
+    }
+
     fn blob_exists(&self, hash: &str) -> bool {
         // Check disk cache first, then inner store.
         self.blob_path(hash).exists() || self.inner.blob_exists(hash)

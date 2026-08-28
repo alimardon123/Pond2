@@ -160,6 +160,26 @@ enum Commands {
         #[arg(long)]
         exec: Option<String>,
     },
+    /// Show the journal state of a collection's active branch.
+    ///
+    /// The journal (ARCHITECTURE.md D3) is the no-CAS write path: every
+    /// write appends an immutable pack to a unique per-writer path, and
+    /// readers union the folded snapshot with all live entries. This
+    /// command shows the snapshot watermark and the live entries per
+    /// writer — the operational view for tuning compaction.
+    JournalStatus {
+        collection: String,
+    },
+    /// Compact a collection: fold the journal (+ shards) into ONE snapshot.
+    ///
+    /// Manifest-level fold (O(metadata)): the union of the snapshot's and
+    /// every live entry's row groups becomes the new snapshot pack, the
+    /// branch ref advances (benign last-writer-wins), and the folded
+    /// entries + shards are deleted. No CAS anywhere — racing compactors
+    /// are safe by construction.
+    Compact {
+        collection: String,
+    },
     Version,
 }
 
@@ -237,6 +257,12 @@ fn main() {
                     // Shell takes ownership of storage — it's the only command
                     // in this dispatch arm that runs a long-lived REPL loop.
                     cmd_shell(storage, exec);
+                }
+                Commands::JournalStatus { collection } => {
+                    cmd_journal_status(&storage, &collection);
+                }
+                Commands::Compact { collection } => {
+                    cmd_compact(&storage, &collection);
                 }
                 _ => unreachable!(),
             }
@@ -653,12 +679,12 @@ fn cmd_branches(storage: &UnifiedStorage, collection: &str) {
 fn cmd_history(storage: &UnifiedStorage, collection: &str, limit: usize) {
     let kernel = storage.kernel();
     let active = storage.get_active_branch(collection);
-    let head = kernel.resolve(&pond_storage::branch_ref(collection, &active))
-        .or_else(|| kernel.resolve(collection));
 
-    match head {
-        Some(h) => {
-            let hist = commit::history(kernel, &h, limit);
+    // JOURNAL-AWARE (D3): live journal entries first (the writes since the
+    // last fold), then the snapshot chain with each fold's absorbed writes
+    // — compaction no longer erases commit-history granularity.
+    match pond_storage::journal::history(kernel, collection, &active, limit) {
+        Ok(hist) => {
             if hist.is_empty() {
                 println!("(no commits)");
             } else {
@@ -668,7 +694,7 @@ fn cmd_history(storage: &UnifiedStorage, collection: &str, limit: usize) {
                 }
             }
         }
-        None => println!("(no commits)"),
+        Err(_) => println!("(no commits)"),
     }
 }
 
@@ -765,6 +791,78 @@ fn cmd_gc(storage: &UnifiedStorage, compute_size: bool, dry_run: bool) {
         println!("\nVacuumed: deleted {} blobs, preserved {}", result.deleted, result.preserved);
     } else {
         println!("\nNo dead blobs to clean up.");
+    }
+}
+
+/// journal-status — show the D3 journal state of the active branch.
+///
+/// The operational view for the no-CAS write path: the folded snapshot
+/// (branch ref) with its per-writer watermark, plus every live entry
+/// still to be folded. Compaction keeps `live entries` bounded; a growing
+/// count means compaction is due (`pond compact`).
+fn cmd_journal_status(storage: &UnifiedStorage, collection: &str) {
+    let kernel = storage.kernel();
+    let active = storage.get_active_branch(collection);
+
+    let status = match pond_storage::journal::status(kernel, collection, &active) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    println!("Journal status: '{}' (branch '{}')", collection, active);
+    match &status.snapshot {
+        Some(snap) => println!("  snapshot:     {}", &snap[..snap.len().min(16)]),
+        None => println!("  snapshot:     (none — journal-only collection)"),
+    }
+    if status.snapshot_upto.is_empty() {
+        println!("  watermark:    (legacy snapshot — no fold watermark)");
+    } else {
+        println!("  watermark:    {}", status.snapshot_upto.len());
+        for (w, seq) in status.snapshot_upto.iter().take(8) {
+            println!("    {}: folded through seq {}", &w[..w.len().min(16)], seq);
+        }
+        if status.snapshot_upto.len() > 8 {
+            println!("    ... and {} more writers", status.snapshot_upto.len() - 8);
+        }
+    }
+    println!("  live entries: {}", status.live_entries);
+    if !status.writers.is_empty() {
+        println!("  writers:");
+        for w in &status.writers {
+            println!(
+                "    {}: {} live entries (max seq {})",
+                &w.writer[..w.writer.len().min(16)],
+                w.entries,
+                w.max_seq
+            );
+        }
+    } else {
+        println!("  writers:      (none — everything folded)");
+    }
+}
+
+/// compact — fold the journal (+ shards) into ONE snapshot (D3).
+fn cmd_compact(storage: &UnifiedStorage, collection: &str) {
+    let kernel = storage.kernel();
+    let active = storage.get_active_branch(collection);
+
+    match pond_storage::journal::compact(kernel, collection, &active, &[]) {
+        Ok(stats) if stats.new_snapshot.is_empty() => {
+            println!("Nothing to compact for '{}' (no snapshot, no live entries, no shards).", collection);
+        }
+        Ok(stats) => {
+            println!("Compacted '{}':", collection);
+            println!("  entries folded: {}", stats.entries_folded);
+            println!("  shards folded:  {}", stats.shards_folded);
+            println!("  new snapshot:   {}", &stats.new_snapshot[..stats.new_snapshot.len().min(16)]);
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 

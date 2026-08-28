@@ -3251,7 +3251,18 @@ impl Storage {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         let active = storage.get_active_branch(collection);
-        pond_storage::shard::clear_shards(kernel, collection, &active)
+        // JOURNAL ERA (ARCHITECTURE.md D3): compact_shards is now a REAL
+        // fold, not a bare delete. The old implementation called
+        // shard::clear_shards directly — which DELETED shard refs+blobs
+        // WITHOUT merging their rows into HEAD, silently losing any shard
+        // not already absorbed (a data-loss footgun whenever it raced a
+        // concurrent upsert_shard). journal::compact folds the snapshot +
+        // live journal entries + shards into ONE pack, advances the branch
+        // ref (benign LWW — see journal.rs), THEN clears what it folded.
+        // Returns shards folded; journal entries folded are reported via
+        // `pond journal-status` / journal::status.
+        pond_storage::journal::compact(kernel, collection, &active, &[])
+            .map(|stats| stats.shards_folded)
             .map_err(pyo3::exceptions::PyIOError::new_err)
     }
 
@@ -4993,6 +5004,31 @@ fn crdt_merge_rows(rows: Vec<(String, JsonValue)>) -> Vec<JsonValue> {
     crdt_merge_rows_sequential(rows)
 }
 
+/// Total-order CRDT replacement test (CRITIQUE C10).
+///
+/// `true` when the incoming (version, row) should REPLACE the stored one.
+/// The old strict `version > existing` made the FIRST-SEEN row win on
+/// version ties, so permuting the chunk/entry order changed the merged
+/// state. The comparison is now the total order `(_version, _rowid,
+/// payload)` — but both merge maps are keyed BY rowid (the rowid term is
+/// constant within a key), so the term that actually breaks ties is the
+/// serialized payload: two concurrent rows with identical clocks and
+/// identical rowid but different payloads converge to the same winner
+/// regardless of merge order. The payload serialization only runs on a
+/// version tie (rare — HLC collisions), so the common path is one compare.
+fn crdt_should_replace(
+    version: &str,
+    row: &JsonValue,
+    existing_ver: &str,
+    existing_row: &JsonValue,
+) -> bool {
+    if version != existing_ver {
+        return version > existing_ver;
+    }
+    serde_json::to_string(row).unwrap_or_default()
+        > serde_json::to_string(existing_row).unwrap_or_default()
+}
+
 /// Sequential CRDT merge (for small row sets).
 fn crdt_merge_rows_sequential(rows: Vec<(String, JsonValue)>) -> Vec<JsonValue> {
     use std::collections::HashMap;
@@ -5024,8 +5060,8 @@ fn crdt_merge_rows_sequential(rows: Vec<(String, JsonValue)>) -> Vec<JsonValue> 
         }
 
         match latest.get(&effective_rowid) {
-            Some((existing_ver, _)) => {
-                if version > *existing_ver {
+            Some((existing_ver, existing_row)) => {
+                if crdt_should_replace(&version, &row, existing_ver, existing_row) {
                     latest.insert(effective_rowid.clone(), (version, row));
                 }
             }
@@ -5093,8 +5129,8 @@ fn crdt_merge_rows_parallel(rows: Vec<(String, JsonValue)>) -> Vec<JsonValue> {
                 }
 
                 match latest.get(&effective_rowid) {
-                    Some((existing_ver, _)) => {
-                        if version > *existing_ver {
+                    Some((existing_ver, existing_row)) => {
+                        if crdt_should_replace(&version, &row, existing_ver, existing_row) {
                             latest.insert(effective_rowid, (version, row));
                         }
                     }
@@ -5123,11 +5159,13 @@ fn crdt_merge_rows_parallel(rows: Vec<(String, JsonValue)>) -> Vec<JsonValue> {
         // Add non-CRDT rows directly
         result.extend(no_rowid);
 
-        // Merge CRDT rows — latest version wins across chunks
+        // Merge CRDT rows — latest version wins across chunks (C10 total
+        // tiebreak: version ties fall through to a payload compare so the
+        // chunk merge order cannot change the merged state).
         for (rowid, version, row) in merged {
             match final_latest.get(&rowid) {
-                Some((existing_ver, _)) => {
-                    if version > *existing_ver {
+                Some((existing_ver, existing_row)) => {
+                    if crdt_should_replace(&version, &row, existing_ver, existing_row) {
                         final_latest.insert(rowid.clone(), (version, row));
                     }
                 }

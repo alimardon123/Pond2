@@ -68,10 +68,11 @@ The project is done only when every statement below is demonstrably true:
   CAS dependency; design it away instead.
 - No reimplementation of SQL planning beyond what the pond_sql crate already
   does (pushdown into the reader, not a new optimizer).
-- Not this cycle: removing the existing S3 CAS commit loop (it is correct and
-  tested; it gets superseded by the journal design in a write-path cycle, not
-  ripped out mid-read-cycle).
-- Not this cycle: Rust proptest suite (next-cycle P1; tracked in CRITIQUE.md).
+- Not this cycle: Rust proptest suite for the PND2/PMAN/PSLB codecs (tracked
+  in CRITIQUE.md C3; the journal itself gets property tests this cycle — see
+  below).
+- Not this cycle: string zone maps, BPTX index wiring for journal entries,
+  cross-process HLC persistence, C7 helper dedup, C8 executor error parity.
 
 ## Assumptions (recorded, autonomous mode)
 
@@ -83,19 +84,47 @@ The project is done only when every statement below is demonstrably true:
 - CI runners are 2-vCPU: keep the bitpack benchmark calibrated (f85a351) —
   do not add uncalibrated long benchmarks.
 
-## This-cycle acceptance (crucible iteration N+1)
+## This-cycle acceptance (crucible iteration N+2 — THE no-CAS journal cycle)
 
-1. `ACCEPTANCE.md` + `ARCHITECTURE.md` exist in repo root and capture the
-   no-CAS concurrency direction, the Rust-first/CLI-first product shape, and
-   the ownership map (this file).
-2. pyo3 `read_rows` (+ SQL `WHERE` via the same reader) routes through the
-   pruned slab-aware pipeline with projection pushdown, for **all column
-   types** (i64, f64, string/bytes, mixed), with a byte-counting test proving
-   ≤ 10%-of-full-scan on a pruned workload, and correctness tests vs the old
-   path's outputs on mixed data.
-3. Zero-warning build: `cargo clippy --workspace --all-targets -- -D warnings`
-   clean; `cargo test --workspace` all green; moto S3 suite green; live R2
-   suite green (streaming, small footprint).
-4. CI green on the pushed HEAD.
-5. Honest gap report in the cycle's worklog entry (what remains short of the
+Mission for this cycle: land **D3 — the immutable per-writer journal** — which
+in one architectural stroke (a) fixes the **P0 history-loss bug** discovered
+this cycle (C9: every `write_rows`/SQL `INSERT` after the first silently hides
+prior commits — each commit's manifest holds only its own row group while
+reads resolve only HEAD), (b) **removes the CAS commit loop** from the
+production write path (user directive: no CAS — CRDT/architectural solution),
+and (c) kills C2's per-read uncacheable shard LIST for journal-era data.
+
+1. **History preservation (P0, C9)**: after N sequential `write_rows` calls
+   (and after M concurrent writers × K entries), a read returns the CRDT-merged
+   union of ALL rows ever committed (minus tombstoned). Proven by tests, one
+   of which is the exact 2-write/20-rows probe that failed before this cycle.
+2. **No-CAS write path**: `write_rows` appends a pack to a unique journal path
+   (`collections/<c>/_branches/<b>/journal/<writer_id>/<seq>`) via plain PUT —
+   always succeeds, zero retries by construction, identical semantics on
+   localfs and S3/R2. A test asserts N concurrent writers all commit with zero
+   errors and zero lost rows. `put_path_if` gains NO new production callers.
+3. **Warm-path visibility budget (C2)**: a warm read with no changes performs
+   ZERO uncacheable LISTs when the discovery cache is fresh (TTL-bounded,
+   default ~1s, env-tunable to 0 for exact freshness): per-writer epoch probes
+   are parallel GETs at computable paths (positive hits content-cacheable).
+   CountingStore test asserts the GET/LIST counts on the no-change warm path.
+4. **Deterministic merge under permutation**: resolving the same set of
+   journal entries in any order yields byte-identical merged state — total
+   tiebreak `(_version, _rowid)` (fixes the strict-`>` order dependence found
+   at shard.rs merge + pyo3 chunk merge). Property test with shuffled orders.
+5. **Compat**: repositories written by the pre-journal code (HEAD commits +
+   shards) read correctly through the new resolver; the shard read layer
+   keeps working (python lenses still write shards); `compact` folds BOTH
+   shards and journal into a fresh snapshot and advances the branch ref via
+   benign last-writer-wins (every ref value is a valid folded state — races
+   are benign by construction; readers union the snapshot with probes above
+   its per-writer `upto` watermark).
+6. `pond journal-status` + `pond compact` CLI commands (D2: new capabilities
+   reachable from the terminal).
+7. Zero-warning build: `cargo clippy --workspace --all-targets -- -D warnings`
+   clean; `cargo test --workspace` all green; moto S3 suite green (journal
+   semantics against mocked S3: unique-path PUTs, delimiter LIST, 404
+   probes); live R2 suite green (streaming, small footprint).
+8. CI green on the pushed HEAD.
+9. Honest gap report in the cycle's worklog entry (what remains short of the
    staledb/DuckDB bar).

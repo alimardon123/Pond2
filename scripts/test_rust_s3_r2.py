@@ -322,8 +322,11 @@ class R2TestRunner:
         self.check("history has >=1 commit", len(lines) >= 1,
                    f"(got {len(lines)} lines)")
         if lines:
+            # JOURNAL ERA (D3): journal-aware history — the first line may be
+            # the bootstrap fold; the user's seed write must still appear
+            # (via the fold's `folds` list).
             self.check("history line has hash + message",
-                       "\t" in lines[0] and "seed" in lines[0],
+                       "\t" in lines[0] and any("seed" in l for l in lines),
                        f"(first line: {lines[0]!r})")
 
     def test_branch_merge(self) -> None:
@@ -345,7 +348,7 @@ class R2TestRunner:
         r = self.pond_cmd("write-rows", coll, "--json", json.dumps(new_rows), "-m", "add dave on branch")
         self.check("write-rows on branch exits 0", r.returncode == 0)
 
-        # Verify branch now has 1 row (dave) — write-rows is snapshot/replace.
+        # Verify branch now has 4 rows (3 inherited + dave) — journal append.
         # See comment in test_branch_merge for CRDT union merge semantics.
         r = self.pond_cmd("read-rows", coll)
         try:
@@ -353,13 +356,15 @@ class R2TestRunner:
             n = len(got) if isinstance(got, list) else 0
         except json.JSONDecodeError:
             n = 0
-        # Pond2 semantics: `write-rows` is a SNAPSHOT/REPLACE operation — the
-        # branch's collection becomes exactly the new rows (1 row: dave), NOT
-        # an append. `merge` then does a CRDT-style UNION (main's 3 ∪ branch's
-        # 1 = 4 rows). Verified against canonical local-FS tests in
-        # cli/tests/cli_integration.rs:126-150.
-        self.check("branch has 1 row after write (write-rows = snapshot)",
-                   n == 1, f"(got {n})")
+        # JOURNAL ERA (D3): `write-rows` APPENDS to the branch's journal —
+        # the branch inherited main's 3 rows at the branch point (the branch
+        # command folds the source first), dave's write lands on top, and
+        # readers union snapshot + live entries → 4 rows. (The old
+        # expectation of 1 row asserted the C9 history-loss bug: write-rows
+        # REPLACED the branch HEAD, silently destroying the inherited rows.)
+        # `merge` unions both sides (still 4 rows; dave present).
+        self.check("branch has 4 rows after write (journal append semantics)",
+                   n == 4, f"(got {n})")
 
         # Merge branch back into main
         r = self.pond_cmd("merge", coll, branch, "-i", "main", "-m", "merge feature branch")

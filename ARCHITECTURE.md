@@ -43,7 +43,7 @@ startup, no runtime deps; powerful = full lens surface from the terminal.
 New user-visible capabilities must be reachable from the CLI, not only from
 Python.
 
-**D3 — No CAS as the concurrency architecture (settled direction).**
+**D3 — No CAS as the concurrency architecture (settled; landing this cycle).**
 
 Background: compare-and-swap (S3 `If-Match` conditional writes) creates
 central boilerplate (one contended object per branch), retry storms under
@@ -51,30 +51,51 @@ multi-writer load, and has no equivalent on localfs — the same code cannot
 be tested/used locally. The owner's design intent is CRDT-based, and the
 architecture must solve concurrency *beautifully* without CAS.
 
-Target design — **immutable journal, CRDT merge, no overwrites**:
+Settled design — **per-writer immutable journal, benign snapshot cache**:
 
-1. A commit NEVER overwrites a shared pointer. It writes:
-   - data blobs (content-addressed, immutable, dedup by hash), then
-   - ONE commit record at a **unique path**:
-     `collections/<c>/journal/<seq>-<writer_id>.pcommit`
-     (PutIfAbsent semantics; always succeeds because the path is unique —
-     no retries by construction).
-2. Readers resolve "current state" = merge all journal records ≥ the last
-   compaction watermark (CRDT union; per-row LWW by `(_version, writer_id)`
-   tiebreak; tombstones suppress). Deterministic, order-independent.
-3. Visibility without per-read LIST: probe `journal/<seq>` forward from the
-   cached max seq (Delimited/staledb-style epoch probe): O(1) GETs when
-   nothing changed, O(k) when k new commits landed. Both are cacheable.
-4. Compaction folds the journal tail into an immutable snapshot record
-   (unique path), advancing the watermark; never mutates old objects.
-5. localfs gets identical semantics for free (unique files, no rename
-   races) — one code path, testable everywhere.
+1. **Writes append, never overwrite.** A commit writes data blobs
+   (content-addressed, immutable), builds its pack (PNPK: commit + manifest),
+   then appends ONE pointer at a unique path:
+   `collections/<c>/_branches/<b>/journal/<writer_id>/<seq:012>`
+   via plain `put_path` — unique path ⇒ always succeeds, zero retries by
+   construction, identical on localfs/S3/R2. `writer_id` = fresh UUIDv7 per
+   writer instance (process boot); `seq` is the writer's own local counter —
+   no coordination, no CAS, no lost updates possible.
+2. **The pack's commit JSON carries journal metadata**: `journal:
+   {writer, seq, upto: {writer → seq}}`. `upto` states what the pack's
+   manifest already folds (compaction snapshots only; data entries omit it).
+   The invariant: *a pack + probes above its `upto` = complete state*.
+3. **Reads = snapshot ∪ live entries.** The branch ref is a CACHE of the
+   last folded snapshot (not a serialization point). Readers resolve:
+   base = branch-ref pack manifest → probe each discovered writer's log
+   forward from `max(snapshot.upto[w], local seen[w]) + 1` (epoch probes:
+   parallel GETs at computable paths; positive hits are immutable and
+   content-cacheable; first miss ends that writer's log) → run the ONE
+   pruned pipeline per entry pack → CRDT-merge rows (LWW by `_version`,
+   total tiebreak `(_version, _rowid)`, tombstones suppress).
+   Legacy shards union in as before (compat; python lenses still write them).
+4. **Writer discovery** = one delimiter-LIST of `journal/` (returns writer
+   dirs only — changes only when a NEW writer process appears, not per
+   write), TTL-cached in-process (default ~1s; `POND_JOURNAL_TTL_MS=0` for
+   exact freshness). Own-process appends are visible immediately.
+5. **Compaction folds and advances the cache.** `compact` = read full state
+   (snapshot + entries + shards) → write ONE folded pack → LWW-update the
+   branch ref (benign: every value is a valid folded state; racing
+   compactors merely pick different valid bases — probes above each `upto`
+   reconstruct completeness) → delete folded entries (≤ `upto` only) and
+   clear folded shards. Auto-compaction triggers on live-entry threshold
+   (fixes the keyvalue-lens compact-after-every-write P0 pattern).
+6. **Writes touch zero shared objects** — no branch-ref write, no derived
+   refs, no retries, no contended key. This is the linearization-free
+   design the owner asked for: correctness from CRDT merge + unique paths,
+   not from serialization.
 
-Transitional state: `write_rows_inner` currently commits through an S3
-conditional-write CAS retry loop (172a3da). It is CORRECT and tested; it is
-NOT the target architecture. It gets superseded by the journal design in a
-dedicated write-path cycle — not surgically replaced mid-read-cycle. No NEW
-CAS dependencies may be added.
+Transitional state (superseded THIS cycle): `write_rows_inner`'s S3 CAS
+retry loop (172a3da) — correct for ref races but semantically vacuous (the
+rebuilt pack still excluded the winner's data; HEAD-only reads meant every
+commit after the first hid its parent's rows — CRITIQUE C9). It is REMOVED
+by the journal path. `put_path_if`/`reference_if` remain kernel primitives
+with existing tests but NO production callers.
 
 **D4 — One pruned read pipeline (settled).** There is exactly ONE production
 read pipeline: leaf pruning (PMAN v3) → zone-map pruning → parallel bloom
