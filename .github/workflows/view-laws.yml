@@ -44,7 +44,9 @@ concurrency:
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────
-  # Rust workspace — 391 unit/integration tests across 18 crates.
+  # Rust workspace — 511 tests across 20 crates (pond_sql re-included
+  # 2026-08-28; pond_python excluded: PyO3 lib-test linking needs Python dev
+  # headers absent from runners — covered by the pytest job instead).
   # ─────────────────────────────────────────────────────────────────────
   rust-tests:
     name: Rust workspace (cargo test --workspace)

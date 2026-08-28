@@ -24,6 +24,17 @@
   green). pond_python stays excluded (no Python dev headers on runners —
   documented in the workflow header).
 - Cargo.lock: committed the zstd dependency entry left out of 66ecca3.
+- Behavior note (tribunal r1 finding 2): CLI `read-rows` now renders
+  VT_BINARY as `__bin_b64__:…` and VT_VARIANT as parsed JSON (was: Null
+  for both) — consistent with pyo3 `read_rows` and arguably a fix for
+  silently-nulled binary data; recorded here because the commit message
+  only claimed VT_BOOLEAN parity.
+- Tribunal round 1 verdict: PASS-WITH-REPAIRS (all principles ≥8, all
+  done-statements ≥9). Repairs landed same-cycle: type-strict string
+  pre-filter (+ regression test incl. name="" vs `!= 5`), degenerate
+  projection-intersection full-decode guard, stale CI comment, docs;
+  C7 (helper dedup) + C8 (executor HEAD-error swallowing) opened in
+  CRITIQUE.md.
 - (prior cycles, summary): cache wiring (04ac316), close-race fix
   (d6e43c1), cache invalidation (7b621b9), CAS write loop (172a3da),
   shard robustness (2239e65), native zstd (66ecca3), tmp-name uniqueness

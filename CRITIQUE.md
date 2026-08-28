@@ -5,14 +5,16 @@
 
 ## Open
 
-- **C1 (flagship, this cycle)** — `bindings/python/pyo3/src/lib.rs:5292`
-  `read_collection_as_json_rows_filtered`: the flagship `read_rows` API
-  reads FULL blobs per row group (`kernel.read_blob`), decodes ALL columns
-  (no projection pushdown), and never uses leaf pruning / zone maps /
-  blooms / slab range reads / coalescing that `core/storage/src/read.rs`
-  already implements for i64. Root cause: the pruned pipeline was built as
-  a typed i64 special case rather than the general reader. Fix: generalize
-  the pipeline to all column types and route pyo3 (and SQL) through it.
+- **C7** — Mirrored-semantics duplication: `determine_rowid` now exists in 3
+  copies (read.rs, pyo3 lib.rs, sql executor) and `base64_encode` in 2.
+  Root cause: pond_storage couldn't host shared helpers for the pyo3 crate
+  historically. Fix: export from pond_storage, delegate everywhere.
+- **C8** — SQL executor still swallows HEAD-read errors (`Err(_) => {}`,
+  executor.rs read_collection_as_json_rows): a transient S3 500 yields
+  silently partial SQL results, while pyo3 propagates (2239e65 fixed shards
+  only). Root cause: predates this cycle; preserved deliberately to avoid
+  behavior churn mid-read-cycle. Fix: propagate like pyo3 + test.
+- **C1 (RESOLVED this cycle)** — moved to Resolved below.
 - **C2** — `core/storage/src/shard.rs:49` `list_shards` runs a prefix LIST
   per read (uncacheable): warm-path sub-10ms impossible with live shards.
   Root cause: shard visibility lives in the ref namespace, not in
@@ -30,6 +32,13 @@
 
 ## Resolved (moved to CHANGELOG.md entries)
 
+- (2026-08-28) **C1** — flagship read path: pyo3 `read_rows`, SQL executor
+  (WHERE conjunction pushdown), and CLI `read-rows` all route through
+  `read_rows_json_pruned` (leaf → zone maps → blooms → coalesced slab
+  ranges → projection → columnar pre-filter); old full-scan readers
+  deleted (they also mis-decoded PMAN v3 roots); +type-strict pre-filter
+  (tribunal r1 finding 1: `name != 5` vs `name=""` regression) and
+  degenerate-intersection full-decode guard (finding 3). 59352dd + repair.
 - (2026-08-28) pyo3 shard error propagation, shard-id collisions, unified
   slab header reads — 2239e65.
 - (2026-08-28) multi-writer lost updates on S3 (transitional CAS loop) —

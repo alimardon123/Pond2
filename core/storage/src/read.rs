@@ -1112,6 +1112,18 @@ pub fn read_rows_json_pruned_with_head(
     for blob_data in &blob_data_list {
         let cols = pond_core::pnd2_decode_projected(blob_data, decode_set.as_ref())
             .map_err(|e| format!("Failed to decode PND2 blob: {}", e))?;
+        // Degenerate-intersection guard (tribunal r1 finding 3): if the
+        // projection set matched ZERO columns of this blob, the projected
+        // decode yields no columns and the RG's rows would silently
+        // vanish. Fall back to a FULL decode — matching the old
+        // full-decode readers' behavior for data the projection doesn't
+        // know about (e.g. no-CRDT rows lacking id/_key/key).
+        let cols = if cols.is_empty() {
+            pond_core::pnd2_decode(blob_data)
+                .map_err(|e| format!("Failed to decode PND2 blob: {}", e))?
+        } else {
+            cols
+        };
         if predicates.is_empty() {
             rows.extend(json_rows_from_cols(&cols, key_fields, None));
         } else {
@@ -1303,14 +1315,20 @@ fn columnar_filter_scalar(
                 }
             }
             VT_STRING => {
-                let target = value.as_str().unwrap_or("");
-                for (i, s) in col.str_data.iter().enumerate() {
-                    if i >= n_rows {
-                        break;
-                    }
-                    if keep_mask[i] {
-                        let cell = s.to_string_lossy();
-                        keep_mask[i] = scalar_cmp_op(cell.as_ref(), target, op);
+                // Type-strict: only filter when the JSON value IS a string.
+                // `unwrap_or("")` here would turn `name != 5` into
+                // `cell != ""` and drop name="" rows that the authoritative
+                // post-merge filter keeps — a pre-filter must never be
+                // narrower than the authoritative filter (tribunal r1).
+                if let Some(target) = value.as_str() {
+                    for (i, s) in col.str_data.iter().enumerate() {
+                        if i >= n_rows {
+                            break;
+                        }
+                        if keep_mask[i] {
+                            let cell = s.to_string_lossy();
+                            keep_mask[i] = scalar_cmp_op(cell.as_ref(), target, op);
+                        }
                     }
                 }
             }
@@ -1386,6 +1404,14 @@ fn json_rows_from_cols(
 /// key_field (str, then i64), `_key`/`id`/`key` (str, then i64), then a
 /// DefaultHasher digest of the row JSON. The exact order matters: it
 /// decides CRDT grouping for rows that lack `_rowid`.
+///
+/// KNOWN LIMITATION (tribunal r1 finding 4): the last-resort hash covers
+/// the row AS DECODED — under projection pushdown that's the projected
+/// row, so identity for _rowid-less, key-less, id-less rows differs
+/// between projected and unprojected reads. Unreachable via pyo3/CLI
+/// writes (both always add _rowid/_version); affects hand-written blobs
+/// only. A projection-independent identity (e.g. hash of all columns,
+/// ignoring the projection) would close it — tracked in CRITIQUE.md.
 fn determine_rowid_json(row: &JsonValue, key_fields: &[String]) -> String {
     if let Some(r) = row.get("_rowid").and_then(|v| v.as_str()) {
         return r.to_string();
@@ -2470,6 +2496,56 @@ mod tests {
         let preds = vec![("id".to_string(), "!=".to_string(), serde_json::json!(42))];
         let got = read_rows_json_pruned(kernel, "mixed", "main", &kc, None, &preds).unwrap();
         assert_eq!(got.len(), 99, "!= keeps every row but id=42");
+    }
+
+    /// Type-mismatched predicates must not filter (tribunal r1 finding 1):
+    /// `name != 5` (string column, non-string literal) must keep EVERY row —
+    /// including rows whose name is "" — because the authoritative
+    /// post-merge filter treats cross-type comparisons as non-matches for
+    /// `=`/`!=` and never drops them. The old `unwrap_or("")` pre-filter
+    /// turned this into `cell != ""` and silently lost name="" rows.
+    #[test]
+    fn test_read_rows_json_pruned_type_mismatch_keeps_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        // HEAD: two rows, one with an EMPTY string name (the row the bug ate).
+        crate::write::write_rows(
+            kernel, "typemismatch", "main",
+            &[
+                ("id", pond_core::TypedColumn::Int64(vec![1, 2])),
+                ("name", pond_core::TypedColumn::String(vec![
+                    "".to_string(),
+                    "alice".to_string(),
+                ])),
+            ],
+            "seed",
+        ).unwrap();
+
+        let kc = vec!["_rowid".to_string()];
+
+        // `name != 5` — non-string literal against a string column: the
+        // pre-filter must skip entirely; both rows survive to the caller.
+        let preds = vec![("name".to_string(), "!=".to_string(), serde_json::json!(5))];
+        let got = read_rows_json_pruned(kernel, "typemismatch", "main", &kc, None, &preds).unwrap();
+        assert_eq!(got.len(), 2,
+            "type-mismatched != must keep every row (incl. name=\"\")");
+
+        // Same for every op: cross-type comparisons are never answerable at
+        // the column level — conservative means keep.
+        for op in ["=", "==", "<", "<=", ">", ">=", "<>"] {
+            let preds = vec![("name".to_string(), op.to_string(), serde_json::json!(5))];
+            let got = read_rows_json_pruned(kernel, "typemismatch", "main", &kc, None, &preds).unwrap();
+            assert_eq!(got.len(), 2,
+                "type-mismatched {} must keep every row", op);
+        }
+
+        // Control: a MATCHED-type predicate still filters normally.
+        let preds = vec![("name".to_string(), "=".to_string(), serde_json::json!("alice"))];
+        let got = read_rows_json_pruned(kernel, "typemismatch", "main", &kc, None, &preds).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1["name"], serde_json::json!("alice"));
     }
 
     /// CRDT pre-filter safety: the RG/row-level pre-filter is an I/O
