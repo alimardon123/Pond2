@@ -5,15 +5,16 @@
 
 ## Open
 
-- **C11 (tribunal r1 residual, F2-partial)** — Racing compactors with
-  PARTIAL overlap (the loser folded entries the winner missed): the loser's
-  fold pack is kept whole by resolve_view's coverage skip, so the RGs it
-  shares with the winner's snapshot still duplicate for the CONCATENATING
-  readers (read_rows_i64, read_all_row_groups, lakehouse/vector lenses).
-  CRDT readers are unaffected (rows collapse by _rowid). Root cause: the
-  coverage check is pack-granular; RG-level plan filtering (per-entry
-  `only_rgs` sets in the resolved view) is the fix. Next cycle, with the
-  C3 proptest harness.
+- **C15 (tribunal r3, NIT — duplicate-identical-RG data entries)** — Two
+  DATA entries with byte-identical content share an RgIdentity
+  `(blob_hash, slab_byte_offset)` but are never plan-filtered (data
+  entries ARE the coverage source), so concatenating readers see the
+  identical RG twice until the next fold's identity dedup
+  (journal.rs compact) heals it. Content addressing makes genuinely
+  identical RGs rare (same bytes = same data); CRDT readers collapse by
+  _rowid regardless. Fix if it ever matters: dedup identical data-entry
+  RG identities in resolve_packs (same mechanism as compact's extension
+  dedup). Recorded, not scheduled.
 - **C12 (tribunal r1, F7 — accepted trade-off)** — The lenient non-PND2
   skip in read.rs (~1197): a corrupted/truncated PND2 RG blob is silently
   skipped as raw data where the reader previously errored loudly. Raw
@@ -34,32 +35,45 @@
   bootstrap fold. Root cause: probes cannot discover an entry past a gap
   without the watermark. Acceptable (next read is correct); revisit if
   read-your-writes on fresh collections matters.
-- **C7** — Mirrored-semantics duplication: `determine_rowid` in 3 copies
-  (read.rs, pyo3 lib.rs, sql executor), `base64_encode` in 2, AND now the
-  "snapshot + entries → pack list" loop in 5 copies (read.rs ×3,
-  lakehouse, vector lenses). Root cause: pond_storage couldn't host shared
-  helpers for the pyo3 crate historically. Fix: export
-  `journal::resolve_packs()` + shared helpers from pond_storage, delegate
-  everywhere. Next cycle.
 - **C8** — SQL executor still swallows HEAD-read errors (`Err(_) => {}`,
   executor.rs read_collection_as_json_rows): a transient S3 500 yields
   silently partial SQL results, while pyo3 propagates. Fix: propagate
   like pyo3 + test.
-- **C3** — Rust proptest suite is zero for PMAN/PNPK/PSLB codecs (the
-  journal itself now has property-style tests: permutation determinism,
-  interleaved prefixes, fabricated multi-writer logs). Root cause: harness
-  debt. Fix: dedicated proptest cycle — also the right home for the PMAN
-  v2 schema/stats-count format check that the journal cycle surfaced (see
-  manifest::normalize_rgs_to_schema).
 - **C5 (partial)** — SlabWriter is not the default write path. Journal
   entries are columnar packs (PND2) now — the JSON-shard write surface is
   the remaining gap (python lenses still write JSON shards). Fix: journal
-  the shards / SlabWriter default in a later cycle.
+  the shards / SlabWriter default in a later cycle. NOTE (laws-cycle
+  finding #1): full-state CRDT merge byte-permutation-invariance needs an
+  owner decision on identity-less (legacy) row ordering — legacy rows pass
+  through in input order (the ignored `merge_is_permutation_invariant`
+  law in tests/laws_crdt.rs documents the counterexample); the CRDT
+  substate IS invariant (proven by the crdt_only law). Natural home: this
+  item's shard-surface removal.
 - **C6** — Naming: docs sometimes say "StalixDB"; the reference project is
   **staledb**. Sweep docs when touched; do not mass-edit untouched files.
 
 ## Resolved (moved to CHANGELOG.md entries)
 
+- (2026-08-28) **C7** — the "snapshot + entries → pack list" loop that had
+  grown to 5 copies: `journal::resolve_packs()` is THE reader entry point
+  (D6, commit 73fde0c); read.rs ×3, lakehouse, vector lenses all delegate.
+  (The determine_rowid ×3 / base64 ×2 duplication remains inside their
+  crates — reduced, not eliminated.)
+- (2026-08-28) **C11** — racing compactors with PARTIAL overlap duplicated
+  shared RGs for concatenating readers: the coverage check moved from pack
+  granularity to RG granularity (per-plan `only_rgs` sets, D6 commit
+  73fde0c); a partially-covered compact contributes ONLY its novel RGs,
+  fully-covered compacts drop from the plan, stale loser entries stay raw
+  so the next fold's upto deletes their zombie paths. Chain case (multiple
+  partially-overlapping compacts) pinned by
+  test_c11_chain_of_partial_overlaps_each_novel_once.
+- (2026-08-28) **C3** — the proptest suite: laws_crdt (6 laws × 256 cases:
+  permutation invariance [finding #1 — legacy-row caveat documented,
+  verbatim-ignored], idempotence live+full, both tombstone laws,
+  determinism, crdt_only permutation), laws_pman (normalize invariant,
+  byte-stable roundtrips, RootManifest laws × 128 cases), laws_journal
+  (C9 union law, compact-preserves-state, multi-writer interleavings × 24
+  cases on real kernels). Seeds pinned in code — byte-reproducible in CI.
 - (2026-08-28) **C9** — write history lost (every commit after the first
   hid its parent's rows; SQL INSERT data loss): the D3 per-writer journal
   — every write appends an immutable pack at a unique path, readers union

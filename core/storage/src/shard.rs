@@ -271,7 +271,16 @@ fn crdt_row_greater(
 /// for callers that group by a fallback key). The greater payload string
 /// wins; either direction is arbitrary but MUST be fixed so the merge is
 /// commutative — the determinism law (same entry set ⇒ byte-identical
-/// state) holds under any permutation, including tombstone-vs-live ties.
+/// state) holds under any permutation **for rows carrying `_rowid`** (the
+/// C10 subject, proven by the crdt_only permutation law in
+/// tests/laws_crdt.rs). CAVEAT (laws-cycle finding #1, kept verbatim as
+/// the ignored `merge_is_permutation_invariant` law): LEGACY rows without
+/// `_rowid` pass through in INPUT order, so a mixed legacy+CRDT input set
+/// is byte-permutable only up to the legacy tail — the same row SET with
+/// a different input order can serialize differently. Production readers
+/// are unaffected today (resolve_packs feeds a deterministic plan order);
+/// full-state permutation invariance needs an owner decision on
+/// identity-less row ordering (tracked with C5's legacy-shard removal).
 pub fn merge_rows_by_rowid(rows: &[Value], key_col: Option<&str>) -> Vec<Value> {
     // Separate CRDT rows (with _rowid) from legacy rows (without)
     let mut latest: std::collections::HashMap<String, Value> = std::collections::HashMap::new();

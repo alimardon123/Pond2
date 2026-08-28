@@ -3,6 +3,57 @@
 > Crucible state file. The deep per-cycle log lives in `worklog.md`
 > (append-only); this file tracks iterations and why.
 
+## 2026-08-28 — Crucible iteration N+3: the LAWS cycle (cron-2026-08-28-1100)
+
+- **D6 landed (C7 + C11)**: `journal::resolve_packs()` is THE reader entry
+  point — the "snapshot + entries → pack list" loop that had grown to 5
+  copies (read.rs ×3, lakehouse, vector lenses) now lives exactly once.
+  Coverage moved from PACK granularity to RG granularity: a partially-
+  covered COMPACT entry contributes ONLY its novel row groups (per-plan
+  `only_rgs` sets applied before zone-map/bloom pruning and I/O), fully-
+  covered compacts drop from the plan, and stale loser entries stay live in
+  the RAW view so the next compact's `upto` deletes their zombie paths.
+  `compact` builds its union manifest from the SAME frozen view's plans
+  (build_pack_plans — no second resolve) with identity dedup at extension
+  time. Concatenating readers now see each RG exactly once under racing
+  compactors with partial overlap (pre-D6: 15 rows for 10 logical; chain
+  case: 20 for 15). (commit 73fde0c)
+- **C3 landed — the proptest suites**: 11 property laws, ~1700 pinned-seed
+  cases. laws_crdt (6 laws × 256 cases): merge permutation invariance,
+  idempotence (live AND full state), both tombstone laws, determinism.
+  laws_pman (3 laws × 128 cases + boundary): normalize-aligns-stats-to-
+  schema (the invariant whose violation corrupted PMAN v2 in the wild),
+  byte-stable encode→decode roundtrips, RootManifest laws. laws_journal
+  (3 laws × 24 cases on REAL kernels): the C9 union law (read-after-N-
+  appends, exact-once), compact-preserves-state-for-every-reader (same
+  kernel + fresh reader + nothing-left-live), multi-writer interleavings
+  (2-3 writers, shuffled physical PUT order → exact union, fold-stable).
+  Seeds pinned IN CODE (`RngSeed::Fixed`, distinct per file) — CI runs are
+  byte-reproducible.
+- **FINDING #1 (the review doing its job)**: the full-state CRDT merge
+  permutation law FAILS on legacy rows — rows without `_rowid` pass
+  through in INPUT order, so the C10 doc claim ("byte-identical state
+  under any permutation") was overstated. Shrunk counterexample (9×`{}` +
+  1 versioned legacy row) persisted in laws_crdt.proptest-regressions;
+  law kept VERBATIM as `#[ignore]`; the CRDT substate (rows carrying
+  `_rowid` — the actual C10 subject) proven invariant by the crdt_only
+  sub-law; shard.rs doc comment now carries the caveat. Production impact
+  today: none (resolve_packs feeds a deterministic plan order). Full fix
+  needs an owner decision on identity-less row ordering — tracked with C5.
+- **Tribunal r3 (fresh-context critic): PASS-WITH-REPAIRS** — no HIGH
+  findings; principles 9/8/9/8/8/8/8/8; done-statements 9/7/9/10/9/9.
+  Empirically verified: all test gates, the finding's counterexample, seed
+  determinism (identical results across runs), strategy attack rates (66%
+  rowid collisions, 23% version ties, 40% legacy-row cases — the laws
+  genuinely attack), zero secrets. Repairs landed same-cycle: the
+  multi-writer interleaving law (closes the item-2 contract gap), the C11
+  CHAIN test (multiple partially-overlapping compacts — tribunal finding
+  4), the shard.rs legacy-row doc caveat (finding 3), state-file sync
+  (finding 1). C15 opened (duplicate-identical-RG data entries, NIT).
+- Validation: 567 workspace tests listed (542→567; pond_storage alone
+  203 pass / 0 fail / 1 ignored), clippy -D warnings clean, moto S3 32/32,
+  live Cloudflare R2 green, pytest 25 pass / 2 env-only skips.
+
 ## 2026-08-28 — Crucible iteration N+2: THE no-CAS journal cycle (cron-2026-08-28-0353)
 
 - **The P0 that framed everything**: discovered + verified empirically that

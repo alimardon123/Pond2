@@ -1565,6 +1565,106 @@ fn test_c11_partial_overlap_only_novel_rgs_read() {
     assert_eq!(rgs.len(), 2, "read_all_row_groups reads S_A's RG + S_B's novel RG only");
 }
 
+/// D6 CHAIN (tribunal r3 finding 4): MULTIPLE live compact entries that
+/// partially overlap EACH OTHER. Winner S_A folds {D1}; loser S_B folds
+/// {D1, D2} (novel: D2); loser S_C folds {D2, D3} (novel: D3 — D2 is
+/// already claimed by S_B's novel set). Each compact in the chain must
+/// contribute ONLY its own novel RGs (`covered ∪= novel` per entry), so
+/// the concatenating reader sees D1+D2+D3 exactly once each. Pre-D6
+/// (pack-granular): both losers kept whole → 20 rows for 15 logical.
+#[test]
+fn test_c11_chain_of_partial_overlaps_each_novel_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+    let kernel = storage.kernel();
+    let coll = "c11chain";
+
+    // Three data blobs with disjoint id ranges.
+    let mk = |lo: i64, hi: i64| -> (Vec<i64>, Vec<i64>) {
+        let ids: Vec<i64> = (lo..=hi).collect();
+        let vals: Vec<i64> = ids.iter().map(|i| i * 10).collect();
+        (ids, vals)
+    };
+    let (ids1, vals1) = mk(1, 5);
+    let (ids2, vals2) = mk(6, 10);
+    let (ids3, vals3) = mk(11, 15);
+    let blob1 = kernel
+        .write(&pond_core::pnd2_encode_i64_auto(&[("id", &ids1), ("val", &vals1)]))
+        .unwrap();
+    let blob2 = kernel
+        .write(&pond_core::pnd2_encode_i64_auto(&[("id", &ids2), ("val", &vals2)]))
+        .unwrap();
+    let blob3 = kernel
+        .write(&pond_core::pnd2_encode_i64_auto(&[("id", &ids3), ("val", &vals3)]))
+        .unwrap();
+    let d1: (String, Option<u64>) = (blob1, None);
+    let d2: (String, Option<u64>) = (blob2, None);
+    let d3: (String, Option<u64>) = (blob3, None);
+
+    // Winner S_A: folded only D1 (it resolved before D2/D3 existed).
+    let s_a = fabricate_compact_pack(
+        kernel,
+        &[(d1.0.clone(), ids1.clone(), vals1.clone())],
+        "W_A",
+        1,
+        json!({"W1": 1}),
+    );
+    kernel.reference(&branch_ref(coll, "main"), &s_a).unwrap();
+
+    // Loser S_B: folded D1+D2, referenced live at W_B/1. Its RG set vs
+    // (snapshot ∪ live data) is partially covered → only D2 is novel.
+    let s_b = fabricate_compact_pack(
+        kernel,
+        &[(d1.0.clone(), ids1.clone(), vals1.clone()), (d2.0.clone(), ids2.clone(), vals2.clone())],
+        "W_B",
+        1,
+        json!({"W1": 1, "W2": 1, "W_B": 1}),
+    );
+    kernel
+        .reference(&entry_path(coll, "main", "W_B", 1), &s_b)
+        .unwrap();
+
+    // Loser S_C: folded D2+D3, referenced live at W_C/1. D2 is already
+    // claimed by S_B's novel set → only D3 is novel for S_C. This is the
+    // `covered.extend(novel)` chain the tribunal asked to pin.
+    let s_c = fabricate_compact_pack(
+        kernel,
+        &[(d2.0.clone(), ids2.clone(), vals2.clone()), (d3.0.clone(), ids3.clone(), vals3.clone())],
+        "W_C",
+        1,
+        json!({"W2": 1, "W3": 1, "W_C": 1}),
+    );
+    kernel
+        .reference(&entry_path(coll, "main", "W_C", 1), &s_c)
+        .unwrap();
+
+    // The plan: S_A whole, S_B filtered to {D2}, S_C filtered to {D3}.
+    let plans = journal::resolve_packs(kernel, coll, "main", true).unwrap();
+    assert_eq!(plans.len(), 3, "snapshot + both losers: {:?}", plans);
+    assert_eq!(plans[0].pack_hash, s_a);
+    assert!(plans[0].only_rgs.is_none());
+    assert_eq!(plans[1].pack_hash, s_b);
+    let only_b = plans[1].only_rgs.as_ref().expect("S_B partially covered");
+    assert_eq!(only_b.len(), 1, "S_B's novel set is exactly {{D2}}: {:?}", only_b);
+    assert!(only_b.contains(&d2), "S_B novel = D2: {:?}", only_b);
+    assert_eq!(plans[2].pack_hash, s_c);
+    let only_c = plans[2].only_rgs.as_ref().expect("S_C partially covered");
+    assert_eq!(only_c.len(), 1, "S_C's novel set is exactly {{D3}}: {:?}", only_c);
+    assert!(only_c.contains(&d3), "S_C novel = D3 (D2 already claimed by S_B): {:?}", only_c);
+
+    // The concatenating reader: ids 1-15, each EXACTLY once (pre-D6: 20).
+    let cols = read::read_rows_i64(kernel, coll, "main", None, None).unwrap();
+    assert_eq!(
+        sorted_ids(&cols),
+        (1..=15).collect::<Vec<i64>>(),
+        "C11 chain: each compact contributes ONLY its novel RGs"
+    );
+
+    // The pruned JSON reader agrees (no _rowid → duplicates would survive).
+    let rows = read::read_rows_json_pruned(kernel, coll, "main", &[], None, &[]).unwrap();
+    assert_eq!(rows.len(), 15, "C11 chain: the JSON pipeline sees each RG once");
+}
+
 /// D6 zombie cleanup: after the C11 aftermath, ONE real compaction must
 /// (a) delete the stale loser's entry path (the RAW view keeps it live,
 /// so its seq joins `upto` and the delete loop finally removes it —
