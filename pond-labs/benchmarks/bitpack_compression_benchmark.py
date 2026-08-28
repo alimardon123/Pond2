@@ -91,25 +91,41 @@ def benchmark_predicate_eval():
     encoded, _ = encode_bitpack(values)
 
     # Predicate: value > 99999 (out of range — should fully prune in O(1))
-    N_RUNS = 10_000
+    # N_RUNS is calibrated: measure one eval, then size the run so the
+    # measured section stays ~<= 2s. Without numpy the pure-Python fallback
+    # is 50-100x slower — a fixed 10_000-run budget was 291s on CI runners
+    # (97% of the test's 300s subprocess timeout; flaked over the line on
+    # slower machines). Calibration keeps the benchmark meaningful on ANY
+    # hardware instead of timing out on the slow path.
+    def _calibrated_runs(fn, budget_s: float = 2.0, max_runs: int = 10_000) -> int:
+        t0 = time.perf_counter()
+        fn()
+        one = time.perf_counter() - t0
+        if one <= 0:
+            return max_runs
+        return max(1, min(max_runs, int(budget_s / one)))
+
+    n_prune = _calibrated_runs(lambda: eval_predicate_encoded(encoded, "x", ">", 99_999))
     t0 = time.perf_counter()
-    for _ in range(N_RUNS):
+    for _ in range(n_prune):
         ranges, _ = eval_predicate_encoded(encoded, "x", ">", 99_999)
-    elapsed_us = (time.perf_counter() - t0) * 1_000_000 / N_RUNS
+    elapsed_us = (time.perf_counter() - t0) * 1_000_000 / n_prune
     assert ranges == [], "Should fully prune"
     print(f"\n  Predicate 'x > 99999' (out of range, fully pruned):")
     print(f"    {elapsed_us:.2f} µs per eval (O(1) — reads 16 bytes from sub-header)")
-    print(f"    {N_RUNS:,} evals in {(elapsed_us * N_RUNS / 1_000_000):.2f}s")
+    print(f"    {n_prune:,} evals in {(elapsed_us * n_prune / 1_000_000):.2f}s")
 
     # Predicate: value > 5000 (in range — vectorized scan yields matching positions)
+    n_scan = _calibrated_runs(lambda: eval_predicate_encoded(encoded, "x", ">", 5_000),
+                              budget_s=2.0)
     t0 = time.perf_counter()
-    for _ in range(N_RUNS):
+    for _ in range(n_scan):
         ranges, _ = eval_predicate_encoded(encoded, "x", ">", 5_000)
-    elapsed_us = (time.perf_counter() - t0) * 1_000_000 / N_RUNS
+    elapsed_us = (time.perf_counter() - t0) * 1_000_000 / n_scan
     assert ranges == [(5001, 10_000)], f"Should return matching range, got {ranges}"
     print(f"\n  Predicate 'x > 5000' (in range, vectorized scan):")
     print(f"    {elapsed_us:.2f} µs per eval (numpy vectorized — scan + compare + coalesce)")
-    print(f"    {N_RUNS:,} evals in {(elapsed_us * N_RUNS / 1_000_000):.2f}s")
+    print(f"    {n_scan:,} evals in {(elapsed_us * n_scan / 1_000_000):.2f}s")
     print(f"    Returns [(5001, 10000)] — 4999 surviving rows (Vortex-style: no full decode)")
 
 
@@ -122,11 +138,15 @@ def benchmark_decode_speed():
     values = list(range(10_000))
     encoded, _ = encode_bitpack(values)
 
-    N_RUNS = 100
+    # Calibrated: bounded total time regardless of numpy presence/hardware.
     t0 = time.perf_counter()
-    for _ in range(N_RUNS):
+    decode_column(encoded)
+    one = time.perf_counter() - t0
+    n_runs = max(1, min(100, int(2.0 / one))) if one > 0 else 100
+    t0 = time.perf_counter()
+    for _ in range(n_runs):
         decoded = decode_column(encoded)
-    elapsed_ms = (time.perf_counter() - t0) * 1000 / N_RUNS
+    elapsed_ms = (time.perf_counter() - t0) * 1000 / n_runs
     assert decoded == values
 
     print(f"\n  Decode 10,000 int16 values (bitwidth=14):")
