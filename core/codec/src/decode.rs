@@ -41,17 +41,18 @@ pub fn pnd2_decode(blob: &[u8]) -> Result<Vec<PondColumn>, String> {
     let compression_tag = blob[12];
 
     if compression_tag == COMPRESSION_ZSTD {
-        // zstd-compressed blob — decompress if the "zstd" feature is enabled.
-        #[cfg(feature = "zstd")]
+        // zstd-compressed blob — decompress if a zstd feature is enabled.
+        #[cfg(any(feature = "zstd", feature = "zstd-pure"))]
         {
             let decompressed = decompress_zstd(&blob[13..])?;
             let mut parser = PND2Parser::new(&decompressed);
             return decode_inner(&decompressed, &mut parser, n_rows, n_columns, has_stats, None);
         }
-        #[cfg(not(feature = "zstd"))]
+        #[cfg(not(any(feature = "zstd", feature = "zstd-pure")))]
         {
-            return Err("zstd-compressed blobs require the 'zstd' feature. \
-                        Rebuild with: cargo build -p pond_core --features zstd".into());
+            return Err("zstd-compressed blobs require the 'zstd' (native) or \
+                        'zstd-pure' (ruzstd) feature. Rebuild with: \
+                        cargo build -p pond_core --features zstd".into());
         }
     }
     if compression_tag != COMPRESSION_NONE {
@@ -63,8 +64,19 @@ pub fn pnd2_decode(blob: &[u8]) -> Result<Vec<PondColumn>, String> {
     decode_inner(inner, &mut parser, n_rows, n_columns, has_stats, None)
 }
 
-/// Decompress zstd data using ruzstd (pure-Rust, no C deps).
+/// Decompress zstd data — NATIVE zstd (C, statically bundled by zstd-sys).
+/// 2-5x faster than the pure-Rust ruzstd on the scan path; pond_storage
+/// already links native zstd for the compression side, so this adds no
+/// new link requirements for C/Go/Java consumers of the staticlib.
 #[cfg(feature = "zstd")]
+fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, String> {
+    zstd::decode_all(data)
+        .map_err(|e| format!("zstd: failed to decompress: {}", e))
+}
+
+/// Pure-Rust fallback (feature `zstd-pure`) for targets without a C
+/// toolchain. Same frame format — just slower decode.
+#[cfg(all(feature = "zstd-pure", not(feature = "zstd")))]
 fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>, String> {
     use ruzstd::decoding::StreamingDecoder;
     use std::io::Cursor;
@@ -100,13 +112,13 @@ pub fn pnd2_decode_projected(
     let compression_tag = blob[12];
 
     if compression_tag == COMPRESSION_ZSTD {
-        #[cfg(feature = "zstd")]
+        #[cfg(any(feature = "zstd", feature = "zstd-pure"))]
         {
             let decompressed = decompress_zstd(&blob[13..])?;
             let mut parser = PND2Parser::new(&decompressed);
             return decode_inner(&decompressed, &mut parser, n_rows, n_columns, has_stats, projection);
         }
-        #[cfg(not(feature = "zstd"))]
+        #[cfg(not(any(feature = "zstd", feature = "zstd-pure")))]
         {
             return Err("zstd-compressed blobs require the 'zstd' feature.".into());
         }

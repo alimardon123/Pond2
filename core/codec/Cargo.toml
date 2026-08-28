@@ -15,14 +15,20 @@ crate-type = ["staticlib", "rlib", "cdylib"]
 [features]
 default = []
 # Enable zstd decompression support (for reading production PND2 blobs).
-# Uses ruzstd (pure-Rust, no C deps). Off by default to preserve zero-dep
-# for cross-language linking. Enable with: cargo build -p pond_core --features zstd
-zstd = ["dep:ruzstd"]
+# NATIVE zstd (C, statically bundled by zstd-sys): 2-5x faster decode than
+# ruzstd on the scan path. pond_storage already links native zstd for the
+# COMPRESSION side, so this adds no new link requirements for C consumers.
+# Enable with: cargo build -p pond_core --features zstd
+zstd = ["dep:zstd"]
+# Pure-Rust fallback (ruzstd) for targets without a C toolchain (exotic
+# cross-compilation). Same frame format, slower decode.
+zstd-pure = ["dep:ruzstd"]
 
 [dependencies]
 # NONE by default — pond_core stays pure-Rust with zero external deps.
 # This is critical for cross-language linking: consumers (Go, Java, Node)
 # must not have to satisfy transitive Rust crate dependencies.
+zstd = { version = "0.13", optional = true, default-features = false }
 ruzstd = { version = "0.9", optional = true }
 
 # serde_json is used by the hybrid search module (BM25 + RRF) to operate
