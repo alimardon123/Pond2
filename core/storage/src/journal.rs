@@ -432,7 +432,8 @@ fn probe_writer(
     entries
 }
 
-/// Resolve the full journal view: snapshot pack + live entries.
+/// Resolve the RAW journal view: snapshot pack + every live entry above
+/// its watermarks.
 ///
 /// Probes run IN PARALLEL across writers (std::thread::scope — same
 /// pattern as the bloom pre-check in read.rs) and sequentially within a
@@ -446,6 +447,17 @@ fn probe_writer(
 /// concurrent compaction mid-probe), but it always observes a PREFIX of
 /// each writer's log over a valid snapshot — a consistent past state,
 /// never a torn one. The next read (post-TTL) sees the rest.
+///
+/// THE RAW VIEW MAY CONTAIN STALE COMPACTION PACKS (ARCHITECTURE.md D6):
+/// a loser compactor's fold pack stays live here even when another
+/// snapshot/entry already covers its row groups. READERS must go through
+/// [`resolve_packs`], which deduplicates at RG granularity (the raw view
+/// deliberately no longer drops fully-covered compact entries — that
+/// pack-granular F2 heuristic moved into the plan). Keeping them raw has
+/// a second purpose: the NEXT compact's `upto` sees their seq and the
+/// delete loop finally removes the zombie entry paths (they used to be
+/// re-probed and re-dropped forever). `compact`/`status`/`history` use
+/// the raw view directly and WANT the full live set.
 pub fn resolve_view(
     kernel: &PondKernel,
     collection: &str,
@@ -524,70 +536,15 @@ pub fn resolve_view(
             .insert(e.seq, e.pack_hash.clone());
     }
 
-    // 4.5 TRIBUNAL F2 — drop fully-covered COMPACT entries.
-    //
-    // When two compactors race, the loser's fold pack stays live in its
-    // writer's log (the winner's upto never covered it). Both packs fold
-    // overlapping RG sets, and the non-CRDT readers (read_rows_i64,
-    // read_all_row_groups, lakehouse/vector lenses) CONCATENATE packs —
-    // every shared RG appeared twice (verified empirically by the
-    // tribunal: 10 rows read for 5 logical rows).
-    //
-    // Fix: a live entry whose pack is a COMPACTION snapshot (journal.upto
-    // present) is SKIPPED when every RG blob hash in its manifest is
-    // already covered by the snapshot's RGs ∪ the DATA entries' RGs ∪
-    // previously-kept compact RGs. The common race (both compactors fold
-    // the same view) is fully covered → skipped → no duplication. A
-    // partial-overlap compact pack (the winner missed entries the loser
-    // folded) is kept whole — its shared RGs still duplicate for the
-    // concatenating readers; that residual is C11 in CRITIQUE.md (needs
-    // RG-level plan filtering, next cycle). CRDT readers are unaffected
-    // either way (duplicate rows collapse by _rowid).
-    //
-    // Cost: entry packs are read here to classify them — the same packs
-    // the readers fetch right after, so content caching makes this free
-    // after the first resolve.
-    if snapshot.is_some() && !live.is_empty() {
-        let all_hashes: Vec<String> = live.values()
-            .flat_map(|log| log.values().cloned())
-            .collect();
-        let kinds = classify_packs(kernel, &all_hashes);
-        let any_compact = kinds.values().any(|k| *k);
-        if any_compact {
-            // Covered set: snapshot RGs + DATA entry RGs.
-            let mut covered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-            if let Some(snap) = &snapshot {
-                collect_rg_hashes(kernel, snap, &mut covered);
-            }
-            for (hash, is_compact) in &kinds {
-                if !is_compact {
-                    collect_rg_hashes(kernel, hash, &mut covered);
-                }
-            }
-            // Drop compact entries whose RGs are fully covered; keep their
-            // novel hashes covered for the next compact in line.
-            let mut filtered: LiveEntries = BTreeMap::new();
-            for (w, log) in &live {
-                let mut kept_log: WriterLog = BTreeMap::new();
-                for (seq, hash) in log {
-                    let is_compact = kinds.get(hash).copied().unwrap_or(false);
-                    if is_compact {
-                        let mut rgs = std::collections::BTreeSet::new();
-                        collect_rg_hashes(kernel, hash, &mut rgs);
-                        if rgs.iter().all(|h| covered.contains(h)) {
-                            continue; // fully covered — skip
-                        }
-                        covered.extend(rgs);
-                    }
-                    kept_log.insert(*seq, hash.clone());
-                }
-                if !kept_log.is_empty() {
-                    filtered.insert(w.clone(), kept_log);
-                }
-            }
-            live = filtered;
-        }
-    }
+    // 4.5 — REMOVED (ARCHITECTURE.md D6): the pack-granular "drop
+    //    fully-covered COMPACT entries" tribunal-F2 heuristic no longer
+    //    lives in resolution. It moved into `resolve_packs` and was
+    //    upgraded to RG granularity: a partially-covered compact pack now
+    //    contributes ONLY its novel row groups (C11 — the old heuristic
+    //    had to keep partial overlaps whole, duplicating their shared RGs
+    //    for every concatenating reader). The raw view intentionally
+    //    keeps stale compact entries live so the next compact's `upto`
+    //    covers their seq and the delete loop removes their zombie paths.
 
     // 5. Persist the new live set (entries ≤ upto are dropped here too —
     //    folded data is never re-read or re-probed).
@@ -613,6 +570,143 @@ pub fn resolve_view(
         snapshot_upto,
         entries,
     })
+}
+
+// ---------------------------------------------------------------------------
+// The RG-level read plan (ARCHITECTURE.md D6 — C7 + C11)
+// ---------------------------------------------------------------------------
+
+/// Identity of one row group: `(blob_hash, slab_byte_offset)`. Stable
+/// across folds because compaction copies RG entries verbatim (only `key`
+/// is re-sequenced). Two RG entries with the same identity are the same
+/// data — that is what makes plan-level dedup safe.
+pub type RgIdentity = (String, Option<u64>);
+
+/// One pack in the read plan.
+#[derive(Debug, Clone)]
+pub struct PackPlan {
+    pub pack_hash: String,
+    /// `None` = read ALL row groups of this pack (snapshot packs, data
+    /// entries, fully-novel compact entries). `Some(set)` = read ONLY the
+    /// RGs whose identity is in the set (the novel RGs of a
+    /// partially-covered compaction pack — C11).
+    pub only_rgs: Option<std::collections::BTreeSet<RgIdentity>>,
+}
+
+/// THE reader entry point (ARCHITECTURE.md D6): resolve the journal into
+/// a per-pack READ PLAN. Readers never resolve the journal themselves —
+/// they iterate the plans, resolve each manifest, apply `only_rgs` with
+/// one `retain`, and run their per-pack pipeline.
+///
+/// Plan construction:
+///   - no live entries → `[snapshot?]` (empty vec when there is no
+///     snapshot either — callers surface "no commits").
+///   - no COMPACT entry live (the steady state) → `[snapshot?] + entries`,
+///     all `only_rgs: None`. Zero reads beyond `resolve_view`'s own
+///     probing plus the per-entry classification blob read.
+///   - with compact entries: `covered` = snapshot RG identities ∪ every
+///     DATA entry's RG identities; each compact entry (in deterministic
+///     (writer, seq) order) contributes only its NOVEL identities — kept
+///     whole when everything is novel, `Some(novel)` when partially
+///     covered, DROPPED when nothing is novel. `covered` absorbs each
+///     entry's novel set, so racing compactors with partial overlap
+///     cannot duplicate an RG for concatenating readers (C11).
+///
+/// Plan order is `[snapshot] + entries in (writer, seq) order` —
+/// identical to the pre-D6 pack order, so output row ordering is
+/// unchanged.
+///
+/// Fail-safety: an entry whose pack cannot be read/classified is treated
+/// as a DATA entry and kept whole (classify_packs is lenient); an
+/// unreadable SNAPSHOT contributes nothing to `covered` (a compact entry
+/// is then more likely kept whole — reads stay correct).
+pub fn resolve_packs(
+    kernel: &PondKernel,
+    collection: &str,
+    branch: &str,
+    force_refresh: bool,
+) -> Result<Vec<PackPlan>, String> {
+    let view = resolve_view(kernel, collection, branch, force_refresh)?;
+    build_pack_plans(kernel, &view)
+}
+
+/// Build the pack plans from an ALREADY-RESOLVED raw view (the internal
+/// half of [`resolve_packs`]). `compact` uses this directly so the union
+/// manifest and the `upto`/delete accounting derive from ONE view
+/// snapshot — resolving twice would open a window where a mid-fold append
+/// lands in the plan but not in `upto` (its entry path would survive,
+/// duplicating its RGs) or vice versa (data loss).
+fn build_pack_plans(kernel: &PondKernel, view: &JournalView) -> Result<Vec<PackPlan>, String> {
+    // Fast exit: nothing live → just the snapshot (or nothing at all).
+    if view.entries.is_empty() {
+        return Ok(view
+            .snapshot
+            .clone()
+            .map(|pack_hash| vec![PackPlan { pack_hash, only_rgs: None }])
+            .unwrap_or_default());
+    }
+
+    // Classify live entries (one blob read per entry — the same packs the
+    // readers fetch right after, so content caching makes this ~free).
+    let all_hashes: Vec<String> = view.entries.iter().map(|e| e.pack_hash.clone()).collect();
+    let kinds = classify_packs(kernel, &all_hashes);
+    let is_compact = |hash: &str| kinds.get(hash).copied().unwrap_or(false);
+
+    // Steady-state fast path: no compact entry live → no coverage work.
+    if !kinds.values().any(|k| *k) {
+        let mut plans: Vec<PackPlan> = Vec::with_capacity(view.entries.len() + 1);
+        if let Some(snapshot) = &view.snapshot {
+            plans.push(PackPlan { pack_hash: snapshot.clone(), only_rgs: None });
+        }
+        for e in &view.entries {
+            plans.push(PackPlan { pack_hash: e.pack_hash.clone(), only_rgs: None });
+        }
+        return Ok(plans);
+    }
+
+    // Compact entries present: RG-level coverage filtering.
+    // covered = snapshot RGs ∪ DATA entry RGs (upfront: data entries are
+    // always kept whole, so any RG they hold is definitely being read).
+    let mut covered: BTreeSet<RgIdentity> = BTreeSet::new();
+    if let Some(snapshot) = &view.snapshot {
+        collect_rg_identities(kernel, snapshot, &mut covered);
+    }
+    for e in &view.entries {
+        if !is_compact(&e.pack_hash) {
+            collect_rg_identities(kernel, &e.pack_hash, &mut covered);
+        }
+    }
+
+    let mut plans: Vec<PackPlan> = Vec::with_capacity(view.entries.len() + 1);
+    if let Some(snapshot) = &view.snapshot {
+        plans.push(PackPlan { pack_hash: snapshot.clone(), only_rgs: None });
+    }
+    for e in &view.entries {
+        if !is_compact(&e.pack_hash) {
+            // Data entry: kept whole, no coverage change (already folded
+            // into `covered` above).
+            plans.push(PackPlan { pack_hash: e.pack_hash.clone(), only_rgs: None });
+            continue;
+        }
+        let mut rgs: BTreeSet<RgIdentity> = BTreeSet::new();
+        collect_rg_identities(kernel, &e.pack_hash, &mut rgs);
+        let novel: BTreeSet<RgIdentity> = rgs.difference(&covered).cloned().collect();
+        if novel.is_empty() {
+            // Fully covered (or an empty fold pack — it holds no RGs to
+            // contribute): dropped from the plan.
+            continue;
+        }
+        if novel.len() == rgs.len() {
+            // Everything novel: keep the pack whole (cheaper than a filter
+            // set, and identical output).
+            plans.push(PackPlan { pack_hash: e.pack_hash.clone(), only_rgs: None });
+        } else {
+            // Partial overlap (C11): read ONLY the novel RGs.
+            plans.push(PackPlan { pack_hash: e.pack_hash.clone(), only_rgs: Some(novel.clone()) });
+        }
+        covered.extend(novel);
+    }
+    Ok(plans)
 }
 
 // ---------------------------------------------------------------------------
@@ -845,20 +939,36 @@ pub fn compact(
         });
     }
 
-    // 2. Union manifest: snapshot pack RGs + every live entry pack's RGs.
-    let mut packs: Vec<String> = Vec::with_capacity(view.entries.len() + 1);
-    if let Some(snap) = &view.snapshot {
-        packs.push(snap.clone());
-    }
-    packs.extend(view.entries.iter().map(|e| e.pack_hash.clone()));
+    // 2. Union manifest — built from the READ PLAN, not the raw pack list
+    //    (ARCHITECTURE.md D6): a stale loser-compaction entry is live in
+    //    the RAW view (kept deliberately — see resolve_view) and its
+    //    already-covered RGs must not enter the union a second time. The
+    //    plans deduplicate at RG granularity; the identity dedup below
+    //    additionally self-heals PRE-D6 snapshots that already carry
+    //    duplicated RGs.
+    //
+    //    The plans are derived from the SAME `view` as the upto/delete
+    //    accounting below (build_pack_plans, not a second resolve_view) —
+    //    one frozen view means the union and the watermarks can never
+    //    disagree about what this fold covers.
+    let plans = build_pack_plans(kernel, &view)?;
 
     let mut union_rgs: Vec<crate::manifest::RowGroupEntry> = Vec::new();
     let mut union_schema: Vec<(String, u8)> = Vec::new();
     let mut key_col = String::new();
-    for pack_hash in &packs {
+    let mut seen_identities: BTreeSet<RgIdentity> = BTreeSet::new();
+    for plan in &plans {
+        let pack_hash = &plan.pack_hash;
         let manifest_bytes = commit::resolve_manifest_bytes(kernel, pack_hash)
             .map_err(|e| format!("compaction: manifest resolve failed for {}: {}", pack_hash, e))?;
-        let manifest = crate::read::resolve_manifest(kernel, &manifest_bytes, None)?;
+        let mut manifest = crate::read::resolve_manifest(kernel, &manifest_bytes, None)?;
+        // Apply the plan's RG-level filter (C11): a partially-covered
+        // compact pack contributes only its novel row groups.
+        if let Some(only) = &plan.only_rgs {
+            manifest
+                .row_groups
+                .retain(|rg| only.contains(&(rg.blob_hash.clone(), rg.slab_byte_offset)));
+        }
         if union_schema.is_empty() {
             union_schema = manifest.columns.clone();
             key_col = manifest.key_col.clone();
@@ -871,7 +981,15 @@ pub fn compact(
                 }
             }
         }
-        union_rgs.extend(manifest.row_groups);
+        // Identity dedup at extension time: keep the FIRST occurrence
+        // (order stability) and skip any RG whose identity is already in
+        // the union — pre-D6 snapshots could carry duplicates, and the
+        // folded manifest must carry each RG exactly once.
+        for rg in manifest.row_groups {
+            if seen_identities.insert((rg.blob_hash.clone(), rg.slab_byte_offset)) {
+                union_rgs.push(rg);
+            }
+        }
     }
     if union_schema.is_empty() {
         if let Some(kf) = key_fields.first() {
@@ -1216,18 +1334,26 @@ fn classify_packs(kernel: &PondKernel, pack_hashes: &[String]) -> HashMap<String
     out
 }
 
-/// Collect a pack's manifest RG blob hashes into `out`. Lenient: an
+/// Collect a pack's manifest RG IDENTITIES into `out`. Lenient: an
 /// unreadable pack contributes nothing (fail-safe: the caller's coverage
 /// check then keeps entries rather than dropping them).
-fn collect_rg_hashes(
+///
+/// Identity is `(blob_hash, slab_byte_offset)` — not blob-hash alone —
+/// because co-slab RGs share one blob hash: hash-only identity would
+/// conflate them and the plan's `only_rgs` filter would read either ALL
+/// of a slab's RGs or none. The pair is stable across folds: compaction
+/// copies RG entries verbatim (only `key` is re-sequenced), so the loser
+/// compactor's manifest carries the SAME identities as the data entries
+/// it folded.
+fn collect_rg_identities(
     kernel: &PondKernel,
     pack_hash: &str,
-    out: &mut std::collections::BTreeSet<String>,
+    out: &mut BTreeSet<RgIdentity>,
 ) {
     if let Ok(manifest_bytes) = commit::resolve_manifest_bytes(kernel, pack_hash) {
         if let Ok(manifest) = crate::read::resolve_manifest(kernel, &manifest_bytes, None) {
             for rg in &manifest.row_groups {
-                out.insert(rg.blob_hash.clone());
+                out.insert((rg.blob_hash.clone(), rg.slab_byte_offset));
             }
         }
     }

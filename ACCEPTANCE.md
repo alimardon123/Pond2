@@ -68,11 +68,9 @@ The project is done only when every statement below is demonstrably true:
   CAS dependency; design it away instead.
 - No reimplementation of SQL planning beyond what the pond_sql crate already
   does (pushdown into the reader, not a new optimizer).
-- Not this cycle: Rust proptest suite for the PND2/PMAN/PSLB codecs (tracked
-  in CRITIQUE.md C3; the journal itself gets property tests this cycle — see
-  below).
 - Not this cycle: string zone maps, BPTX index wiring for journal entries,
-  cross-process HLC persistence, C7 helper dedup, C8 executor error parity.
+  cross-process HLC persistence, C5 shard-surface migration (python lenses
+  keep writing JSON shards until their own cycle), C8 executor error parity.
 
 ## Assumptions (recorded, autonomous mode)
 
@@ -84,47 +82,50 @@ The project is done only when every statement below is demonstrably true:
 - CI runners are 2-vCPU: keep the bitpack benchmark calibrated (f85a351) —
   do not add uncalibrated long benchmarks.
 
-## This-cycle acceptance (crucible iteration N+2 — THE no-CAS journal cycle)
+## This-cycle acceptance (crucible iteration N+3 — the LAWS cycle)
 
-Mission for this cycle: land **D3 — the immutable per-writer journal** — which
-in one architectural stroke (a) fixes the **P0 history-loss bug** discovered
-this cycle (C9: every `write_rows`/SQL `INSERT` after the first silently hides
-prior commits — each commit's manifest holds only its own row group while
-reads resolve only HEAD), (b) **removes the CAS commit loop** from the
-production write path (user directive: no CAS — CRDT/architectural solution),
-and (c) kills C2's per-read uncacheable shard LIST for journal-era data.
+Mission for this cycle: **prove the CRDT/journal invariants with property
+tests (C3), and close the read-plan residuals (C7 + C11)**. The owner's
+directive behind it: the CRDT shards layer is the owner's own foundational
+work — review it by ATTACKING it with random inputs, not by re-reading it.
+Property tests either prove the laws or find real bugs; both outcomes are
+the review.
 
-1. **History preservation (P0, C9)**: after N sequential `write_rows` calls
-   (and after M concurrent writers × K entries), a read returns the CRDT-merged
-   union of ALL rows ever committed (minus tombstoned). Proven by tests, one
-   of which is the exact 2-write/20-rows probe that failed before this cycle.
-2. **No-CAS write path**: `write_rows` appends a pack to a unique journal path
-   (`collections/<c>/_branches/<b>/journal/<writer_id>/<seq>`) via plain PUT —
-   always succeeds, zero retries by construction, identical semantics on
-   localfs and S3/R2. A test asserts N concurrent writers all commit with zero
-   errors and zero lost rows. `put_path_if` gains NO new production callers.
-3. **Warm-path visibility budget (C2)**: a warm read with no changes performs
-   ZERO uncacheable LISTs when the discovery cache is fresh (TTL-bounded,
-   default ~1s, env-tunable to 0 for exact freshness): per-writer epoch probes
-   are parallel GETs at computable paths (positive hits content-cacheable).
-   CountingStore test asserts the GET/LIST counts on the no-change warm path.
-4. **Deterministic merge under permutation**: resolving the same set of
-   journal entries in any order yields byte-identical merged state — total
-   tiebreak `(_version, _rowid)` (fixes the strict-`>` order dependence found
-   at shard.rs merge + pyo3 chunk merge). Property test with shuffled orders.
-5. **Compat**: repositories written by the pre-journal code (HEAD commits +
-   shards) read correctly through the new resolver; the shard read layer
-   keeps working (python lenses still write shards); `compact` folds BOTH
-   shards and journal into a fresh snapshot and advances the branch ref via
-   benign last-writer-wins (every ref value is a valid folded state — races
-   are benign by construction; readers union the snapshot with probes above
-   its per-writer `upto` watermark).
-6. `pond journal-status` + `pond compact` CLI commands (D2: new capabilities
-   reachable from the terminal).
-7. Zero-warning build: `cargo clippy --workspace --all-targets -- -D warnings`
-   clean; `cargo test --workspace` all green; moto S3 suite green (journal
-   semantics against mocked S3: unique-path PUTs, delimiter LIST, 404
-   probes); live R2 suite green (streaming, small footprint).
-8. CI green on the pushed HEAD.
-9. Honest gap report in the cycle's worklog entry (what remains short of the
-   staledb/DuckDB bar).
+1. **CRDT merge laws (proptest)**: for randomly generated row sets with
+   colliding `_rowid`s, arbitrary `_version`s (incl. ties), tombstones,
+   legacy rows, and arbitrary key_cols — `merge_rows_by_rowid` satisfies:
+   - **Commutativity/associativity-ish invariance**: the merged LIVE state
+     (`filter_live_rows ∘ merge`) is invariant under any permutation of the
+     input order (the C10 total tiebreak extended to exhaustive random
+     cases, not just seeded shuffles).
+   - **Idempotence**: merge(merge(S)) == merge(S) at the live-state level.
+   - **Tombstone law**: a tombstone with strictly-latest version always
+     suppresses; a live row with strictly-latest version always survives.
+   - **Determinism**: same input bytes ⇒ same output bytes, always.
+2. **Journal fold laws (proptest)**: for randomly generated multi-writer
+   interleavings — after `compact`, a fresh reader (empty caches) sees the
+   same CRDT-merged rows as before the compact (fold preserves state); and
+   read-after-N-appends sees the union of all appended rows (history law,
+   the C9 invariant). Both laws hold under shuffled writer interleavings.
+3. **PMAN format laws (proptest)**: `normalize_rgs_to_schema` output always
+   satisfies `stats.len() == schema.len()` per RG (the invariant whose
+   violation corrupted PMAN v2); manifest encode→decode roundtrips
+   byte-stably for normalized manifests; v3 roots resolve to the same RG
+   set as their flat equivalent.
+4. **C7 — one resolve_packs**: `journal::resolve_packs()` exported from
+   pond_storage; the 5 duplicated "snapshot + entries → pack list" loops
+   (read.rs ×3, lakehouse lens, vector lens) all delegate to it. No behavior
+   change beyond C11 filtering.
+5. **C11 — RG-level plan filtering**: resolve_packs returns a per-pack read
+   plan; a partially-covered COMPACT entry contributes ONLY its novel RG
+   blobs (per-entry `only_rgs` set), so concatenating readers
+   (read_rows_i64, read_all_row_groups) see each RG exactly once even
+   under racing compactors with partial overlap. Regression test with the
+   exact partial-overlap construction (compactor A folds writers {w1},
+   compactor B folds {w1,w2}, B loses the ref race).
+6. Zero-warning build: `cargo clippy --workspace --all-targets -- -D
+   warnings` clean; `cargo test --workspace` all green (including the new
+   proptest suites — proptest cases must be seeded/deterministic in CI);
+   moto S3 suite green; live R2 suite green (streaming, small footprint).
+7. CI green on the pushed HEAD.
+8. Honest gap report in the cycle's worklog entry.

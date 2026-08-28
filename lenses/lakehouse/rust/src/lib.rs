@@ -147,21 +147,17 @@ impl LakehouseLens {
     ) -> Result<Vec<(String, TypedColumn)>, String> {
         let active = self.storage.get_active_branch(table_name);
 
-        // JOURNAL-AWARE (ARCHITECTURE.md D3): plain journal writes never
+        // JOURNAL-AWARE (ARCHITECTURE.md D3/D6): plain journal writes never
         // move the branch ref — it is a CACHE of the last folded snapshot.
         // Resolving only branch_ref would hide every live entry written
         // since the last compaction (the C9 history-loss shape at the lens
-        // level). Resolve the journal view instead: snapshot pack + every
-        // live entry, RGs concatenated.
-        let view = pond_storage::journal::resolve_view(
+        // level). resolve_packs yields the RG-level read plan (snapshot +
+        // live entries, stale compaction packs filtered at RG granularity);
+        // RGs are concatenated.
+        let plans = pond_storage::journal::resolve_packs(
             self.storage.kernel(), table_name, &active, false,
         )?;
-        let mut packs: Vec<String> = Vec::with_capacity(view.entries.len() + 1);
-        if let Some(snapshot) = &view.snapshot {
-            packs.push(snapshot.clone());
-        }
-        packs.extend(view.entries.iter().map(|e| e.pack_hash.clone()));
-        if packs.is_empty() {
+        if plans.is_empty() {
             return Err(format!("Table '{}' has no commits", table_name));
         }
 
@@ -174,12 +170,19 @@ impl LakehouseLens {
         type ColAccum = (u8, Vec<i64>, Vec<f64>, Vec<String>);
         let mut result_cols: HashMap<String, ColAccum> = HashMap::new();
 
-        for pack_hash in &packs {
-            let manifest_bytes = storage_commit::resolve_manifest_bytes(self.storage.kernel(), pack_hash)
+        for plan in &plans {
+            let manifest_bytes = storage_commit::resolve_manifest_bytes(self.storage.kernel(), &plan.pack_hash)
                 .map_err(|e| format!("Failed to read manifest: {}", e))?;
 
-            let manifest = CollectionManifest::decode(&manifest_bytes)
+            let mut manifest = CollectionManifest::decode(&manifest_bytes)
                 .ok_or_else(|| "Failed to decode manifest".to_string())?;
+
+            // D6 plan filter (C11): a partially-covered compaction pack
+            // contributes only its NOVEL row groups.
+            if let Some(only) = &plan.only_rgs {
+                manifest.row_groups.retain(|rg|
+                    only.contains(&(rg.blob_hash.clone(), rg.slab_byte_offset)));
+            }
 
             for rg in &manifest.row_groups {
                 // Architecture review GAP 6 fix: use slab-aware range reads instead of

@@ -108,12 +108,48 @@ debt, not alternatives.
 (immutable snapshot + ref move); readers never see partial state. No
 cross-collection transactions.
 
+**D6 — The RG-level read plan (settled this cycle; supersedes resolve_view's
+pack-granular F2 drop).**
+
+Readers never resolve the journal themselves. ONE entry point,
+`journal::resolve_packs(kernel, collection, branch, force_refresh) ->
+Vec<PackPlan>`, where `PackPlan = { pack_hash, only_rgs:
+Option<BTreeSet<RgIdentity>> }` and `RgIdentity = (blob_hash,
+slab_byte_offset)`:
+
+1. **`resolve_view` returns the RAW view** (snapshot + every live entry
+   above `upto`) — the pack-granular coverage drop (tribunal-r1 F2 fix)
+   moves OUT of resolution and into the plan, upgraded to RG granularity.
+   Side effect (deliberate): a stale loser-compactor entry now stays
+   visible as live, so the NEXT compact's `upto` covers its seq and the
+   delete loop finally removes it (pre-F2 zombie entries were re-probed
+   and re-dropped forever).
+2. **Common path** (no COMPACT entries live — the steady state): plans =
+   `[snapshot?] + entries`, all `only_rgs: None`. Zero extra reads vs
+   today; the classification short-circuits.
+3. **With compact entries**: `covered` = snapshot RGs ∪ data-entry RGs;
+   each compact entry (in deterministic (writer, seq) order) contributes
+   only its NOVEL RG identities — `None` (keep whole) when all are novel,
+   `Some(novel)` when partially covered, dropped when nothing is novel;
+   `covered` absorbs each entry's novel set. This closes C11: partial
+   overlap duplicates vanish for the CONCATENATING readers too.
+4. **RG identity is `(blob_hash, slab_byte_offset)`** — stable across
+   folds because compaction copies RG entries verbatim (only `key` is
+   re-sequenced). blob-hash-only identity would conflate co-slab RGs.
+5. **`compact` uses BOTH**: the raw view for `upto`/delete accounting,
+   the plans for the union manifest — and dedups union RGs by identity
+   (self-heals pre-D6 snapshots that already carry duplicated RGs).
+6. Readers apply `only_rgs` with one `retain` after `resolve_manifest`.
+   The 5 duplicated "snapshot + entries" loops (read.rs ×3, lakehouse,
+   vector) all delegate to `resolve_packs` (C7 closed).
+
 ## Components and interfaces (as-built)
 
 | Component | Interface | Notes |
 |---|---|---|
 | `core/kernel` | `write`, `read_blob`, `read_blob_batch`, `get_blob_range`, `reference`, `resolve`, `list_names_prefix`, `delete_ref` | content-addressed blob store + ref namespace; LocalFS/S3 backends |
 | `core/storage::read` | `read_rows_i64`, `read_rows_i64_indexed`, `read_rows_i64_range_indexed` | THE pruned pipeline (i64 today; this cycle generalizes it) |
+| `core/storage::journal` | `resolve_packs` (D6 read plan), `append_pack`, `compact`, `status`, `history` | per-writer immutable journal; ONE reader entry point |
 | `core/storage::manifest` | `CollectionManifest` (PMAN v1/v2 flat, v3 root+leaves) | zone-map stats, bloom refs, slab offsets |
 | `core/storage::shard` | `write_shard`, `list_shards`, `read_with_shards`, `clear_shards` | CRDT shard layer; per-read LIST is known debt (CRITIQUE C2) |
 | `core/storage::commit` | `resolve_manifest_bytes`, `read_commit` | HEAD → manifest, single-GET resolve |

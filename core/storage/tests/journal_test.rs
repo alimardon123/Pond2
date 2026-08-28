@@ -117,26 +117,29 @@ fn fabricate_entry(
     pack_hash
 }
 
-/// Counting ObjectStore — records every LIST (dirs + paths) and every
-/// ref-path GET (with the path), so the warm-path budget tests can assert
-/// EXACT call counts: zero LISTs, one branch-ref GET, one epoch-probe miss
-/// per discovered writer.
+/// Counting ObjectStore — records every LIST (dirs + paths), every
+/// ref-path GET (with the path), and every content-blob GET, so the
+/// warm-path budget tests can assert EXACT call counts: zero LISTs, one
+/// branch-ref GET, one epoch-probe miss per discovered writer, and (D6)
+/// zero extra blob reads on the resolve_packs fast path.
 struct CountingStore {
     inner: LocalFSObjectStore,
     list_dirs_calls: Arc<AtomicU64>,
     list_paths_calls: Arc<AtomicU64>,
     get_path_calls: Arc<AtomicU64>,
     get_path_paths: Arc<Mutex<Vec<String>>>,
+    get_blob_calls: Arc<AtomicU64>,
 }
 
 /// The CountingStore handle bundle: (kernel, list_dirs_calls,
-/// list_paths_calls, get_path_calls, get_path_paths).
+/// list_paths_calls, get_path_calls, get_path_paths, get_blob_calls).
 type CountedKernel = (
     PondKernel,
     Arc<AtomicU64>,
     Arc<AtomicU64>,
     Arc<AtomicU64>,
     Arc<Mutex<Vec<String>>>,
+    Arc<AtomicU64>,
 );
 
 impl CountingStore {
@@ -147,6 +150,7 @@ impl CountingStore {
             list_paths_calls: Arc::new(AtomicU64::new(0)),
             get_path_calls: Arc::new(AtomicU64::new(0)),
             get_path_paths: Arc::new(Mutex::new(Vec::new())),
+            get_blob_calls: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -156,8 +160,9 @@ impl CountingStore {
             Arc::clone(&self.list_paths_calls),
             Arc::clone(&self.get_path_calls),
             Arc::clone(&self.get_path_paths),
+            Arc::clone(&self.get_blob_calls),
         );
-        (PondKernel::new_with_store(Box::new(self)), counters.0, counters.1, counters.2, counters.3)
+        (PondKernel::new_with_store(Box::new(self)), counters.0, counters.1, counters.2, counters.3, counters.4)
     }
 }
 
@@ -166,6 +171,7 @@ impl ObjectStore for CountingStore {
         self.inner.put_blob(data)
     }
     fn get_blob(&self, hash: &str) -> std::io::Result<Vec<u8>> {
+        self.get_blob_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.get_blob(hash)
     }
     fn put_path(&self, path: &str, hash: &str) -> std::io::Result<()> {
@@ -448,7 +454,7 @@ fn test_warm_read_zero_lists() {
     // the branch_ref get_path. That is the ACCEPTANCE #3 warm-path budget.
     let dir = tempfile::tempdir().unwrap();
     let store = CountingStore::new(dir.path());
-    let (kernel, list_dirs_calls, list_paths_calls, get_path_calls, get_path_paths) = store.kernel();
+    let (kernel, list_dirs_calls, list_paths_calls, get_path_calls, get_path_paths, _get_blob_calls) = store.kernel();
 
     // 3 external writers × 3 entries each (5 rows per entry → 45 rows).
     for w in 0..3 {
@@ -843,7 +849,7 @@ fn test_upto_watermark_skips_folded_entries() {
     // paths, and a post-compact live entry is found by probe.
     let dir = tempfile::tempdir().unwrap();
     let store = CountingStore::new(dir.path());
-    let (kernel, _list_dirs, _list_paths, get_path_calls, get_path_paths) = store.kernel();
+    let (kernel, _list_dirs, _list_paths, get_path_calls, get_path_paths, _get_blob_calls) = store.kernel();
 
     // 2 external writers × 2 entries each.
     let mut folded_paths = Vec::new();
@@ -919,7 +925,7 @@ fn test_upto_watermark_skips_folded_entries() {
 fn test_journal_status() {
     let dir = tempfile::tempdir().unwrap();
     let store = CountingStore::new(dir.path());
-    let (kernel, _a, _b, _c, _d) = store.kernel();
+    let (kernel, _a, _b, _c, _d, _e) = store.kernel();
 
     // Two external writers × 2 entries each; no snapshot yet.
     for w in 0..2 {
@@ -1050,7 +1056,7 @@ fn test_discovery_ttl_zero_forces_fresh_list() {
 fn ttl0_child() {
     let dir = tempfile::tempdir().unwrap();
     let store = CountingStore::new(dir.path());
-    let (kernel, list_dirs_calls, _lp, _gp, _pp) = store.kernel();
+    let (kernel, list_dirs_calls, _lp, _gp, _pp, _gb) = store.kernel();
 
     let ids: Vec<i64> = (0..5).collect();
     let vals: Vec<i64> = ids.iter().map(|i| i * 2).collect();
@@ -1086,7 +1092,7 @@ fn test_resolve_view_entry_order_is_deterministic() {
     // merged output before the C10 tiebreak even applies) is fixed.
     let dir = tempfile::tempdir().unwrap();
     let store = CountingStore::new(dir.path());
-    let (kernel, _a, _b, _c, _d) = store.kernel();
+    let (kernel, _a, _b, _c, _d, _e) = store.kernel();
 
     let writers = ["zeta-writer", "alpha-writer", "mid-writer"];
     for (wi, w) in writers.iter().enumerate() {
@@ -1226,8 +1232,8 @@ fn run_f1_assertions(kernel: &PondKernel) {
 /// — the loser's fold pack stays live in its writer's log (the winner's upto
 /// never covered it), and the CONCATENATING readers (read_rows_i64,
 /// read_all_row_groups) returned every shared RG TWICE (10 rows read for 5
-/// logical). The fix: resolve_view drops a live COMPACT entry whose RG set
-/// is fully covered by the snapshot ∪ data entries.
+/// logical). The fix (D6): resolve_packs drops a live COMPACT entry whose
+/// RG set is fully covered by the snapshot ∪ data entries.
 ///
 /// This constructs the tribunal's exact race aftermath: C1.resolve →
 /// C2.resolve → C1.append+ref (winner) → C2.append (loser, same RG set,
@@ -1254,38 +1260,42 @@ fn test_f2_racing_compactors_no_duplicate_rows() {
     // The LOSER's fold pack: same two data RGs (both compactors resolved
     // the same view), stamped as a compaction (journal.upto present),
     // appended under a DIFFERENT writer's log where the winner's upto
-    // never reached → stays live.
-    let blob1 = pond_core::pnd2_encode_i64_auto(&[("id", &ids1), ("val", &vals1)]);
-    let blob2 = pond_core::pnd2_encode_i64_auto(&[("id", &ids2), ("val", &vals2)]);
-    let h1 = kernel.write(&blob1).unwrap();
-    let h2 = kernel.write(&blob2).unwrap();
-    let mut loser_manifest = CollectionManifest::new(
-        vec![("id".to_string(), VT_INT64), ("val".to_string(), VT_INT64)],
-        "id".to_string(),
+    // never reached → stays live. (Fixture built with proper per-RG stats
+    // via fabricate_compact_pack — PMAN decode reads schema.len() stats
+    // per RG, so an empty-stats RG would be a malformed manifest.)
+    let h1 = kernel
+        .write(&pond_core::pnd2_encode_i64_auto(&[("id", &ids1), ("val", &vals1)]))
+        .unwrap();
+    let h2 = kernel
+        .write(&pond_core::pnd2_encode_i64_auto(&[("id", &ids2), ("val", &vals2)]))
+        .unwrap();
+    let loser_hash = fabricate_compact_pack(
+        kernel,
+        &[(h1, ids1, vals1), (h2, ids2, vals2)],
+        "W_loser",
+        1,
+        json!({"W1": 2, "W_loser": 1}),
     );
-    for h in [&h1, &h2] {
-        loser_manifest.add_row_group(RowGroupEntry {
-            key: "rg_0000000000".to_string(),
-            blob_hash: h.clone(),
-            n_rows: 5,
-            columns: vec![],
-            slab_byte_offset: None,
-            slab_byte_len: None,
-        });
-    }
-    let loser_commit = json!({
-        "parent": Value::Null,
-        "second_parent": Value::Null,
-        "manifest": "packed",
-        "message": "loser compaction",
-        "timestamp": 0.0,
-        "index": 0,
-        "journal": {"writer": "W_loser", "seq": 1, "upto": {"W1": 2, "W_loser": 1}},
-    });
-    let loser_pack = pond_storage::pond_pack::encode_pack(
-        &loser_commit, &loser_manifest.encode(), None);
-    let loser_hash = kernel.write(&loser_pack).unwrap();
-    kernel.reference(&entry_path("f2", "main", "W_loser", 1), &loser_hash).unwrap();
+    kernel
+        .reference(&entry_path("f2", "main", "W_loser", 1), &loser_hash)
+        .unwrap();
+
+    // Force a FRESH discovery so the loser is actually VISIBLE to the
+    // reads below: a read within the discovery TTL is served the
+    // pre-loser writer set and never exercises the drop (warm-cache
+    // blindness is bounded and by design — but THIS test exists to pin
+    // the FULL-overlap drop at plan level, D6 style).
+    let view = resolve_view(kernel, "f2", "main", true).unwrap();
+    assert_eq!(view.entries.len(), 1, "the loser stays live in the raw view");
+    assert_eq!(view.entries[0].pack_hash, loser_hash);
+    let plans = journal::resolve_packs(kernel, "f2", "main", true).unwrap();
+    assert_eq!(
+        plans.len(),
+        1,
+        "the fully-covered loser drops out of the plan entirely: {:?}",
+        plans
+    );
+    assert_eq!(plans[0].pack_hash, view.snapshot.unwrap());
 
     // THE assertion (tribunal: 20 rows before the fix, 5+5=10 expected):
     // the concatenating i64 reader must NOT double the shared RGs.
@@ -1357,4 +1367,363 @@ fn test_two_writer_logs_interleaved_parent() {
         "two-writer child (TTL=0) failed:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr));
+}
+
+// ---------------------------------------------------------------------------
+// D6 — the RG-level read plan (ARCHITECTURE.md D6; C7 one resolve_packs,
+// C11 partial-overlap filtering; builder spec cron-2026-08-28-1100-a)
+// ---------------------------------------------------------------------------
+
+/// Fabricate a COMPACTION pack (journal.upto present — classify_packs'
+/// compact signature) whose manifest holds one RG per (blob hash, ids,
+/// vals) triple, and return its hash. The CALLER decides where to
+/// reference it (branch_ref or a journal entry path) — that placement is
+/// exactly the LWW race variable under test.
+///
+/// NOTE on the per-RG column stats: PMAN decode reads `schema.len()`
+/// stats entries per RG, so a fixture RG with EMPTY stats is a malformed
+/// manifest (decode reads past the buffer — garbage RGs or a panic). The
+/// stats here mirror what `fabricate_entry` writes, keeping the fixture
+/// well-formed for every decoder in the pipeline.
+fn fabricate_compact_pack(
+    kernel: &PondKernel,
+    rgs: &[(String, Vec<i64>, Vec<i64>)],
+    writer: &str,
+    seq: u64,
+    upto: Value,
+) -> String {
+    let mut manifest = CollectionManifest::new(
+        vec![("id".to_string(), VT_INT64), ("val".to_string(), VT_INT64)],
+        "id".to_string(),
+    );
+    for (i, (blob_hash, ids, vals)) in rgs.iter().enumerate() {
+        let col_stats: Vec<ColumnStatsEntry> = [("id", ids), ("val", vals)]
+            .iter()
+            .map(|(name, values)| {
+                let (min, max) = if values.is_empty() {
+                    (None, None)
+                } else {
+                    (Some(values.iter().min().unwrap().to_le_bytes().to_vec()),
+                     Some(values.iter().max().unwrap().to_le_bytes().to_vec()))
+                };
+                ColumnStatsEntry {
+                    name: name.to_string(),
+                    value_type: VT_INT64,
+                    min,
+                    max,
+                    null_count: 0,
+                }
+            })
+            .collect();
+        manifest.add_row_group(RowGroupEntry {
+            key: format!("rg_{:010}", i),
+            blob_hash: blob_hash.clone(),
+            n_rows: ids.len() as u32,
+            columns: col_stats,
+            slab_byte_offset: None,
+            slab_byte_len: None,
+        });
+    }
+    let commit_obj = json!({
+        "parent": Value::Null,
+        "second_parent": Value::Null,
+        "manifest": "packed",
+        "message": format!("fabricated compact pack for {}", writer),
+        "timestamp": 0.0,
+        "index": 0,
+        "journal": {"writer": writer, "seq": seq, "upto": upto},
+    });
+    let pack = pond_storage::pond_pack::encode_pack(&commit_obj, &manifest.encode(), None);
+    kernel.write(&pack).unwrap()
+}
+
+/// Build the C11 PARTIAL-OVERLAP aftermath — the acceptance-required
+/// construction (ACCEPTANCE.md item 5, builder spec §5.1): the ref-LWW
+/// WINNER folded LESS than the loser, and both racing delete loops
+/// already removed the data entries the winner missed, so D2's rows are
+/// ONLY reachable through the loser's live compact pack.
+///
+/// Timeline being fabricated:
+///   1. w1 appends data entry D1 (ids 1-5) at W1 seq 1.
+///   2. w2 appends data entry D2 (ids 6-10) at W2 seq 1.
+///   3. Compactor A resolves BEFORE D2 exists → folds {D1}; its pack S_A
+///      wins the branch-ref LWW.
+///   4. Both delete loops remove the data entry paths (A's covered W1/1;
+///      B's covered W1/1 and W2/1) — THE CRITICAL DETAIL: with W2/1 still
+///      present, D2 would be a live DATA entry, S_B would be FULLY
+///      covered by it, and the test would pass even without D6 (that is
+///      the F2 full-overlap shape).
+///   5. Compactor B folds {D1, D2}, appends S_B under W_B … and LOSES
+///      the ref race (branch_ref stays at S_A). S_B stays live in W_B's
+///      log because S_A's upto never covered W_B.
+///
+/// Returns (S_A hash, S_B hash, D1's RG identity, D2's RG identity).
+type RgIdent = (String, Option<u64>);
+fn build_c11_partial_overlap(
+    kernel: &PondKernel,
+    collection: &str,
+) -> (String, String, RgIdent, RgIdent) {
+    let ids1: Vec<i64> = (1..=5).collect();
+    let vals1: Vec<i64> = ids1.iter().map(|i| i * 10).collect();
+    let ids2: Vec<i64> = (6..=10).collect();
+    let vals2: Vec<i64> = ids2.iter().map(|i| i * 10).collect();
+    fabricate_entry(kernel, collection, "main", "W1", 1, &ids1, &vals1);
+    fabricate_entry(kernel, collection, "main", "W2", 1, &ids2, &vals2);
+    // Content-addressed store: writing the SAME PND2 bytes returns the
+    // same hash the fabricated manifests carry — that is how the test
+    // learns the two RG identities.
+    let h1 = kernel
+        .write(&pond_core::pnd2_encode_i64_auto(&[("id", &ids1), ("val", &vals1)]))
+        .unwrap();
+    let h2 = kernel
+        .write(&pond_core::pnd2_encode_i64_auto(&[("id", &ids2), ("val", &vals2)]))
+        .unwrap();
+    let d1 = (h1, None);
+    let d2 = (h2, None);
+
+    // Winner S_A: resolved before D2 existed — folds ONLY D1's RG.
+    let s_a = fabricate_compact_pack(
+        kernel,
+        &[(d1.0.clone(), ids1.clone(), vals1.clone())],
+        "W_A",
+        1,
+        json!({"W1": 1}),
+    );
+    kernel.reference(&branch_ref(collection, "main"), &s_a).unwrap();
+
+    // CRITICAL: both data entry paths are gone (the racing delete loops).
+    kernel.delete_ref(&entry_path(collection, "main", "W1", 1)).unwrap();
+    kernel.delete_ref(&entry_path(collection, "main", "W2", 1)).unwrap();
+
+    // Loser S_B: folded D1 AND D2, lost the ref race — referenced only at
+    // its own journal entry path (the winner's upto never covers W_B).
+    let s_b = fabricate_compact_pack(
+        kernel,
+        &[(d1.0.clone(), ids1, vals1), (d2.0.clone(), ids2, vals2)],
+        "W_B",
+        1,
+        json!({"W1": 1, "W2": 1, "W_B": 1}),
+    );
+    kernel
+        .reference(&entry_path(collection, "main", "W_B", 1), &s_b)
+        .unwrap();
+
+    (s_a, s_b, d1, d2)
+}
+
+/// THE C11 REGRESSION (acceptance-required): a partially-covered COMPACT
+/// entry contributes ONLY its novel row groups, so concatenating readers
+/// see each RG exactly once even under racing compactors with partial
+/// overlap. Pre-D6: resolve_view's pack-granular F2 drop had to keep S_B
+/// whole (it was not FULLY covered) → D1's rows appeared TWICE (15 rows
+/// for 10 logical).
+#[test]
+fn test_c11_partial_overlap_only_novel_rgs_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+    let kernel = storage.kernel();
+    let (s_a, s_b, d1, d2) = build_c11_partial_overlap(kernel, "c11");
+
+    // The RAW view keeps the loser live (D6: resolution no longer drops
+    // compact entries — that filtering moved into the plan).
+    let view = resolve_view(kernel, "c11", "main", true).unwrap();
+    assert_eq!(view.snapshot.as_deref(), Some(s_a.as_str()));
+    assert_eq!(view.entries.len(), 1, "the loser's entry stays live in the raw view");
+    assert_eq!(view.entries[0].pack_hash, s_b);
+
+    // THE PLAN: snapshot S_A whole + S_B filtered to D2's RG only.
+    let plans = journal::resolve_packs(kernel, "c11", "main", true).unwrap();
+    assert_eq!(plans.len(), 2, "snapshot S_A + the loser S_B: {:?}", plans);
+    assert_eq!(plans[0].pack_hash, s_a, "snapshot plan comes first (order stability)");
+    assert!(plans[0].only_rgs.is_none(), "snapshots are never filtered");
+    assert_eq!(plans[1].pack_hash, s_b);
+    let only = plans[1]
+        .only_rgs
+        .as_ref()
+        .expect("the partially-covered loser must carry an only_rgs filter (C11)");
+    assert_eq!(only.len(), 1, "exactly one novel RG: {:?}", only);
+    assert!(only.contains(&d2), "the novel RG is D2's: {:?}", only);
+    assert!(!only.contains(&d1), "D1's RG is covered by snapshot S_A — must NOT be in the filter");
+
+    // The CONCATENATING i64 reader: ids 1-10, each EXACTLY once
+    // (pre-D6: 15 — D1's rows twice).
+    let cols = read::read_rows_i64(kernel, "c11", "main", None, None).unwrap();
+    assert_eq!(
+        sorted_ids(&cols),
+        (1..=10).collect::<Vec<i64>>(),
+        "C11: the partial-overlap loser contributes ONLY its novel RG"
+    );
+
+    // The JSON pipeline (legacy union — no _rowid, so duplicates would
+    // survive the merge) sees the same 10 rows.
+    let rows = read::read_rows_json_pruned(kernel, "c11", "main", &[], None, &[]).unwrap();
+    assert_eq!(rows.len(), 10, "C11: the pruned JSON reader dedups the partial overlap");
+
+    // And the raw-RG surface: exactly two RG byte vectors (S_A's one +
+    // S_B's single novel RG).
+    let rgs = read::read_all_row_groups(kernel, "c11", "main").unwrap();
+    assert_eq!(rgs.len(), 2, "read_all_row_groups reads S_A's RG + S_B's novel RG only");
+}
+
+/// D6 zombie cleanup: after the C11 aftermath, ONE real compaction must
+/// (a) delete the stale loser's entry path (the RAW view keeps it live,
+/// so its seq joins `upto` and the delete loop finally removes it —
+/// pre-D6 it was re-probed and re-dropped forever), and (b) fold a
+/// snapshot whose manifest carries each RG identity EXACTLY once.
+#[test]
+fn test_c11_zombie_loser_entry_cleaned_up_by_next_compact() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+    let kernel = storage.kernel();
+    let (_s_a, _s_b, d1, d2) = build_c11_partial_overlap(kernel, "zombie");
+
+    let stats = journal::compact(kernel, "zombie", "main", &[]).unwrap();
+    assert_eq!(stats.entries_folded, 1, "the stale loser entry was folded (it is live in the raw view)");
+    assert!(
+        kernel.resolve(&entry_path("zombie", "main", "W_B", 1)).is_none(),
+        "the zombie loser entry path must be DELETED by the fold's delete loop"
+    );
+
+    // The folded snapshot: D1's RG + D2's RG, each identity exactly once.
+    let head = kernel.resolve(&branch_ref("zombie", "main")).unwrap();
+    let manifest_bytes = pond_storage::commit::resolve_manifest_bytes(kernel, &head).unwrap();
+    let manifest = CollectionManifest::decode(&manifest_bytes).unwrap();
+    let identities: Vec<(String, Option<u64>)> = manifest
+        .row_groups
+        .iter()
+        .map(|rg| (rg.blob_hash.clone(), rg.slab_byte_offset))
+        .collect();
+    assert_eq!(identities.len(), 2, "D1's RG + D2's RG: {:?}", identities);
+    let mut distinct = identities.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(identities.len(), distinct.len(), "no duplicate RG identities in the folded snapshot");
+    assert!(identities.contains(&d1) && identities.contains(&d2));
+
+    // Full state survives the fold: 10 rows, and no live entries remain.
+    let cols = read::read_rows_i64(kernel, "zombie", "main", None, None).unwrap();
+    assert_eq!(sorted_ids(&cols), (1..=10).collect::<Vec<i64>>());
+    let view = resolve_view(kernel, "zombie", "main", true).unwrap();
+    assert!(view.entries.is_empty(), "the fold leaves nothing live above the watermarks");
+}
+
+/// D6 fast path: with only DATA entries live (the steady state),
+/// resolve_packs performs NO blob reads beyond resolve_view's own (the
+/// snapshot-upto read plus one classification read per live entry) — no
+/// manifest resolves, no RG-identity collection. Measured with the
+/// counting store's get_blob counter.
+#[test]
+fn test_resolve_packs_fast_path_zero_extra_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = CountingStore::new(dir.path());
+    let (kernel, _a, _b, _c, _d, get_blob_calls) = store.kernel();
+
+    // Two data entries by two writers, no snapshot yet.
+    for (w, base) in [("W1", 0i64), ("W2", 10)] {
+        let ids: Vec<i64> = (base..base + 5).collect();
+        let vals: Vec<i64> = ids.iter().map(|i| i * 3).collect();
+        fabricate_entry(&kernel, "fast", "main", w, 1, &ids, &vals);
+    }
+    get_blob_calls.store(0, Ordering::SeqCst);
+    let plans = journal::resolve_packs(&kernel, "fast", "main", true).unwrap();
+    assert_eq!(plans.len(), 2, "no snapshot → plans are exactly the data entries");
+    assert!(plans.iter().all(|p| p.only_rgs.is_none()),
+        "data-only plans carry no RG filter");
+    assert_eq!(
+        get_blob_calls.load(Ordering::SeqCst),
+        2,
+        "fast path: one classification read per live entry, NOTHING else (no manifest reads)"
+    );
+
+    // With a snapshot + one live data entry above its watermark: still
+    // the fast path — 1 snapshot-upto read + 1 classification read.
+    compact(&kernel, "fast", "main", &["id".to_string()]).unwrap();
+    let ids: Vec<i64> = (100..105).collect();
+    let vals: Vec<i64> = ids.iter().map(|i| i * 3).collect();
+    fabricate_entry(&kernel, "fast", "main", "W1", 2, &ids, &vals);
+    get_blob_calls.store(0, Ordering::SeqCst);
+    let plans = journal::resolve_packs(&kernel, "fast", "main", true).unwrap();
+    assert_eq!(plans.len(), 2, "snapshot + one live data entry");
+    let snapshot = kernel.resolve(&branch_ref("fast", "main")).unwrap();
+    assert_eq!(plans[0].pack_hash, snapshot, "the snapshot plan is first");
+    assert!(plans.iter().all(|p| p.only_rgs.is_none()),
+        "no compact entry live → no coverage filtering");
+    assert_eq!(
+        get_blob_calls.load(Ordering::SeqCst),
+        2,
+        "1 snapshot-upto read + 1 classification read — zero coverage/manifest reads"
+    );
+
+    // And the plan reads the full state: 15 rows (10 folded + 5 live).
+    let cols = read::read_rows_i64(&kernel, "fast", "main", None, None).unwrap();
+    let mut got = sorted_ids(&cols);
+    got.sort_unstable();
+    let mut expected: Vec<i64> = (0..5).chain(10..15).chain(100..105).collect();
+    expected.sort_unstable();
+    assert_eq!(got, expected, "the fast-path plan still reads every row");
+}
+
+/// D6 order stability: plans are `[snapshot] + entries in (writer, seq)
+/// order` — the pre-D6 pack order, so output row ordering is unchanged —
+/// and the order is identical across cold and warm resolutions.
+#[test]
+fn test_resolve_packs_plan_order_is_stable() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+    let kernel = storage.kernel();
+
+    // Three writers × two entries, appended in round-robin (NOT sorted)
+    // order.
+    let mut appended: Vec<(String, u64, String)> = Vec::new();
+    for round in 0..2u64 {
+        for (wi, w) in ["W-c", "W-a", "W-b"].iter().enumerate() {
+            let base = ((wi as i64) * 10 + (round as i64) * 100) * 5;
+            let ids: Vec<i64> = (base..base + 5).collect();
+            let vals: Vec<i64> = ids.iter().map(|i| i * 3).collect();
+            let hash = fabricate_entry(kernel, "planorder", "main", w, round + 1, &ids, &vals);
+            appended.push((w.to_string(), round + 1, hash));
+        }
+    }
+    // Fold everything (so a snapshot exists), then append three more
+    // entries — again in non-sorted order.
+    compact(kernel, "planorder", "main", &["id".to_string()]).unwrap();
+    for (wi, w) in ["W-b", "W-c", "W-a"].iter().enumerate() {
+        let base = 1000 + (wi as i64) * 5;
+        let ids: Vec<i64> = (base..base + 5).collect();
+        let vals: Vec<i64> = ids.iter().map(|i| i * 3).collect();
+        let hash = fabricate_entry(kernel, "planorder", "main", w, 3, &ids, &vals);
+        appended.push((w.to_string(), 3, hash));
+    }
+    // The live entries above the fold watermark: the three seq-3 entries,
+    // in (writer, seq) order — the pre-D6 pack order.
+    let mut live: Vec<(String, u64, String)> = appended
+        .iter()
+        .filter(|(_, seq, _)| *seq == 3)
+        .cloned()
+        .collect();
+    live.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+    let snapshot = kernel.resolve(&branch_ref("planorder", "main")).unwrap();
+    let mut expected: Vec<String> = vec![snapshot];
+    expected.extend(live.iter().map(|(_, _, h)| h.clone()));
+
+    let plans = journal::resolve_packs(kernel, "planorder", "main", true).unwrap();
+    let got: Vec<String> = plans.iter().map(|p| p.pack_hash.clone()).collect();
+    assert_eq!(got, expected,
+        "plans are [snapshot] + entries in (writer, seq) order — the pre-D6 pack order");
+    assert!(plans.iter().all(|p| p.only_rgs.is_none()),
+        "data-only live set → no RG filters");
+
+    // Warm re-resolution: identical order.
+    let plans_warm = journal::resolve_packs(kernel, "planorder", "main", false).unwrap();
+    let got_warm: Vec<String> = plans_warm.iter().map(|p| p.pack_hash.clone()).collect();
+    assert_eq!(got_warm, expected, "plan order is stable across resolutions");
+
+    // Row order sanity: all 45 written rows (6 folded entries + 3 live)
+    // visible, each exactly once.
+    let cols = read::read_rows_i64(kernel, "planorder", "main", None, None).unwrap();
+    let mut got = sorted_ids(&cols);
+    got.sort_unstable();
+    assert_eq!(got.len(), 45, "all 45 rows visible through the plan");
+    got.dedup();
+    assert_eq!(got.len(), 45, "each row exactly once");
 }

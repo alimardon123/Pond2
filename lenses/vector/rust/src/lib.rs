@@ -209,31 +209,34 @@ impl VectorLens {
     pub fn get_all(&self, collection: &str) -> Result<HashMap<String, (Vec<f64>, String)>, String> {
         let active = self.storage.get_active_branch(collection);
 
-        // JOURNAL-AWARE (ARCHITECTURE.md D3): the branch ref is a CACHE of
+        // JOURNAL-AWARE (ARCHITECTURE.md D3/D6): the branch ref is a CACHE of
         // the last folded snapshot, not the current state — plain journal
-        // writes never move it. Resolve the full journal view (snapshot +
-        // live entries) so vectors inserted after the last compaction are
+        // writes never move it. resolve_packs yields the RG-level read plan
+        // (snapshot + live entries, stale compaction packs filtered at RG
+        // granularity) so vectors inserted after the last compaction are
         // visible; ids are last-write-wins per insert order.
-        let view = pond_storage::journal::resolve_view(
+        let plans = pond_storage::journal::resolve_packs(
             self.storage.kernel(), collection, &active, false,
         )?;
-        let mut packs: Vec<String> = Vec::with_capacity(view.entries.len() + 1);
-        if let Some(snapshot) = &view.snapshot {
-            packs.push(snapshot.clone());
-        }
-        packs.extend(view.entries.iter().map(|e| e.pack_hash.clone()));
-        if packs.is_empty() {
+        if plans.is_empty() {
             return Err(format!("Collection '{}' has no commits", collection));
         }
 
         let mut result: HashMap<String, (Vec<f64>, String)> = HashMap::new();
 
-        for pack_hash in &packs {
-            let manifest_bytes = pond_storage::commit::resolve_manifest_bytes(self.storage.kernel(), pack_hash)
+        for plan in &plans {
+            let manifest_bytes = pond_storage::commit::resolve_manifest_bytes(self.storage.kernel(), &plan.pack_hash)
                 .map_err(|e| format!("Failed to read manifest: {}", e))?;
 
-            let manifest = CollectionManifest::decode(&manifest_bytes)
+            let mut manifest = CollectionManifest::decode(&manifest_bytes)
                 .ok_or_else(|| "Failed to decode manifest".to_string())?;
+
+            // D6 plan filter (C11): a partially-covered compaction pack
+            // contributes only its NOVEL row groups.
+            if let Some(only) = &plan.only_rgs {
+                manifest.row_groups.retain(|rg|
+                    only.contains(&(rg.blob_hash.clone(), rg.slab_byte_offset)));
+            }
 
             for rg in &manifest.row_groups {
                 let blob_data = self.storage.kernel().read_blob(&rg.blob_hash)

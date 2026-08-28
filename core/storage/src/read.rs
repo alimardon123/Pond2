@@ -60,24 +60,27 @@ pub fn read_all_row_groups(
     collection: &str,
     branch: &str,
 ) -> Result<Vec<Vec<u8>>, String> {
-    // JOURNAL-AWARE (ARCHITECTURE.md D3): snapshot + live entry packs, RG
-    // byte vectors concatenated in (writer, seq) entry order. See
-    // read_rows_json_pruned for the CRDT-merge variant; this raw-RG API
-    // has no merge semantics — concatenation is the union.
-    let view = crate::journal::resolve_view(kernel, collection, branch, false)?;
-    let mut packs: Vec<String> = Vec::with_capacity(view.entries.len() + 1);
-    if let Some(snapshot) = &view.snapshot {
-        packs.push(snapshot.clone());
-    }
-    packs.extend(view.entries.iter().map(|e| e.pack_hash.clone()));
-    if packs.is_empty() {
+    // JOURNAL-AWARE (ARCHITECTURE.md D3/D6): the RG-level read plan
+    // (snapshot + live entry packs, stale compaction packs filtered at RG
+    // granularity), RG byte vectors concatenated in (writer, seq) entry
+    // order. See read_rows_json_pruned for the CRDT-merge variant; this
+    // raw-RG API has no merge semantics — concatenation is the union.
+    let plans = crate::journal::resolve_packs(kernel, collection, branch, false)?;
+    if plans.is_empty() {
         return Err(format!("Collection '{}' has no commits", collection));
     }
     let mut out: Vec<Vec<u8>> = Vec::new();
-    for pack_hash in &packs {
-        let manifest_bytes = commit::resolve_manifest_bytes(kernel, pack_hash)
+    for plan in &plans {
+        let manifest_bytes = commit::resolve_manifest_bytes(kernel, &plan.pack_hash)
             .map_err(|e| format!("Failed to read manifest: {}", e))?;
-        let manifest = resolve_manifest(kernel, &manifest_bytes, None)?;
+        let mut manifest = resolve_manifest(kernel, &manifest_bytes, None)?;
+        // D6 plan filter: a partially-covered compaction pack contributes
+        // only its NOVEL row groups (C11).
+        if let Some(only) = &plan.only_rgs {
+            manifest
+                .row_groups
+                .retain(|rg| only.contains(&(rg.blob_hash.clone(), rg.slab_byte_offset)));
+        }
         // An empty manifest (e.g. a legacy write() of empty data) simply
         // contributes no RGs — not an error in the union path.
         if manifest.row_groups.is_empty() {
@@ -756,28 +759,31 @@ pub fn read_rows_i64(
     columns: Option<&[String]>,
     predicates: Option<&[(&str, &str, i64)]>,
 ) -> Result<Vec<(String, Vec<i64>)>, String> {
-    // JOURNAL-AWARE (ARCHITECTURE.md D3): the union of the snapshot pack
-    // and every live journal entry, read through the same per-pack i64
-    // pipeline and CONCATENATED. This layer has no CRDT merge by design —
-    // write_rows_i64 data carries no _rowid/_version (dedup is the JSON
-    // pipeline's job via read_rows_json_pruned), so concatenation IS the
-    // correct union semantics here. It also keeps the C9 history-loss
-    // fix visible at this API level: before the journal, every
-    // write_rows_i64 after the first silently hid its predecessors.
-    let view = crate::journal::resolve_view(kernel, collection, branch, false)?;
-    let mut packs: Vec<String> = Vec::with_capacity(view.entries.len() + 1);
-    if let Some(snapshot) = &view.snapshot {
-        packs.push(snapshot.clone());
-    }
-    packs.extend(view.entries.iter().map(|e| e.pack_hash.clone()));
-    if packs.is_empty() {
+    // JOURNAL-AWARE (ARCHITECTURE.md D3/D6): the RG-level read plan — the
+    // snapshot pack plus every live journal entry (stale compaction packs
+    // filtered at RG granularity by resolve_packs), read through the same
+    // per-pack i64 pipeline and CONCATENATED. This layer has no CRDT
+    // merge by design — write_rows_i64 data carries no _rowid/_version
+    // (dedup is the JSON pipeline's job via read_rows_json_pruned), so
+    // concatenation IS the correct union semantics here. It also keeps
+    // the C9 history-loss fix visible at this API level: before the
+    // journal, every write_rows_i64 after the first silently hid its
+    // predecessors.
+    let plans = crate::journal::resolve_packs(kernel, collection, branch, false)?;
+    if plans.is_empty() {
         return Err(format!("Collection '{}' has no commits", collection));
     }
 
     use std::collections::HashMap;
     let mut result_cols: HashMap<String, Vec<i64>> = HashMap::new();
-    for pack_hash in &packs {
-        let cols = read_rows_i64_from_head(kernel, pack_hash, columns, predicates)?;
+    for plan in &plans {
+        let cols = read_rows_i64_from_head(
+            kernel,
+            &plan.pack_hash,
+            columns,
+            predicates,
+            plan.only_rgs.as_ref(),
+        )?;
         for (name, data) in cols {
             result_cols.entry(name).or_default().extend(data);
         }
@@ -788,11 +794,17 @@ pub fn read_rows_i64(
 }
 
 /// The per-pack i64 pruned pipeline (see [`read_rows_i64`]).
+///
+/// `only_rgs` carries the D6 read plan's per-pack RG filter (C11): when
+/// set, row groups whose identity is NOT in the set are dropped before
+/// pruning/I/O — a partially-covered compaction pack contributes only its
+/// novel RGs.
 fn read_rows_i64_from_head(
     kernel: &PondKernel,
     head: &str,
     columns: Option<&[String]>,
     predicates: Option<&[(&str, &str, i64)]>,
+    only_rgs: Option<&std::collections::BTreeSet<crate::journal::RgIdentity>>,
 ) -> Result<Vec<(String, Vec<i64>)>, String> {
     // Resolve manifest bytes from HEAD in a SINGLE code path.
     //
@@ -815,7 +827,15 @@ fn read_rows_i64_from_head(
             (col.to_string(), op.to_string(), val.to_le_bytes().to_vec())
         }).collect()
     });
-    let manifest = resolve_manifest(kernel, &manifest_bytes, pman_preds.as_deref())?;
+    let mut manifest = resolve_manifest(kernel, &manifest_bytes, pman_preds.as_deref())?;
+
+    // D6 plan filter (C11): drop row groups the plan says are already
+    // covered by another pack — BEFORE zone-map/bloom pruning and I/O.
+    if let Some(only) = only_rgs {
+        manifest
+            .row_groups
+            .retain(|rg| only.contains(&(rg.blob_hash.clone(), rg.slab_byte_offset)));
+    }
 
     // Build projection set (which columns to decode)
     let projection: Option<std::collections::HashSet<&str>> = columns.map(|cols| {
@@ -992,11 +1012,14 @@ fn read_rows_i64_from_head(
 /// Pruned, projection-pushed-down JSON row reader for a collection —
 /// JOURNAL-AWARE (ARCHITECTURE.md D3: reads = snapshot ∪ live entries).
 ///
-/// Resolves the branch's journal view (branch_ref snapshot pack + every
-/// live journal entry discovered above its watermarks), runs the ONE
-/// pruned pipeline per pack via [`read_rows_json_pruned_with_head`], then
-/// CRDT-merges the rows (LWW by `_version`, total tiebreak
-/// `(_version, _rowid, payload)` — CRITIQUE C10 — tombstones suppressed).
+/// Resolves the branch's journal into the D6 RG-level read plan via
+/// [`crate::journal::resolve_packs`] (branch_ref snapshot pack + every
+/// live journal entry discovered above its watermarks, stale compaction
+/// packs filtered at RG granularity — ARCHITECTURE.md D6), runs the ONE
+/// pruned pipeline per planned pack via
+/// [`read_rows_json_pruned_with_head`], then CRDT-merges the rows (LWW by
+/// `_version`, total tiebreak `(_version, _rowid, payload)` — CRITIQUE
+/// C10 — tombstones suppressed).
 /// Shards remain the caller's CRDT responsibility (`shard::read_with_shards`
 /// + merge — the python lenses still write them).
 ///
@@ -1022,33 +1045,30 @@ pub fn read_rows_json_pruned(
     projection: Option<&[String]>,
     predicates: &[(String, String, JsonValue)],
 ) -> Result<Vec<(String, JsonValue)>, String> {
-    // 1. Resolve the journal view (snapshot + live entries). This is the
-    //    C9 fix: HEAD-only resolution used to hide every commit after the
-    //    first; the journal unions ALL committed data.
-    let view = crate::journal::resolve_view(kernel, collection, branch, false)?;
-    let mut packs: Vec<String> = Vec::with_capacity(view.entries.len() + 1);
-    if let Some(snapshot) = &view.snapshot {
-        packs.push(snapshot.clone());
-    }
-    packs.extend(view.entries.iter().map(|e| e.pack_hash.clone()));
-    if packs.is_empty() {
+    // 1. Resolve the journal into the D6 RG-level READ PLAN (snapshot +
+    //    live entries, stale compaction packs filtered at RG granularity).
+    //    This is the C9 fix: HEAD-only resolution used to hide every commit
+    //    after the first; the journal unions ALL committed data.
+    let plans = crate::journal::resolve_packs(kernel, collection, branch, false)?;
+    if plans.is_empty() {
         return Ok(Vec::new());
     }
 
-    // 2. ONE pruned pipeline per pack. Each pack is exactly what
+    // 2. ONE pruned pipeline per planned pack. Each pack is exactly what
     //    read_rows_json_pruned_with_head already handles (PNPK packs and
     //    legacy JSON commits alike); a pack with zero surviving RGs simply
     //    contributes zero rows (that function returns Ok(vec![]) when
     //    every RG is pruned or the manifest is empty — it never errors on
     //    empty manifests).
     let mut all_rows: Vec<JsonValue> = Vec::new();
-    for pack_hash in &packs {
-        let rows = read_rows_json_pruned_with_head(
+    for plan in &plans {
+        let rows = read_rows_json_pruned_from_head(
             kernel,
-            pack_hash,
+            &plan.pack_hash,
             key_fields,
             projection,
             predicates,
+            plan.only_rgs.as_ref(),
         )?;
         all_rows.extend(rows.into_iter().map(|(_, row)| row));
     }
@@ -1077,6 +1097,28 @@ pub fn read_rows_json_pruned_with_head(
     projection: Option<&[String]>,
     predicates: &[(String, String, JsonValue)],
 ) -> Result<Vec<(String, JsonValue)>, String> {
+    read_rows_json_pruned_from_head(
+        kernel,
+        head_hash,
+        key_fields,
+        projection,
+        predicates,
+        None,
+    )
+}
+
+/// The planned half of [`read_rows_json_pruned_with_head`]: the same
+/// pipeline plus the D6 read plan's per-pack RG filter (`only_rgs`, C11)
+/// applied right after manifest resolution — a partially-covered
+/// compaction pack contributes only its NOVEL row groups.
+fn read_rows_json_pruned_from_head(
+    kernel: &PondKernel,
+    head_hash: &str,
+    key_fields: &[String],
+    projection: Option<&[String]>,
+    predicates: &[(String, String, JsonValue)],
+    only_rgs: Option<&std::collections::BTreeSet<crate::journal::RgIdentity>>,
+) -> Result<Vec<(String, JsonValue)>, String> {
     let manifest_bytes = commit::resolve_manifest_bytes(kernel, head_hash)
         .map_err(|e| format!("Failed to read manifest: {}", e))?;
 
@@ -1090,11 +1132,19 @@ pub fn read_rows_json_pruned_with_head(
     // 3. PMAN v3 leaf pruning: only typed key-column predicates are passed
     //    (see classify_predicates for why f64/string predicates never
     //    reach prune_leaves). v1/v2 manifests decode directly.
-    let manifest = resolve_manifest(
+    let mut manifest = resolve_manifest(
         kernel,
         &manifest_bytes,
         if typed.leaf.is_empty() { None } else { Some(&typed.leaf) },
     )?;
+
+    // D6 plan filter (C11): drop row groups the plan says are already
+    // covered by another pack — BEFORE zone-map/bloom pruning and I/O.
+    if let Some(only) = only_rgs {
+        manifest
+            .row_groups
+            .retain(|rg| only.contains(&(rg.blob_hash.clone(), rg.slab_byte_offset)));
+    }
 
     // 4. Phase 1 — zone-map pruning (free: manifest stats, no I/O).
     let zone_map_survivors: Vec<&crate::manifest::RowGroupEntry> = manifest.row_groups.iter()
