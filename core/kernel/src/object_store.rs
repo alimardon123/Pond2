@@ -277,6 +277,9 @@ impl ObjectStore for LocalFSObjectStore {
     }
 
     fn put_path(&self, path: &str, hash: &str) -> io::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
         let file = self.path_file(path);
         if let Some(parent) = file.parent() {
             fs::create_dir_all(parent)?;
@@ -286,7 +289,16 @@ impl ObjectStore for LocalFSObjectStore {
         let body = format!(r#"{{"hash":"{}"}}"#, hash);
         // Write temp → rename (POSIX atomic on local FS).
         // On S3, put_path just does PUT (S3 is already idempotent).
-        let tmp = format!("{}.tmp.{}", file.display(), std::process::id());
+        // PID + counter: PID alone collides between same-process THREADS
+        // (two concurrent ref updates mint the same tmp name; one rename
+        // wins, the other fails with ENOENT — caught by the CAS-concurrency
+        // test). Matches put_blob's uniqueness scheme.
+        let tmp = format!(
+            "{}.tmp.{}.{}",
+            file.display(),
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
         fs::write(&tmp, &body)?;
         fs::rename(&tmp, &file)?;
         let mut s = self.stats.lock().unwrap();
