@@ -10,7 +10,7 @@
   as ONE PND2 row group (the shared `journal::build_rg_from_json_rows`
   encoder) inside ONE journal pack per call (unique per-writer path, plain
   PUT, zero shared objects). The JSON-shard write surface is GONE from the
-  Rust core; every pyo3/CLI/Go CRDT row write (incl. the high-level
+  Rust core; every pyo3/CLI CRDT row write (incl. the high-level
   update_rows/delete_rows/merge_rows/upload) is probeable, and
   upsert/delete workloads need no LIST on warm reads (the last C2-compat
   surface closes for Rust-written data). `shard_count == 0` is the steady
@@ -32,17 +32,25 @@
   (SQL `test_where_pushdown_shard_updated_row_disappears`: 3 rows for 2).
   Pre-D7 the hole was unreachable (updates lived in the unfiltered shard
   channel) but LATENT for folded shard RGs. Fix — the D7 reader rule:
-  `RowGroupEntry::is_crdt_update_rg()` (stats carry `_deleted`); MERGING
+  `RowGroupEntry::is_crdt_update_rg()` (a `_deleted` stat WITH REAL
+  min/max — the requirement is load-bearing: tribunal r4 finding 1
+  proved a name-only check misfires on normalize PLACEHOLDER stats and
+  blinded the non-merging readers post-fold, 0 rows for 3); MERGING
   readers exempt CRDT RGs from zone-map/bloom/row-filter; NON-MERGING
   readers (`read_rows_i64`, `read_all_row_groups`, lakehouse/vector
-  lenses) skip them (pre-D7 shard-invisible equivalence). Pinned by 3
-  regressions (live update-OUT-of-range, post-compact, i64-skip).
+  lenses) skip them (pre-D7 shard-invisible equivalence). The branch
+  merge re-encoder now writes REAL stats (was all-None — genuine merged
+  CRDT RGs would have been misclassified as base). Pinned by 6
+  regressions: live update-OUT-of-range, post-compact update-OUT/INTO
+  range, compact-blindness (the tribunal probe), i64-skip,
+  resurrection-post-compact, two-writer same-rowid.
 - **FINDING (pre-existing flake, fixed)**: `write_rows` generated rowids
   with plain `uuidv7()` (RANDOM within the same millisecond); the CRDT
   merge sorts by rowid, so a fresh batch's read-back order was random per
   run (test_write_rows_auto_crdt failed ~5/6 of runs). Fix:
-  `uuidv7_monotonic()` (existing kernel fn) in write_rows_inner AND
-  shard::upsert_shard's generated rowids — batch order is now
+  `uuidv7_monotonic()` (existing kernel fn) in write_rows_inner,
+  shard::upsert_shard's generated rowids, AND the SQL MERGE insert path
+  (executor.rs — tribunal r4 finding 3) — batch order is now
   deterministic insertion order.
 - **Scoping discovery (recorded)**: the Python lens stack
   (keyvalue/streaming/oltp + pure-Python UnifiedStorage on
@@ -51,12 +59,12 @@
   interop with CLI/pyo3/Go today (verified: no test mixes the worlds).
   C5-python residual: SDK delegation to the Rust core via pyo3 per D1 —
   never a Python journal port.
-- Validation: pond_storage 216 tests green (163 unit + 26 journal + 8
-  upsert_journal + 5 chaos + laws ×13); full workspace 570 green / 0
-  failed; SQL integration 30/30 (incl. the fixed regression); clippy
-  `-D warnings` clean; pytest pyo3 suites 28/28 + test_all 25 pass / 2
-  env-skips; moto S3 32/32; live Cloudflare R2 35/35; lens laws (pure
-  Python world, untouched) all 6 laws compliant.
+- Validation: pond_storage 220 tests green (163 unit + 26 journal + 12
+  upsert_journal + 5 chaos + laws ×13); full workspace green; SQL
+  integration 30/30 (incl. the fixed regression); clippy `-D warnings`
+  clean; pytest pyo3 suites 28/28 + test_all 25 pass / 2 env-skips; moto
+  S3 32/32; live Cloudflare R2 35/35; lens laws (pure Python world,
+  untouched) all 6 laws compliant.
 
 ## 2026-08-28 — Crucible iteration N+3: the LAWS cycle (cron-2026-08-28-1100)
 

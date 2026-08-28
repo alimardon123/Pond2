@@ -115,21 +115,26 @@ by compacting once. `append_shard` (raw bytes) remains an explicit
 escape hatch for non-row payloads.
 
 **D7 reader rule (the pruning carve-out, found by the cycle's own SQL
-regression):** an RG whose stats carry `_deleted`
-(`RowGroupEntry::is_crdt_update_rg`) is a CRDT-update RG — its rows may
-be UPDATES of rows in other RGs, so value-based pruning (zone-map /
-bloom / row pre-filter) may drop the authoritative newer copy while the
-stale copy survives, resurrecting outdated state after the CRDT merge.
-Therefore: MERGING readers (`read_rows_json_pruned`) exempt CRDT-update
-RGs from value pruning entirely (the caller's post-merge filter is
-authoritative for them); NON-MERGING readers (`read_rows_i64`,
-`read_all_row_groups`, the lakehouse/vector columnar pipelines) SKIP
-them — without a CRDT merge, base + update copies would duplicate rows.
-This preserves every surface's pre-D7 behavior exactly (updates lived in
-the unfiltered shard channel; the non-merging readers never read
-shards). The latent hole pre-dates D7 for FOLDED shard RGs (compact's
-shard fold kept tombstones, so a folded update RG was value-prunable
-the same way) — the `_deleted`-stat rule fixes both eras uniformly.
+regression):** an RG whose stats carry a `_deleted` column WITH REAL
+min/max stats (`RowGroupEntry::is_crdt_update_rg`) is a CRDT-update RG —
+its rows may be UPDATES of rows in other RGs, so value-based pruning
+(zone-map / bloom / row pre-filter) may drop the authoritative newer copy
+while the stale copy survives, resurrecting outdated state after the
+CRDT merge. Therefore: MERGING readers (`read_rows_json_pruned`) exempt
+CRDT-update RGs from value pruning entirely (the caller's post-merge
+filter is authoritative for them); NON-MERGING readers
+(`read_rows_i64`, `read_all_row_groups`, the lakehouse/vector columnar
+pipelines) SKIP them — without a CRDT merge, base + update copies would
+duplicate rows. The real-stats requirement is load-bearing (tribunal r4
+finding 1): `normalize_rgs_to_schema` pads every RG with None-stats
+PLACEHOLDERs for union-schema columns it lacks, so after a mixed fold
+every base RG carries a `_deleted` placeholder — a name-only check
+blinded the non-merging readers post-fold (0 rows for 3, empirically
+proven). Placeholders never carry min/max; every genuine CRDT RG writer
+(`build_rg_from_json_rows`, the branch merge re-encoder) does. The
+latent hole pre-dates D7 for FOLDED shard RGs (compact's shard fold kept
+tombstones, so a folded update RG was value-prunable the same way) — the
+rule fixes both eras uniformly.
 
 **Python stack boundary (recorded this cycle):** the pure-Python SDK/lens
 stack (PondMinimal SQLite kernel + ObjectStoreNativeKernel root-pointer

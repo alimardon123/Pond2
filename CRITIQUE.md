@@ -80,11 +80,20 @@
   in the unfiltered shard channel) but LATENT for folded shard RGs
   (compact's shard fold kept tombstones → folded update RGs were
   value-prunable identically). Fix: `RowGroupEntry::is_crdt_update_rg()`
-  (stats carry `_deleted`) — merging readers exempt CRDT RGs from
-  zone-map/bloom/row-filter; non-merging readers (i64, all_row_groups,
-  lakehouse/vector lenses) skip them (pre-D7 shard-invisible
-  equivalence). Pinned by upsert_journal_test regressions (live +
-  post-compact + i64-skip).
+  — merging readers exempt CRDT RGs from zone-map/bloom/row-filter;
+  non-merging readers (i64, all_row_groups, lakehouse/vector lenses)
+  skip them (pre-D7 shard-invisible equivalence). **Amended same cycle
+  (tribunal r4 finding 1, HIGH, empirically proven)**: the first version
+  of the check was NAME-ONLY and misfired on `normalize_rgs_to_schema`
+  PLACEHOLDER stats — after any mixed fold every base RG carries a
+  `_deleted` placeholder and the non-merging readers went BLIND
+  post-fold (0 rows for 3). Fix v2: the check requires REAL min/max
+  stats on `_deleted` (placeholders never carry them; every genuine
+  CRDT RG writer does — and branch.rs's merge re-encoder now writes real
+  stats instead of all-None, which would have misclassified genuine
+  merged CRDT RGs). Pinned by 6 regressions in upsert_journal_test
+  (live + post-compact update-OUT/INTO, compact-blindness probe,
+  i64-skip, resurrection-post-compact, two-writer same-rowid).
 - (2026-08-28, N+4) **write_rows batch order flake (pre-existing)** —
   `write_rows` generated rowids with plain `uuidv7()`, which is RANDOM
   within the same millisecond; the CRDT merge sorts by rowid, so a

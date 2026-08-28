@@ -543,3 +543,192 @@ fn test_i64_reader_skips_crdt_update_rgs() {
         .and_then(|(_, r)| r.get("v").and_then(|v| v.as_i64()));
     assert_eq!(upsert_v, Some(99), "the upsert row is visible through the merging reader");
 }
+
+// ---------------------------------------------------------------------------
+// 7. Tribunal r4 finding-1 regressions + the missing constructions
+// ---------------------------------------------------------------------------
+//
+// The tribunal empirically proved: after a compact whose union schema
+// absorbs `_deleted`, normalize_rgs_to_schema pads EVERY base RG with a
+// `_deleted` PLACEHOLDER — the name-only is_crdt_update_rg misfired on all
+// of them and the non-merging readers went blind post-fold (0 rows for 3).
+// Fix: the check requires REAL min/max stats on `_deleted`. These tests
+// pin the exact constructions that were missing.
+
+/// THE tribunal probe as a regression: base write + ONE upsert + compact
+/// ⇒ the non-merging readers still see the BASE rows post-fold (the
+/// placeholder-padded base RGs are NOT CRDT RGs), and read_all_row_groups
+/// still returns the base RGs.
+#[test]
+fn test_compact_mixed_base_plus_upsert_nonmerging_readers_see_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+    let kernel = storage.kernel();
+
+    // Base i64 data + one journal upsert, then fold EVERYTHING.
+    let base_cols: Vec<(&str, &[i64])> = vec![("k", &[1, 2, 3]), ("v", &[10, 20, 30])];
+    pond_storage::write::write_rows_i64(kernel, "kv", "main", &base_cols, "seed").unwrap();
+    let mut hlc = HLC::new();
+    let upd = vec![json!({"_rowid": "upd-1", "k": 2, "v": 99})];
+    shard::upsert_shard(kernel, "kv", "main", "upd", &upd, Some("k"), &mut hlc).unwrap();
+    journal::compact(kernel, "kv", "main", &["k".to_string()]).unwrap();
+
+    // The union schema now includes _deleted (from the upsert RG) — every
+    // base RG in the folded manifest carries a _deleted PLACEHOLDER. The
+    // real-stats discriminator must classify them as BASE:
+    let want_cols = vec!["k".to_string(), "v".to_string()];
+    let cols = read::read_rows_i64(kernel, "kv", "main", Some(&want_cols), None).unwrap();
+    let col = |name: &str| cols.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone());
+    assert_eq!(col("k"), Some(vec![1, 2, 3]),
+        "post-compact: the i64 reader must still see the BASE rows (tribunal r4 f1)");
+    assert_eq!(col("v"), Some(vec![10, 20, 30]),
+        "post-compact: base values intact");
+
+    let rgs = read::read_all_row_groups(kernel, "kv", "main").unwrap();
+    assert!(!rgs.is_empty(),
+        "post-compact: read_all_row_groups must still return the base RGs (tribunal r4 f1)");
+
+    // The merging reader still applies the upsert over the folded state.
+    let merged = read::read_rows_json_pruned(kernel, "kv", "main", &key_fields(), None, &[])
+        .unwrap();
+    let v2 = merged.iter()
+        .find(|(rid, _)| rid == "upd-1")
+        .and_then(|(_, r)| r.get("v").and_then(|v| v.as_i64()));
+    assert_eq!(v2, Some(99), "the folded upsert row stays visible to the merging reader");
+}
+
+/// Resurrection post-compact: base row → tombstoned → folded (suppressed)
+/// → a LATER live upsert of the same rowid resurrects it.
+#[test]
+fn test_resurrection_after_compact() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+    let kernel = storage.kernel();
+    let kc = key_fields();
+    let mut hlc = HLC::new();
+
+    // Base row (write_rows CRDT-stamps its rowid).
+    let columns: Vec<(&str, TypedColumn)> = vec![
+        ("name", TypedColumn::String(vec!["alice".to_string()])),
+        ("age", TypedColumn::Int64(vec![30])),
+    ];
+    pond_storage::write::write_rows(kernel, "users", "main", &columns, "seed").unwrap();
+
+    let base = read::read_rows_json_pruned(kernel, "users", "main", &kc, None, &[]).unwrap();
+    let rowid = base[0].0.clone();
+    for (_, row) in &base {
+        if let Some(v) = row.get("_version").and_then(|v| v.as_str()) {
+            hlc.observe(v);
+        }
+    }
+
+    // Tombstone, then fold — the row is suppressed post-fold.
+    shard::delete_shard(kernel, "users", "main", "del", std::slice::from_ref(&rowid), Some("name"), &mut hlc).unwrap();
+    journal::compact(kernel, "users", "main", &["name".to_string()]).unwrap();
+    let live = read::read_rows_json_pruned(kernel, "users", "main", &kc, None, &[]).unwrap();
+    assert!(live.is_empty(), "post-fold tombstone suppresses the base row");
+
+    // Resurrect: a LATER live upsert of the same rowid (new _version).
+    let res = vec![json!({"_rowid": rowid, "name": "alice", "age": 31})];
+    shard::upsert_shard(kernel, "users", "main", "resurrect", &res, Some("name"), &mut hlc).unwrap();
+    let live = read::read_rows_json_pruned(kernel, "users", "main", &kc, None, &[]).unwrap();
+    assert_eq!(live.len(), 1, "the later live version resurrects the row");
+    assert_eq!(live[0].1.get("age").and_then(|v| v.as_i64()), Some(31));
+}
+
+/// Update-INTO-range post-compact (the mirror of the update-OUT-of-range
+/// regression): a base row outside the predicate range, updated INTO the
+/// range, folded — the pruned read must deliver the UPDATED row (the
+/// folded CRDT RG is exempt from value pruning).
+#[test]
+fn test_update_into_range_after_compact() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+    let kernel = storage.kernel();
+    let kc = key_fields();
+    let mut hlc = HLC::new();
+
+    // Base: alice@22 (OUTSIDE `age >= 30`), carol@35, dave@40.
+    let columns: Vec<(&str, TypedColumn)> = vec![
+        ("name", TypedColumn::String(vec![
+            "alice".to_string(), "carol".to_string(), "dave".to_string(),
+        ])),
+        ("age", TypedColumn::Int64(vec![22, 35, 40])),
+    ];
+    pond_storage::write::write_rows(kernel, "users", "main", &columns, "seed").unwrap();
+
+    let base = read::read_rows_json_pruned(kernel, "users", "main", &kc, None, &[]).unwrap();
+    let alice_rowid = base.iter()
+        .find(|(_, r)| r.get("name").and_then(|v| v.as_str()) == Some("alice"))
+        .map(|(rid, _)| rid.clone()).unwrap();
+    for (_, row) in &base {
+        if let Some(v) = row.get("_version").and_then(|v| v.as_str()) {
+            hlc.observe(v);
+        }
+    }
+
+    // Update alice INTO the range, then fold.
+    let upd = vec![json!({"_rowid": alice_rowid, "name": "alice", "age": 33})];
+    shard::upsert_shard(kernel, "users", "main", "upd_alice", &upd, Some("name"), &mut hlc).unwrap();
+    journal::compact(kernel, "users", "main", &["name".to_string()]).unwrap();
+
+    // Post-fold `age >= 30`: the folded CRDT RG (real _deleted stats) is
+    // exempt from value pruning, so the updated alice@33 reaches the merge
+    // even though BOTH her copies (22, 33) sit in prunable-looking value
+    // ranges on the base side.
+    let preds = vec![("age".to_string(), ">=".to_string(), json!(30))];
+    let out = read::read_rows_json_pruned(kernel, "users", "main", &kc, None, &preds).unwrap();
+    let ages: Vec<(String, i64)> = out.iter()
+        .filter_map(|(_, row)| {
+            let name = row.get("name")?.as_str()?.to_string();
+            let age = row.get("age")?.as_i64()?;
+            Some((name, age))
+        })
+        .collect();
+    assert!(ages.contains(&("alice".to_string(), 33)),
+        "post-compact: the updated-INTO-range row must be delivered — got {:?}", ages);
+    assert!(ages.contains(&("carol".to_string(), 35)));
+    assert!(ages.contains(&("dave".to_string(), 40)));
+    assert_eq!(out.len(), 3, "exactly one row per rowid");
+}
+
+/// Two writers upserting the SAME rowid concurrently: the CRDT merge
+/// yields exactly ONE row — the strictly-later version wins (LWW), and a
+/// FRESH reader (empty caches) agrees.
+#[test]
+fn test_two_writers_same_rowid_lww() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+    let kernel = storage.kernel();
+    let kc = key_fields();
+
+    // Writer A: version V1, value "a".
+    let mut hlc_a = HLC::new();
+    let rows_a = vec![json!({"_rowid": "shared-1", "k": 1, "who": "a"})];
+    shard::upsert_shard(kernel, "shared", "main", "w_a", &rows_a, Some("k"), &mut hlc_a).unwrap();
+
+    // Writer B observes A's version (reads it back, like the production
+    // update paths do), so its tick is strictly later. Value "b".
+    let mut hlc_b = HLC::new();
+    let seen = read::read_rows_json_pruned(kernel, "shared", "main", &kc, None, &[]).unwrap();
+    for (_, row) in &seen {
+        if let Some(v) = row.get("_version").and_then(|v| v.as_str()) {
+            hlc_b.observe(v);
+        }
+    }
+    let rows_b = vec![json!({"_rowid": "shared-1", "k": 1, "who": "b"})];
+    shard::upsert_shard(kernel, "shared", "main", "w_b", &rows_b, Some("k"), &mut hlc_b).unwrap();
+
+    // Exactly ONE row; B's copy wins (strictly later version).
+    let live = read::read_rows_json_pruned(kernel, "shared", "main", &kc, None, &[]).unwrap();
+    assert_eq!(live.len(), 1, "two upserts of the same rowid must collapse to one row");
+    assert_eq!(live[0].1.get("who").and_then(|v| v.as_str()), Some("b"),
+        "the strictly-later version wins (LWW)");
+
+    // A fresh reader agrees.
+    let fresh = UnifiedStorage::new_local(dir.path()).unwrap();
+    let live2 = read::read_rows_json_pruned(fresh.kernel(), "shared", "main", &kc, None, &[])
+        .unwrap();
+    assert_eq!(live2.len(), 1);
+    assert_eq!(live2[0].1.get("who").and_then(|v| v.as_str()), Some("b"));
+}

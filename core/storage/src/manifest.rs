@@ -155,14 +155,28 @@ impl RowGroupEntry {
     /// Is this RG a CRDT-update RG (upsert/delete rows)?
     ///
     /// D7 rule (ARCHITECTURE.md, N+4): an RG whose per-RG stats carry a
-    /// `_deleted` column holds rows from the CRDT update surface —
-    /// `upsert_shard`/`delete_shard` packs (every stamped row carries
-    /// `_deleted`), compact's folded-shard RGs (tombstones are KEPT in the
-    /// fold), and fold-union'd CRDT pack RGs (RG entries copied verbatim,
-    /// stats included). Base `write_rows` RGs NEVER carry `_deleted`
-    /// (`write_rows_inner` adds only `_rowid` + `_version`) — a user who
-    /// manually writes a `_deleted` column opts into update semantics for
-    /// that RG (correctness preserved, pruning forfeited).
+    /// `_deleted` column **with REAL min/max stats** holds rows from the
+    /// CRDT update surface — `upsert_shard`/`delete_shard` packs (every
+    /// stamped row carries `_deleted`; `build_rg_from_json_rows` writes
+    /// Boolean min/max — `TypedColumn::min_max_bytes` returns Some for
+    /// Boolean), compact's folded-shard RGs (tombstones are KEPT in the
+    /// fold, same encoder), fold-union'd CRDT pack RGs (RG entries copied
+    /// verbatim, stats included), and merge-rewritten CRDT RGs (branch.rs
+    /// re-encoder — writes real stats for the same reason).
+    ///
+    /// WHY the min/max requirement (tribunal r4 finding 1):
+    /// `normalize_rgs_to_schema` pads every RG with PLACEHOLDER stats
+    /// (min: None, max: None, null_count: 0) for union-schema columns the
+    /// RG lacks — after any compact or branch merge whose union schema
+    /// absorbed `_deleted`, EVERY base RG carries a `_deleted` PLACEHOLDER.
+    /// A name-only check misfires on all of them: non-merging readers went
+    /// blind post-fold (0 rows for 3 — empirically proven by the tribunal)
+    /// and the merging reader lost all pruning. Placeholders never carry
+    /// min/max, and every genuine CRDT writer does, so the stats presence
+    /// is the discriminator. Out-of-contract edge: a user who manually
+    /// writes `_deleted` as a NON-boolean column gets a None-stats String
+    /// column (misclassified as base — such data breaks tombstone
+    /// semantics anyway; documented, not supported).
     ///
     /// Readers use this to keep the pre-D7 channel split under one journal:
     ///   - MERGING readers (`read_rows_json_pruned`) exempt these RGs from
@@ -176,7 +190,9 @@ impl RowGroupEntry {
     ///     exactly the pre-D7 behavior (updates lived in shards, which
     ///     those readers never read).
     pub fn is_crdt_update_rg(&self) -> bool {
-        self.columns.iter().any(|c| c.name == "_deleted")
+        self.columns.iter().any(|c| {
+            c.name == "_deleted" && (c.min.is_some() || c.max.is_some())
+        })
     }
 
     /// Can this row group be pruned given a list of predicates?

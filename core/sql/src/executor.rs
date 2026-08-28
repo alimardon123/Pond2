@@ -16,7 +16,7 @@ use crate::parser::{
 };
 use crate::where_clause::WhereExpr;
 use pond_core::TypedColumn;
-use pond_kernel::crdt::{uuidv7, HLC};
+use pond_kernel::crdt::{uuidv7_monotonic, HLC};
 use pond_storage::shard;
 use pond_storage::{write as storage_write, UnifiedStorage};
 use serde_json::{json, Value as JsonValue};
@@ -1585,7 +1585,10 @@ fn execute_merge(
                     let mut new_row = source.clone();
                     if let Some(obj) = new_row.as_object_mut() {
                         if obj.get("_rowid").is_none() {
-                            obj.insert("_rowid".to_string(), json!(uuidv7()));
+                            // MONOTONIC: multi-row MERGE inserts get
+                            // insertion-ordered rowids (plain uuidv7()
+                            // randomizes same-ms order — the N+4 flake fix).
+                            obj.insert("_rowid".to_string(), json!(uuidv7_monotonic()));
                         }
                         obj.insert("_version".to_string(), json!(hlc.tick()));
                         obj.insert("_deleted".to_string(), json!(false));

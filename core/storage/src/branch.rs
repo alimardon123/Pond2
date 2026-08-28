@@ -543,12 +543,24 @@ fn encode_json_rows_to_pnd2(
             (TypedColumn::String(vals), 3u8)
         };
 
+        // Real per-column stats (tribunal r4 finding-1 repair): the stats
+        // presence is what `is_crdt_update_rg` discriminates on — the old
+        // all-None entries made merge-rewritten CRDT RGs (which DO carry
+        // `_deleted`) indistinguishable from normalize placeholders, so a
+        // merged CRDT RG would be value-pruned like base data (the
+        // update-OUT-of-range resurrection hole, merge flavor). String/
+        // VARIANT columns keep None stats (min_max_bytes has no arm for
+        // them — same as every other stats writer).
+        let (min, max) = typed_col
+            .min_max_bytes()
+            .map(|(mn, mx)| (Some(mn), Some(mx)))
+            .unwrap_or((None, None));
         typed_cols.push((name.as_str(), typed_col));
         col_stats.push(crate::manifest::ColumnStatsEntry {
             name: name.clone(),
             value_type: vtype,
-            min: None,
-            max: None,
+            min,
+            max,
             null_count: 0,
         });
     }
