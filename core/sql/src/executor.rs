@@ -15,8 +15,7 @@ use crate::parser::{
     SqlStatement, TableRef,
 };
 use crate::where_clause::WhereExpr;
-use pond_core::{pnd2_decode_projected, PondColumn, TypedColumn, VT_BINARY, VT_FLOAT64, VT_INT64,
-                VT_STRING, VT_VARIANT};
+use pond_core::TypedColumn;
 use pond_kernel::crdt::{uuidv7, HLC};
 use pond_storage::shard;
 use pond_storage::{write as storage_write, UnifiedStorage};
@@ -129,16 +128,40 @@ fn execute_select(
     let projection = extract_required_columns(
         select_items, where_expr, groups, orders, &join_on_left, having,
     );
-    let mut result_rows = read_table_rows(storage, table, projection.as_ref())?;
+
+    // WHERE pushdown: extract the plain conjunction of column-vs-scalar
+    // comparisons from the WHERE clause and push it into the pruned reader
+    // (leaf/zone-map/bloom pruning + columnar pre-filter). Pushdown is only
+    // attempted for join-free queries — with a JOIN, execute_join lets the
+    // RIGHT table's columns shadow the left's on name collision, so a
+    // base-table pre-filter could drop rows whose joined partner satisfies
+    // the WHERE. The executor's post-merge WHERE eval below remains the
+    // AUTHORITATIVE filter either way; the pushed predicates are a
+    // conservative I/O optimization only (shard-updated rows survive via
+    // their shard copies).
+    let pushdown_preds: Vec<(String, String, JsonValue)> = if joins.is_empty() {
+        let mut preds = Vec::new();
+        extract_conjunction_predicates(where_expr, &mut preds);
+        // Alias-qualified refs ("u.age") can't be attributed to this table
+        // safely — only exact column names are pushed.
+        preds.retain(|(col, _, _)| !col.contains('.'));
+        preds
+    } else {
+        Vec::new()
+    };
+
+    let mut result_rows = read_table_rows(storage, table, projection.as_ref(), &pushdown_preds)?;
 
     // If there's an alias, prefix all columns with the alias.
     if let Some(al) = alias {
         prefix_rows_with_alias(&mut result_rows, al);
     }
 
-    // Execute JOINs.
+    // Execute JOINs. Right-side tables are read WITHOUT predicate pushdown:
+    // the WHERE clause belongs to the post-join row space and cannot be
+    // attributed to a single join input.
     for join in joins {
-        let mut right_rows = read_table_rows(storage, &join.table, None)?;
+        let mut right_rows = read_table_rows(storage, &join.table, None, &[])?;
         if let Some(al) = &join.alias {
             prefix_rows_with_alias(&mut right_rows, al);
         }
@@ -767,6 +790,7 @@ fn read_table_rows(
     storage: &UnifiedStorage,
     table: &TableRef,
     projection: Option<&HashSet<String>>,
+    predicates: &[(String, String, JsonValue)],
 ) -> Result<Vec<JsonValue>, String> {
     match table {
         TableRef::Collection(name) => {
@@ -776,11 +800,32 @@ fn read_table_rows(
                 s.iter().map(|c| c.as_str()).collect()
             });
             let all_rows = read_collection_as_json_rows(
-                storage, name, &kc, proj_ref.as_ref(),
+                storage, name, &kc, proj_ref.as_ref(), predicates,
             )?;
             Ok(crdt_merge_rows(all_rows))
         }
         TableRef::File(path) => read_file_rows(path),
+    }
+}
+
+/// Extract the conjunctive (AND-only) `col op scalar` comparisons from a
+/// WHERE expression for reader pushdown. Any non-conjunction subtree
+/// (OR / NOT / IN / LIKE / IS NULL / subquery) contributes NOTHING — a
+/// predicate under an OR that prunes row groups would drop rows the OR
+/// would have kept. Correctness first.
+fn extract_conjunction_predicates(
+    expr: &WhereExpr,
+    out: &mut Vec<(String, String, JsonValue)>,
+) {
+    match expr {
+        WhereExpr::And(a, b) => {
+            extract_conjunction_predicates(a, out);
+            extract_conjunction_predicates(b, out);
+        }
+        WhereExpr::Compare { col, op, value } => {
+            out.push((col.clone(), op.clone(), value.clone()));
+        }
+        _ => {}
     }
 }
 
@@ -1179,38 +1224,43 @@ fn extract_having_columns(expr: &WhereExpr, needed: &mut HashSet<String>) {
 /// Reads HEAD + shards, decodes PND2 blobs, converts each row to a JSON
 /// object. Sequential CRDT merge is then applied by the caller.
 ///
-/// Uses the optimized read path: slab-aware range reads, range coalescing,
-/// and parallel blob reads (see `read::read_all_row_groups`). This avoids
-/// full blob GETs when row groups are stored in slabs, reducing S3
-/// bandwidth by up to 100x for selective queries.
+/// HEAD data is routed through `pond_storage::read::read_rows_json_pruned` —
+/// the ONE production read pipeline (PMAN v3 leaf pruning → zone-map pruning
+/// → parallel bloom pre-check → slab-aware coalesced range reads → projection
+/// pushdown → columnar pre-filter). The previous implementation used
+/// `read_all_row_groups` (slab-aware but NO predicate pushdown — every RG
+/// read and decoded on every query).
+///
+/// Predicates are a CONSERVATIVE pre-filter (I/O optimization); the
+/// executor's WHERE evaluation stays the authoritative post-CRDT-merge
+/// filter — a HEAD row pruned here is still delivered by its shard copy.
 fn read_collection_as_json_rows(
     storage: &UnifiedStorage,
     collection: &str,
     key_fields: &[String],
     projection: Option<&std::collections::HashSet<&str>>,
+    predicates: &[(String, String, JsonValue)],
 ) -> Result<Vec<(String, JsonValue)>, String> {
     let kernel = storage.kernel();
     let mut rows: Vec<(String, JsonValue)> = Vec::new();
 
     let active = storage.get_active_branch(collection);
 
-    // --- Read HEAD data (optimized: slab-aware range reads) ---
-    // Uses read_all_row_groups which handles:
-    //   - PondPack transparently
-    //   - Slab-backed RGs via range reads (not full blob GETs)
-    //   - Range coalescing (adjacent RGs → single GET)
-    //   - Parallel reads (bounded thread pool)
-    //   - PSLB v2 zstd decompression
-    // Previous impl did kernel.read_blob(&rg.blob_hash) per RG, which
-    // fetched the entire slab (up to 128 MB) for each RG — 100x waste.
-    match pond_storage::read::read_all_row_groups(kernel, collection, &active) {
-        Ok(rg_blobs) => {
-            for blob_data in rg_blobs {
-                let cols = pnd2_decode_projected(&blob_data, projection)
-                    .map_err(|e| format!("Failed to decode PND2: {}", e))?;
-                rows.extend(decode_cols_to_rows(&cols, key_fields));
-            }
-        }
+    // --- Read HEAD data (pruned pipeline) ---
+    // read_rows_json_pruned handles: PondPack transparently, slab-backed RGs
+    // via coalesced range reads (not full blob GETs), PSLB v2 zstd
+    // decompression, PMAN v3 leaf pruning, zone-map/bloom pruning,
+    // projection + predicate pushdown.
+    // A HEAD read error yields no HEAD rows and the caller proceeds to
+    // shards (preserves the previous read_all_row_groups error behavior).
+    // Convert HashSet<&str> → Vec<String> for the storage reader's
+    // projection parameter (a few short clones per query — negligible).
+    let proj_vec: Option<Vec<String>> =
+        projection.map(|s| s.iter().map(|c| c.to_string()).collect());
+    match pond_storage::read::read_rows_json_pruned(
+        kernel, collection, &active, key_fields, proj_vec.as_deref(), predicates,
+    ) {
+        Ok(head_rows) => rows.extend(head_rows),
         Err(_) => { /* no HEAD data — proceed to shards */ }
     }
 
@@ -1234,57 +1284,6 @@ fn read_collection_as_json_rows(
     }
 
     Ok(rows)
-}
-
-fn decode_cols_to_rows(cols: &[PondColumn], key_fields: &[String]) -> Vec<(String, JsonValue)> {
-    let mut rows = Vec::new();
-    let n_rows = cols.first().map(|c| c.n_values).unwrap_or(0);
-
-    for row_idx in 0..n_rows {
-        let mut row_obj = serde_json::Map::new();
-        for col in cols {
-            let name = col.name.to_string_lossy().to_string();
-            let val = match col.vtype {
-                VT_INT64 => col
-                    .i64_data
-                    .get(row_idx)
-                    .map(|v| JsonValue::Number(serde_json::Number::from(*v)))
-                    .unwrap_or(JsonValue::Null),
-                VT_FLOAT64 => col
-                    .f64_data
-                    .get(row_idx)
-                    .and_then(|v| serde_json::Number::from_f64(*v))
-                    .map(JsonValue::Number)
-                    .unwrap_or(JsonValue::Null),
-                VT_STRING => col
-                    .str_data
-                    .get(row_idx)
-                    .map(|v| JsonValue::String(v.to_string_lossy().to_string()))
-                    .unwrap_or(JsonValue::Null),
-                VT_BINARY => col
-                    .bin_data
-                    .get(row_idx)
-                    .map(|b| {
-                        JsonValue::String(format!("__bin_b64__:{}", simple_base64_encode(b)))
-                    })
-                    .unwrap_or(JsonValue::Null),
-                VT_VARIANT => col
-                    .str_data
-                    .get(row_idx)
-                    .and_then(|s| {
-                        let s_str = s.to_string_lossy();
-                        serde_json::from_str::<JsonValue>(&s_str).ok()
-                    })
-                    .unwrap_or(JsonValue::Null),
-                _ => JsonValue::Null,
-            };
-            row_obj.insert(name, val);
-        }
-        let row = JsonValue::Object(row_obj);
-        let rowid = determine_rowid(&row, key_fields);
-        rows.push((rowid, row));
-    }
-    rows
 }
 
 fn determine_rowid(row: &JsonValue, key_fields: &[String]) -> String {
@@ -1412,7 +1411,9 @@ fn execute_update(
     let active = storage.get_active_branch(collection);
 
     let kc = vec!["_rowid".to_string()];
-    let all_rows = read_collection_as_json_rows(storage, collection, &kc, None)?;
+    // No predicate pushdown: UPDATE must observe every row (matching rows
+    // may exist only in shards, and the WHERE is re-evaluated per row here).
+    let all_rows = read_collection_as_json_rows(storage, collection, &kc, None, &[])?;
 
     let mut matched: Vec<JsonValue> = Vec::new();
     for (_rowid, row) in &all_rows {
@@ -1460,7 +1461,9 @@ fn execute_delete(
     let active = storage.get_active_branch(collection);
 
     let kc = vec!["_rowid".to_string()];
-    let all_rows = read_collection_as_json_rows(storage, collection, &kc, None)?;
+    // No predicate pushdown: DELETE must observe every row for the same
+    // reason as UPDATE — matches may live only in shards.
+    let all_rows = read_collection_as_json_rows(storage, collection, &kc, None, &[])?;
 
     let mut tombstones: Vec<String> = Vec::new();
     for (rowid, row) in &all_rows {
@@ -1505,7 +1508,9 @@ fn execute_merge(
     let active = storage.get_active_branch(target);
 
     let kc = vec!["_rowid".to_string()];
-    let target_rows = read_collection_as_json_rows(storage, target, &kc, None)?;
+    // No predicate pushdown: MERGE matches on key equality across the full
+    // target, not on a WHERE filter.
+    let target_rows = read_collection_as_json_rows(storage, target, &kc, None, &[])?;
 
     // Build an index of target rows by the composite key built from the
     // FIRST match_key (target side). Multi-key match isn't fully supported
@@ -1677,32 +1682,6 @@ fn build_typed_columns(
         result.push((col_name.clone(), typed));
     }
     result
-}
-
-/// Tiny base64 encoder (avoids pulling in a base64 crate dependency).
-fn simple_base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = chunk.get(1).copied().unwrap_or(0);
-        let b2 = chunk.get(2).copied().unwrap_or(0);
-        let triple = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
-        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(triple & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
 }
 
 /// Generate a sortable, time-based identifier for shard names.

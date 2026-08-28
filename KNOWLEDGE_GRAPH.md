@@ -348,6 +348,11 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `SDK_SPEC.md` | 1095 | Authoritative SDK contract (13 ambiguities settled). |
 | `KNOWLEDGE_GRAPH.md` | — | This file. The navigational map of the repo. |
 | `worklog.md` | 1928 | Append-only research log (Tasks 1-57). |
+| `ACCEPTANCE.md` | — | **Crucible state file.** Definition of done: project-level + per-cycle testable statements, numeric budgets (warm read < 10 ms, ≤ 2 cold GETs, ≤ 10% bytes vs full scan), non-goals (no CAS-centric concurrency), assumptions. Reference class: staledb / DuckDB-on-S3 / Databricks LTAP+RT. |
+| `ARCHITECTURE.md` | — | **Crucible state file.** Architecture contract: component/interface map, settled decisions D1-D5 (Rust-first, CLI as first-class product, no-CAS journal concurrency, one pruned read pipeline, atomic publish), ownership map (COUPLED vs INDEPENDENT concerns), data vocabulary. |
+| `SCORECARD.md` | — | **Crucible state file.** Per-component rubric scores vs the eight principles, with trends. Updated after every tribunal. |
+| `CRITIQUE.md` | — | **Crucible state file.** Open findings with location + root-cause hypothesis (C1 flagship read path, C2 per-read LIST, C3 zero proptests, C4 redundant refs, C5 SlabWriter not default, C6 StalixDB→staledb naming). Append-only until resolved. |
+| `CHANGELOG.md` | — | **Crucible state file.** One entry per iteration with the why; deep per-cycle detail stays in `worklog.md`. |
 
 ### 2.10 core/ (Cross-language Rust core + Python bindings + CLI — 1 workspace, 4 crates)
 

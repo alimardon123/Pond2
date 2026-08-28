@@ -8,9 +8,14 @@
 # This file is the new canonical CI. It wires up ONLY the test suites that
 # actually exist today:
 #
-#   - Rust workspace (cargo test --workspace — 391 #[test] markers across
-#     18 crates including kernel, storage, codec, s3, sql, all 5 lens
-#     crates, IVF/HNSW/simple/semantic indexes, mcp-server, and pond CLI).
+#   - Rust workspace (cargo test --workspace --exclude pond_python — 511
+#     tests across 20 crates including kernel, storage (pruned JSON read
+#     pipeline), codec, s3, sql (executor + integration), all 5 lens
+#     crates, IVF/HNSW/simple/semantic indexes, mcp-server, and pond CLI.
+#     pond_python stays excluded: PyO3's lib-test linking needs Python dev
+#     headers absent from the runner image; its behavior is covered by the
+#     pytest job. pond_sql was re-included 2026-08-28: the exclusion was
+#     collateral from f1932ce, and its tests are pure Rust (fast, green).
 #   - Python pytest (tests/test_all.py — 25 test functions covering
 #     property tests, hazards, architecture laws, lakehouse, KG coverage,
 #     Rust-Python roundtrip, C ABI, Go SDK, decode benchmark, pond CLI).
@@ -70,10 +75,10 @@ jobs:
             ${{ runner.os }}-cargo-target-
 
       - name: Build (release)
-        run: cargo build --release --workspace --exclude pond_python --exclude pond_sql
+        run: cargo build --release --workspace --exclude pond_python
 
       - name: Test (workspace)
-        run: cargo test --workspace --release --exclude pond_python --exclude pond_sql
+        run: cargo test --workspace --release --exclude pond_python
 
   # ─────────────────────────────────────────────────────────────────────
   # Python tests via tests/test_all.py (the canonical pytest entry point).

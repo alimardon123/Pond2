@@ -7,6 +7,7 @@ use crate::commit;
 use crate::manifest::{CollectionManifest, RootManifest, pman_version};
 use crate::shard;
 use pond_kernel::PondKernel;
+use serde_json::Value as JsonValue;
 
 /// Read the current data for a collection (from the active branch's HEAD).
 ///
@@ -922,6 +923,528 @@ pub fn read_rows_i64(
     Ok(result)
 }
 
+// ---------------------------------------------------------------------------
+// General pruned JSON row reader — ALL column types (CRITIQUE C1 fix)
+//
+// `read_rows_i64` pioneered the pruned pipeline but is i64-only; the pyo3
+// `read_rows` and SQL executor paths decoded FULL blobs per row group with
+// no pruning. This reader generalizes the pipeline to every PND2 value
+// type and returns JSON rows:
+//   PMAN v3 leaf pruning → zone-map pruning → parallel bloom pre-check →
+//   slab-aware coalesced range reads → projection pushdown → columnar
+//   row pre-filter.
+// ---------------------------------------------------------------------------
+
+/// Pruned, projection-pushed-down JSON row reader for a collection's HEAD data.
+///
+/// Returns `(rowid, JsonValue)` pairs from HEAD row groups ONLY — shards are
+/// the caller's CRDT responsibility (`shard::read_with_shards` + merge).
+///
+/// Predicates are applied as a CONSERVATIVE pre-filter (PMAN v3 leaf pruning,
+/// zone maps, slab blooms, columnar filter): a HEAD row dropped here can
+/// still be delivered by its shard copy, because the AUTHORITATIVE row
+/// filter must run post-CRDT-merge in the caller (a row whose HEAD version
+/// doesn't match can be updated in a shard to match, and vice versa).
+/// Callers that don't re-check predicates after the merge WILL see
+/// false negatives on shard-updated rows.
+///
+/// Args:
+///   - kernel: The PondKernel handle
+///   - collection: Collection name
+///   - branch: Branch to read from
+///   - key_fields: rowid fallback fields (mirrors the pyo3 `determine_rowid`
+///     order: `_rowid` first, then `key_fields[0]`, then `_key`/`id`/`key`)
+///   - projection: Optional requested columns (None = all columns). CRDT
+///     metadata (`_rowid`/`_version`/`_deleted`/`_tenant`), the rowid
+///     fallback columns and predicate columns are ALWAYS decoded so
+///     post-merge CRDT/RLS/rowid logic sees the same fields the old
+///     full-decode path produced.
+///   - predicates: `(column, op, value)` triples; ops `= == != <> > >= < <=`
+///     are row-filterable, of which `= == < <= > >=` also prune row groups.
+pub fn read_rows_json_pruned(
+    kernel: &PondKernel,
+    collection: &str,
+    branch: &str,
+    key_fields: &[String],
+    projection: Option<&[String]>,
+    predicates: &[(String, String, JsonValue)],
+) -> Result<Vec<(String, JsonValue)>, String> {
+    // 1. Resolve HEAD — a collection with no commits has no HEAD rows; the
+    //    caller proceeds to shards (matches the old pyo3/executor behavior
+    //    of treating "no HEAD" as empty, not as an error).
+    let head = kernel.resolve(&branch_ref(collection, branch));
+    let head_hash = match head {
+        Some(h) => h,
+        None => return Ok(Vec::new()),
+    };
+    read_rows_json_pruned_with_head(kernel, &head_hash, key_fields, projection, predicates)
+}
+
+/// Head-override variant of [`read_rows_json_pruned`]: run the SAME pruned
+/// pipeline from an explicit HEAD hash (a commit hash or a PNPK pack hash;
+/// `commit::resolve_manifest_bytes` handles both). Used by callers that
+/// resolve HEAD through a different ref chain — e.g. the CLI's legacy
+/// bare-collection-ref fallback for pre-branch data — so they cannot bypass
+/// the ONE production read pipeline (ARCHITECTURE.md D4).
+pub fn read_rows_json_pruned_with_head(
+    kernel: &PondKernel,
+    head_hash: &str,
+    key_fields: &[String],
+    projection: Option<&[String]>,
+    predicates: &[(String, String, JsonValue)],
+) -> Result<Vec<(String, JsonValue)>, String> {
+    let manifest_bytes = commit::resolve_manifest_bytes(kernel, head_hash)
+        .map_err(|e| format!("Failed to read manifest: {}", e))?;
+
+    // 2. Peek the schema (v1/v2 flat or v3 root) so predicates can be
+    //    classified by declared column type BEFORE the v3 leaf fetch —
+    //    leaf pruning needs typed key-column predicates up front. This is
+    //    an in-memory re-decode, not a second GET.
+    let (schema, key_col) = peek_manifest_schema(&manifest_bytes)?;
+    let typed = classify_predicates(&schema, &key_col, predicates);
+
+    // 3. PMAN v3 leaf pruning: only typed key-column predicates are passed
+    //    (see classify_predicates for why f64/string predicates never
+    //    reach prune_leaves). v1/v2 manifests decode directly.
+    let manifest = resolve_manifest(
+        kernel,
+        &manifest_bytes,
+        if typed.leaf.is_empty() { None } else { Some(&typed.leaf) },
+    )?;
+
+    // 4. Phase 1 — zone-map pruning (free: manifest stats, no I/O).
+    let zone_map_survivors: Vec<&crate::manifest::RowGroupEntry> = manifest.row_groups.iter()
+        .filter(|rg| !rg.can_prune(&typed.zone))
+        .collect();
+
+    // 5. Phase 2 — parallel bloom pre-check (bounded, 32-way) on slabs that
+    //    still have zone-map survivors, mirroring read_rows_i64.
+    //    slab_bloom_should_skip is total & monotone: it only ever returns
+    //    true when the value is DEFINITELY absent, so parallel execution
+    //    preserves semantics exactly.
+    let mut bloom_skip_slabs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if !typed.bloom.is_empty() {
+        let mut unique_slab_hashes: Vec<&str> = Vec::new();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for rg in &zone_map_survivors {
+            if rg.slab_byte_offset.is_some() && seen.insert(&rg.blob_hash) {
+                unique_slab_hashes.push(&rg.blob_hash);
+            }
+        }
+
+        if !unique_slab_hashes.is_empty() {
+            let skip_flags = std::sync::Arc::new(std::sync::Mutex::new(
+                vec![false; unique_slab_hashes.len()]));
+            std::thread::scope(|s| {
+                let (tx, rx) = std::sync::mpsc::sync_channel(MAX_PARALLEL_RANGE_READS);
+                for _ in 0..MAX_PARALLEL_RANGE_READS {
+                    tx.send(()).unwrap();
+                }
+                let tx = std::sync::Arc::new(tx);
+                for (i, slab_hash) in unique_slab_hashes.iter().enumerate() {
+                    rx.recv().unwrap(); // acquire a parallelism permit (blocks at 32)
+                    let tx = std::sync::Arc::clone(&tx);
+                    let flags = std::sync::Arc::clone(&skip_flags);
+                    let hash = *slab_hash;
+                    let preds_ref = &typed.bloom;
+                    s.spawn(move || {
+                        let skip = slab_bloom_should_skip(kernel, hash, preds_ref);
+                        if let Ok(mut f) = flags.lock() {
+                            f[i] = skip;
+                        }
+                        let _ = tx.send(()); // release the permit
+                    });
+                }
+            });
+            let flags = skip_flags.lock().map_err(|_| "bloom flags mutex poisoned".to_string())?;
+            for (slab_hash, &skip) in unique_slab_hashes.iter().zip(flags.iter()) {
+                if skip {
+                    bloom_skip_slabs.insert(slab_hash.to_string());
+                }
+            }
+        }
+    }
+
+    // Final survivors: zone-map pass minus bloom-negative slabs.
+    let surviving_rgs: Vec<&crate::manifest::RowGroupEntry> = zone_map_survivors.into_iter()
+        .filter(|rg| {
+            !(rg.slab_byte_offset.is_some() && bloom_skip_slabs.contains(&rg.blob_hash))
+        })
+        .collect();
+
+    if surviving_rgs.is_empty() {
+        // Every RG pruned — nothing at HEAD can match.
+        return Ok(Vec::new());
+    }
+
+    // 6. Slab-aware range reads + coalescing for survivors ONLY (handles
+    //    standalone blobs, PSLB slab offsets and PSLB v2 zstd).
+    let blob_data_list = read_rgs_slab_aware_with_decompress(kernel, &surviving_rgs)?;
+
+    // 7. Projection pushdown. pnd2_decode_projected skips non-member
+    //    columns entirely (no memcpy, no decode). The always-decoded set
+    //    preserves the old full-decode row shape for everything downstream
+    //    of the CRDT merge depends on.
+    let decode_set: Option<std::collections::HashSet<&str>> = projection.map(|proj| {
+        let mut set: std::collections::HashSet<&str> =
+            proj.iter().map(|s| s.as_str()).collect();
+        // CRDT metadata: merge key (_rowid), LWW clock (_version),
+        // tombstones (_deleted), RLS tenant (_tenant).
+        // Rowid fallbacks + key fields: determine_rowid probes these when
+        // _rowid is absent (write_rows_no_crdt data); omitting them would
+        // silently change CRDT grouping for such rows.
+        for meta in ["_rowid", "_version", "_deleted", "_tenant", "_key", "id", "key"] {
+            set.insert(meta);
+        }
+        for kf in key_fields {
+            set.insert(kf.as_str());
+        }
+        // Predicate columns: the row-level pre-filter below needs them.
+        for (col, _, _) in predicates {
+            set.insert(col.as_str());
+        }
+        set
+    });
+
+    // 8. Decode + conservative columnar row pre-filter, then assemble JSON
+    //    rows. Rows that fail the pre-filter are never converted to JSON.
+    let mut rows: Vec<(String, JsonValue)> = Vec::new();
+    for blob_data in &blob_data_list {
+        let cols = pond_core::pnd2_decode_projected(blob_data, decode_set.as_ref())
+            .map_err(|e| format!("Failed to decode PND2 blob: {}", e))?;
+        if predicates.is_empty() {
+            rows.extend(json_rows_from_cols(&cols, key_fields, None));
+        } else {
+            let mask = columnar_filter_scalar(&cols, predicates);
+            rows.extend(json_rows_from_cols(&cols, key_fields, Some(&mask)));
+        }
+    }
+    Ok(rows)
+}
+
+/// Peek the schema (columns + key column) out of manifest bytes without
+/// fetching leaves. Handles PMAN v1/v2 (flat) and v3 (root) formats.
+fn peek_manifest_schema(
+    manifest_bytes: &[u8],
+) -> Result<(Vec<(String, u8)>, String), String> {
+    match pman_version(manifest_bytes) {
+        Some(3) => {
+            let root = RootManifest::decode(manifest_bytes)
+                .ok_or_else(|| "Failed to decode PMAN v3 root manifest".to_string())?;
+            Ok((root.columns, root.key_col))
+        }
+        Some(1) | Some(2) => {
+            let m = CollectionManifest::decode(manifest_bytes)
+                .ok_or_else(|| "Failed to decode PMAN manifest".to_string())?;
+            Ok((m.columns, m.key_col))
+        }
+        _ => Err("Unknown manifest format (not PMAN)".to_string()),
+    }
+}
+
+/// Predicates classified against a manifest schema for stats-based pruning.
+struct TypedPredicates {
+    /// Zone-map-checkable comparisons: (col, op, typed LE bytes). Only
+    /// INT64/FLOAT64 stats with ops `= < <= > >=` — exactly the combinations
+    /// `ColumnStatsEntry::can_prune` answers definitively.
+    zone: Vec<(String, String, Vec<u8>)>,
+    /// INT64 equality subset — the ONLY kind a slab bloom can definitively
+    /// rule out: slab blooms are built from i64 LE bytes exclusively
+    /// (write_rows_i64_slab + SlabWriter insert i64 values only), so an
+    /// f64/string equality that bloom-misses is a false negative, not a
+    /// proof of absence.
+    bloom: Vec<(String, String, Vec<u8>)>,
+    /// INT64 comparisons on the manifest key column — the ONLY kind
+    /// `RootManifest::prune_leaves` interprets correctly: it compares raw
+    /// stats bytes as SIGNED i64, and f64 bit patterns read as signed i64
+    /// invert ordering across negative values (−2.0 > −1.0 as doubles but
+    /// −2.0's bits < −1.0's bits as i64), which would mis-prune leaves.
+    leaf: Vec<(String, String, Vec<u8>)>,
+}
+
+/// Split caller predicates into stats-prunable classes. Predicates that
+/// cannot be answered from manifest stats (unknown column, `!=`/`<>`, `in`,
+/// like, is-null, mistyped values, string columns whose stats can_prune
+/// ignores) are simply not pushed to the pruning layers — they still run in
+/// the columnar row filter, which is type-tolerant.
+fn classify_predicates(
+    schema: &[(String, u8)],
+    key_col: &str,
+    predicates: &[(String, String, JsonValue)],
+) -> TypedPredicates {
+    let mut out = TypedPredicates { zone: Vec::new(), bloom: Vec::new(), leaf: Vec::new() };
+    for (col, op, val) in predicates {
+        let Some(vtype) = schema.iter()
+            .find(|(name, _)| name == col)
+            .map(|(_, t)| *t)
+        else {
+            continue; // not a schema column — no stats to prune with
+        };
+        // "==" is a synonym for "=" everywhere in this codebase; can_prune
+        // matches the bare forms only.
+        let op = if op == "==" { "=" } else { op.as_str() };
+        if !matches!(op, "=" | "<" | "<=" | ">" | ">=") {
+            continue; // min/max cannot answer !=, <>, in, like, is-null
+        }
+        match vtype {
+            pond_core::VT_INT64 => {
+                // A float-typed JSON value against an INT64 column has no
+                // stats representation — skip (conservative).
+                if let Some(i) = val.as_i64() {
+                    let bytes = i.to_le_bytes().to_vec();
+                    if col == key_col {
+                        out.leaf.push((col.clone(), op.to_string(), bytes.clone()));
+                    }
+                    if op == "=" {
+                        out.bloom.push((col.clone(), op.to_string(), bytes.clone()));
+                    }
+                    out.zone.push((col.clone(), op.to_string(), bytes));
+                }
+            }
+            pond_core::VT_FLOAT64 => {
+                // as_f64 accepts integral JSON numbers too, so `score > 3`
+                // and `score > 3.5` both prune.
+                if let Some(f) = val.as_f64() {
+                    out.zone.push((col.clone(), op.to_string(), f.to_le_bytes().to_vec()));
+                }
+            }
+            _ => {} // STRING/BINARY/VARIANT stats exist but can_prune ignores them
+        }
+    }
+    out
+}
+
+/// Scalar comparison for the columnar pre-filter. Unknown ops keep the
+/// row — the authoritative post-merge filter is type/op-tolerant, so the
+/// pre-filter must never be narrower than it.
+fn scalar_cmp_op<T: PartialOrd + PartialEq + ?Sized>(v: &T, target: &T, op: &str) -> bool {
+    match op {
+        "=" | "==" => *v == *target,
+        "!=" | "<>" => *v != *target,
+        ">" => *v > *target,
+        ">=" => *v >= *target,
+        "<" => *v < *target,
+        "<=" => *v <= *target,
+        _ => true, // unknown op — keep (conservative)
+    }
+}
+
+/// Scalar mirror of the pyo3 `simd::columnar_filter` (bindings/python/pyo3
+/// src/simd.rs) — identical comparison semantics, no SIMD. Kept in this
+/// crate so pond_storage cannot depend on the pyo3 binding; it only has to
+/// be conservative-correct, not fast, since it pre-filters rows that the
+/// caller re-checks post-CRDT-merge.
+///
+/// Semantics per column vtype (mirrored exactly):
+///   INT64  + i64 JSON value  → = == != <> > >= < <= ; unknown op keeps all
+///   FLOAT64 + any number     → same op set; unknown op keeps all
+///                              (deliberate fix: simd::columnar_filter's
+///                              f64 arm dropped ALL rows on unknown ops,
+///                              which the post-merge filter keeps)
+///   STRING + str JSON value  → lexicographic = == != <> > >= < <= against
+///                              `value.as_str().unwrap_or("")` — a non-string
+///                              value compares against "" (pyo3 parity)
+///   other vtypes / missing column / mistyped value → no filtering (keep)
+fn columnar_filter_scalar(
+    cols: &[pond_core::PondColumn],
+    predicates: &[(String, String, JsonValue)],
+) -> Vec<bool> {
+    use pond_core::{VT_FLOAT64, VT_INT64, VT_STRING};
+
+    let n_rows = cols.first().map(|c| c.n_values).unwrap_or(0);
+    if n_rows == 0 || predicates.is_empty() {
+        return vec![true; n_rows];
+    }
+
+    let mut keep_mask = vec![true; n_rows];
+    for (col_name, op, value) in predicates {
+        let Some(col) = cols.iter().find(|c| c.name.to_string_lossy() == col_name.as_str()) else {
+            continue; // column not decoded/present — don't filter
+        };
+
+        match col.vtype {
+            // Boolean: compare the 0/1 i64 payload against a JSON bool
+            // (true → 1, false → 0). Zone maps never see VT_BOOLEAN
+            // (classify_predicates skips it), so this is row-level only.
+            pond_core::VT_BOOLEAN => {
+                if let Some(target) = value.as_bool().map(|b| b as i64) {
+                    for (i, v) in col.i64_data.iter().enumerate() {
+                        if i >= n_rows {
+                            break;
+                        }
+                        if keep_mask[i] {
+                            keep_mask[i] = scalar_cmp_op(v, &target, op);
+                        }
+                    }
+                }
+            }
+            VT_INT64 => {
+                if let Some(target) = value.as_i64() {
+                    for (i, v) in col.i64_data.iter().enumerate() {
+                        if i >= n_rows {
+                            break;
+                        }
+                        if keep_mask[i] {
+                            keep_mask[i] = scalar_cmp_op(v, &target, op);
+                        }
+                    }
+                }
+            }
+            VT_FLOAT64 => {
+                if let Some(target) = value.as_f64() {
+                    for (i, v) in col.f64_data.iter().enumerate() {
+                        if i >= n_rows {
+                            break;
+                        }
+                        if keep_mask[i] {
+                            keep_mask[i] = scalar_cmp_op(v, &target, op);
+                        }
+                    }
+                }
+            }
+            VT_STRING => {
+                let target = value.as_str().unwrap_or("");
+                for (i, s) in col.str_data.iter().enumerate() {
+                    if i >= n_rows {
+                        break;
+                    }
+                    if keep_mask[i] {
+                        let cell = s.to_string_lossy();
+                        keep_mask[i] = scalar_cmp_op(cell.as_ref(), target, op);
+                    }
+                }
+            }
+            _ => {} // VARIANT/BINARY/NULL — not comparable at column level
+        }
+    }
+    keep_mask
+}
+
+/// Assemble `(rowid, JSON row)` pairs from decoded PND2 columns, skipping
+/// rows the keep mask rejects. Faithful mirror of the pyo3
+/// `decode_cols_to_rows_filtered` row-assembly semantics:
+///   INT64 → Number, FLOAT64 → Number, STRING → String, BOOLEAN → Bool,
+///   BINARY → `__bin_b64__:<base64>` (same alphabet/padding as pyo3),
+///   VARIANT → the stored JSON text parsed back into a JSON value.
+fn json_rows_from_cols(
+    cols: &[pond_core::PondColumn],
+    key_fields: &[String],
+    keep_mask: Option<&[bool]>,
+) -> Vec<(String, JsonValue)> {
+    use pond_core::{VT_BINARY, VT_BOOLEAN, VT_FLOAT64, VT_INT64, VT_STRING};
+
+    let mut rows = Vec::new();
+    let n_rows = cols.first().map(|c| c.n_values).unwrap_or(0);
+
+    for row_idx in 0..n_rows {
+        // Pre-filtered rows are never converted to JSON — the whole point
+        // of the columnar pre-filter.
+        if let Some(mask) = keep_mask {
+            if !mask[row_idx] {
+                continue;
+            }
+        }
+
+        let mut row_obj = serde_json::Map::new();
+        for col in cols {
+            let name = col.name.to_string_lossy().to_string();
+            let val = match col.vtype {
+                VT_INT64 => col.i64_data.get(row_idx)
+                    .map(|v| JsonValue::Number(serde_json::Number::from(*v)))
+                    .unwrap_or(JsonValue::Null),
+                VT_FLOAT64 => col.f64_data.get(row_idx)
+                    .and_then(|v| serde_json::Number::from_f64(*v))
+                    .map(JsonValue::Number)
+                    .unwrap_or(JsonValue::Null),
+                VT_STRING => col.str_data.get(row_idx)
+                    .map(|v| JsonValue::String(v.to_string_lossy().to_string()))
+                    .unwrap_or(JsonValue::Null),
+                VT_BINARY => col.bin_data.get(row_idx)
+                    .map(|b| JsonValue::String(format!("__bin_b64__:{}", base64_encode(b))))
+                    .unwrap_or(JsonValue::Null),
+                // Boolean: PND2 stores bools as 0/1 in i64_data (the CLI's
+                // legacy decode path mapped them the same way).
+                VT_BOOLEAN => col.i64_data.get(row_idx)
+                    .map(|v| JsonValue::Bool(*v != 0))
+                    .unwrap_or(JsonValue::Null),
+                // Variant: JSON-encoded string — parse back to a JSON value.
+                _ => col.str_data.get(row_idx)
+                    .and_then(|s| serde_json::from_str::<JsonValue>(&s.to_string_lossy()).ok())
+                    .unwrap_or(JsonValue::Null),
+            };
+            row_obj.insert(name, val);
+        }
+        let row = JsonValue::Object(row_obj);
+        let rowid = determine_rowid_json(&row, key_fields);
+        rows.push((rowid, row));
+    }
+    rows
+}
+
+/// Determine the rowid for a row — mirror of the pyo3 `determine_rowid`
+/// (bindings/python/pyo3 src/lib.rs): `_rowid` (str, then i64), first
+/// key_field (str, then i64), `_key`/`id`/`key` (str, then i64), then a
+/// DefaultHasher digest of the row JSON. The exact order matters: it
+/// decides CRDT grouping for rows that lack `_rowid`.
+fn determine_rowid_json(row: &JsonValue, key_fields: &[String]) -> String {
+    if let Some(r) = row.get("_rowid").and_then(|v| v.as_str()) {
+        return r.to_string();
+    }
+    if let Some(n) = row.get("_rowid").and_then(|v| v.as_i64()) {
+        return n.to_string();
+    }
+    if let Some(kf) = key_fields.first() {
+        if let Some(s) = row.get(kf).and_then(|v| v.as_str()) {
+            return s.to_string();
+        }
+        if let Some(n) = row.get(kf).and_then(|v| v.as_i64()) {
+            return n.to_string();
+        }
+    }
+    for fallback in ["_key", "id", "key"] {
+        if let Some(s) = row.get(fallback).and_then(|v| v.as_str()) {
+            return s.to_string();
+        }
+        if let Some(n) = row.get(fallback).and_then(|v| v.as_i64()) {
+            return n.to_string();
+        }
+    }
+    // Last resort: hash the row.
+    let s = serde_json::to_string(row).unwrap_or_default();
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Standard base64 (RFC 4648, padded) — byte-identical to the pyo3
+/// `base64_encode` and executor `simple_base64_encode` so `__bin_b64__`
+/// round-trips produce the same strings on every read path.
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        result.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
+        result.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(CHARS[(triple & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
+}
+
 /// Indexed point lookup: read a single row by key column using the BPTX index.
 ///
 /// This is the **fast path** for primary-key lookups. Instead of scanning all
@@ -1489,6 +2012,615 @@ mod tests {
         let score_col = cols.iter().find(|(n, _)| n == "score").expect("score column");
         assert_eq!(id_col.1, ids);
         assert_eq!(score_col.1, scores);
+    }
+
+    // ------------------------------------------------------------------
+    // read_rows_json_pruned — the general pruned JSON read pipeline
+    // ------------------------------------------------------------------
+
+    /// Byte-counting ObjectStore wrapper — measures the bytes the read path
+    /// actually transfers (the ACCEPTANCE.md ≤10%-of-full-scan budget is
+    /// measured through this). Counts only blob payloads (get_blob /
+    /// get_blob_range / get_blob_suffix / get_blob_batch); ref-path reads
+    /// are identical on both sides of every comparison, so they cancel.
+    struct CountingStore {
+        inner: pond_kernel::LocalFSObjectStore,
+        bytes_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl CountingStore {
+        fn new(dir: &std::path::Path) -> Self {
+            Self {
+                inner: pond_kernel::LocalFSObjectStore::new(dir).unwrap(),
+                bytes_read: std::sync::Arc::new(
+                    std::sync::atomic::AtomicU64::new(0)),
+            }
+        }
+    }
+
+    impl pond_kernel::ObjectStore for CountingStore {
+        fn put_blob(&self, data: &[u8]) -> std::io::Result<String> {
+            self.inner.put_blob(data)
+        }
+        fn get_blob(&self, hash: &str) -> std::io::Result<Vec<u8>> {
+            let d = self.inner.get_blob(hash)?;
+            self.bytes_read.fetch_add(d.len() as u64,
+                std::sync::atomic::Ordering::SeqCst);
+            Ok(d)
+        }
+        fn get_blob_batch(&self, hashes: &[String]) -> std::io::Result<Vec<Vec<u8>>> {
+            let results = self.inner.get_blob_batch(hashes)?;
+            let total: usize = results.iter().map(|r| r.len()).sum();
+            self.bytes_read.fetch_add(total as u64,
+                std::sync::atomic::Ordering::SeqCst);
+            Ok(results)
+        }
+        fn put_path(&self, path: &str, hash: &str) -> std::io::Result<()> {
+            self.inner.put_path(path, hash)
+        }
+        fn get_path(&self, path: &str) -> Option<String> {
+            self.inner.get_path(path)
+        }
+        fn delete_path(&self, path: &str) -> std::io::Result<bool> {
+            self.inner.delete_path(path)
+        }
+        fn list_paths(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+            self.inner.list_paths(prefix)
+        }
+        fn blob_exists(&self, hash: &str) -> bool {
+            self.inner.blob_exists(hash)
+        }
+        fn delete_blob(&self, hash: &str) -> std::io::Result<bool> {
+            self.inner.delete_blob(hash)
+        }
+        fn get_blob_range(&self, hash: &str, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
+            let d = self.inner.get_blob_range(hash, start, end)?;
+            self.bytes_read.fetch_add(d.len() as u64,
+                std::sync::atomic::Ordering::SeqCst);
+            Ok(d)
+        }
+        fn get_blob_suffix(&self, hash: &str, n: u64) -> std::io::Result<Vec<u8>> {
+            let d = self.inner.get_blob_suffix(hash, n)?;
+            self.bytes_read.fetch_add(d.len() as u64,
+                std::sync::atomic::Ordering::SeqCst);
+            Ok(d)
+        }
+    }
+
+    /// Write a collection whose manifest holds K standalone (non-slab) row
+    /// groups of mixed typed columns — mirrors write_rows_inner's manifest/
+    /// commit layout but with one RG per batch. Used to exercise the pruned
+    /// reader against multi-RG collections of every PND2 value type.
+    fn write_multi_rg_typed(
+        kernel: &PondKernel,
+        collection: &str,
+        branch: &str,
+        rgs: &[Vec<(&str, pond_core::TypedColumn)>],
+        message: &str,
+    ) -> Result<String, String> {
+        use crate::manifest::{CollectionManifest, ColumnStatsEntry, RowGroupEntry};
+
+        assert!(!rgs.is_empty());
+        let schema: Vec<(String, u8)> = rgs[0].iter()
+            .map(|(name, col)| (name.to_string(), col.vtype()))
+            .collect();
+        let key_col = rgs[0].first()
+            .map(|(name, _)| name.to_string())
+            .unwrap_or_default();
+        let mut manifest = CollectionManifest::new(schema, key_col);
+
+        for (i, rg_cols) in rgs.iter().enumerate() {
+            let blob = pond_core::pnd2_encode_multi_typed(rg_cols);
+            let blob_hash = kernel.write(&blob).map_err(|e| e.to_string())?;
+            let n_rows = rg_cols.first().map(|(_, c)| c.len()).unwrap_or(0) as u32;
+            let col_stats: Vec<ColumnStatsEntry> = rg_cols.iter().map(|(name, col)| {
+                let (min, max) = col.min_max_bytes()
+                    .map(|(mn, mx)| (Some(mn), Some(mx)))
+                    .unwrap_or((None, None));
+                ColumnStatsEntry {
+                    name: name.to_string(),
+                    value_type: col.vtype(),
+                    min,
+                    max,
+                    null_count: 0,
+                }
+            }).collect();
+            manifest.add_row_group(RowGroupEntry {
+                key: format!("rg_{:010}", i),
+                blob_hash,
+                n_rows,
+                columns: col_stats,
+                slab_byte_offset: None,
+                slab_byte_len: None,
+            });
+        }
+
+        let manifest_bytes = manifest.encode();
+        let manifest_hash = kernel.write(&manifest_bytes).map_err(|e| e.to_string())?;
+        let parent = kernel.resolve(&branch_ref(collection, branch));
+        let parent_index = parent.as_ref()
+            .and_then(|p| crate::commit::read_commit(kernel, p))
+            .map(|c| c.index + 1)
+            .unwrap_or(0);
+        let commit_hash = crate::commit::write_commit(
+            kernel, collection, &manifest_hash, parent.as_deref(), None,
+            message, parent_index,
+        ).map_err(|e| e.to_string())?;
+        kernel.reference(&branch_ref(collection, branch), &commit_hash)
+            .map_err(|e| e.to_string())?;
+        Ok(commit_hash)
+    }
+
+    /// Emulate the OLD pyo3 HEAD read path: resolve HEAD + manifest, then
+    /// one FULL `read_blob` per row group. This is what
+    /// read_collection_as_json_rows_filtered did before the pruned-reader
+    /// routing (and for slab-backed RGs it fetched the ENTIRE slab once per
+    /// RG — 16 RGs in one slab = 16 full-slab GETs).
+    fn old_full_scan_bytes(kernel: &PondKernel, collection: &str, branch: &str) -> usize {
+        let head = kernel.resolve(&branch_ref(collection, branch)).unwrap();
+        let manifest_bytes = crate::commit::resolve_manifest_bytes(kernel, &head).unwrap();
+        let manifest = crate::manifest::CollectionManifest::decode(&manifest_bytes).unwrap();
+        let mut total = 0usize;
+        for rg in &manifest.row_groups {
+            total += kernel.read_blob(&rg.blob_hash).unwrap().len();
+        }
+        total
+    }
+
+    /// Byte-savings budget (ACCEPTANCE.md): a pruned read must transfer
+    /// ≤ 10% of the bytes the old full-scan path transfers, measured via a
+    /// counting ObjectStore. Standalone multi-RG layout: 24 RGs, an
+    /// equality predicate on `id` leaves exactly 1 RG alive.
+    #[test]
+    fn test_read_rows_json_pruned_byte_savings_standalone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CountingStore::new(dir.path());
+        let counter = store.bytes_read.clone();
+        let kernel = &PondKernel::new_with_store(Box::new(store));
+
+        const N_RGS: usize = 24;
+        const ROWS_PER_RG: usize = 100;
+        // 60-char payload keeps blob bytes dominant over ref/manifest
+        // overhead on both sides of the comparison.
+        let mut rgs: Vec<Vec<(&str, pond_core::TypedColumn)>> = Vec::new();
+        for rg in 0..N_RGS {
+            let ids: Vec<i64> = (0..ROWS_PER_RG).map(|i| (rg * 1000 + i) as i64).collect();
+            let payloads: Vec<String> = (0..ROWS_PER_RG)
+                .map(|i| format!("payload-{}-{}", rg, "x".repeat(60 - i.to_string().len())))
+                .collect();
+            rgs.push(vec![
+                ("id", pond_core::TypedColumn::Int64(ids)),
+                ("payload", pond_core::TypedColumn::String(payloads)),
+            ]);
+        }
+        write_multi_rg_typed(kernel, "budget", "main", &rgs, "seed").unwrap();
+
+        // Baseline: the OLD path's bytes (manifest resolve + N full GETs).
+        counter.store(0, std::sync::atomic::Ordering::SeqCst);
+        let old_bytes = old_full_scan_bytes(kernel, "budget", "main");
+        assert!(old_bytes > 0);
+
+        // Pruned read: id=15_042 lives in exactly one RG (zone-map prunes
+        // the other 23); the columnar filter then reduces to one row.
+        counter.store(0, std::sync::atomic::Ordering::SeqCst);
+        let preds = vec![("id".to_string(), "=".to_string(), serde_json::json!(15_042))];
+        let rows = read_rows_json_pruned(kernel, "budget", "main", &["_rowid".to_string()], None, &preds).unwrap();
+        let pruned_bytes = counter.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(rows.len(), 1, "exactly one row matches id=15042");
+        assert_eq!(rows[0].1["id"], serde_json::json!(15_042));
+
+        let ratio = pruned_bytes as f64 / old_bytes as f64;
+        assert!(ratio <= 0.10,
+            "pruned read transferred {:.1}% of the old full-scan bytes \
+             ({} of {} bytes) — budget is 10%",
+            ratio * 100.0, pruned_bytes, old_bytes);
+    }
+
+    /// Same ≤10% budget on a SLAB-backed layout (write_rows_i64_slab): the
+    /// old path fetched the ENTIRE slab once per RG (N×slab bytes); the
+    /// pruned path reads header + tail + footer (bloom check) + ONE RG's
+    /// byte range.
+    #[test]
+    fn test_read_rows_json_pruned_byte_savings_slab() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CountingStore::new(dir.path());
+        let counter = store.bytes_read.clone();
+        let kernel = &PondKernel::new_with_store(Box::new(store));
+
+        const N_RGS: usize = 16;
+        const ROWS_PER_RG: usize = 1000;
+        let mut id_data: Vec<Vec<i64>> = Vec::new();
+        let mut val_data: Vec<Vec<i64>> = Vec::new();
+        for rg in 0..N_RGS {
+            let ids: Vec<i64> = (0..ROWS_PER_RG).map(|i| (rg * 1000 + i) as i64).collect();
+            let vals: Vec<i64> = ids.iter().map(|i| i * 10).collect();
+            id_data.push(ids);
+            val_data.push(vals);
+        }
+        let row_groups: Vec<Vec<(&str, &[i64])>> = (0..N_RGS)
+            .map(|rg| vec![("id", id_data[rg].as_slice()), ("val", val_data[rg].as_slice())])
+            .collect();
+        let rg_refs: Vec<&[(&str, &[i64])]> = row_groups.iter().map(|rg| rg.as_slice()).collect();
+        crate::write::write_rows_i64_slab(kernel, "slab_budget", "main", &rg_refs, "slab seed").unwrap();
+
+        // Baseline: the OLD path — one FULL slab GET per RG. (The old path
+        // couldn't even decode those bytes — PSLB slabs aren't PND2 blobs —
+        // but the transfer cost is what the budget measures.)
+        counter.store(0, std::sync::atomic::Ordering::SeqCst);
+        let old_bytes = old_full_scan_bytes(kernel, "slab_budget", "main");
+        assert!(old_bytes > 0);
+
+        // Pruned read: id=15_500 → zone maps keep RG 15; the slab bloom
+        // confirms presence (hit → no skip); one RG range is fetched.
+        counter.store(0, std::sync::atomic::Ordering::SeqCst);
+        let preds = vec![("id".to_string(), "=".to_string(), serde_json::json!(15_500))];
+        let rows = read_rows_json_pruned(kernel, "slab_budget", "main", &["_rowid".to_string()], None, &preds).unwrap();
+        let pruned_bytes = counter.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(rows.len(), 1, "exactly one row matches id=15500");
+        assert_eq!(rows[0].1["id"], serde_json::json!(15_500));
+        assert_eq!(rows[0].1["val"], serde_json::json!(155_000));
+
+        let ratio = pruned_bytes as f64 / old_bytes as f64;
+        assert!(ratio <= 0.10,
+            "pruned slab read transferred {:.1}% of the old full-scan bytes \
+             ({} of {} bytes) — budget is 10%",
+            ratio * 100.0, pruned_bytes, old_bytes);
+    }
+
+    /// A predicate that matches NOTHING prunes every RG: no data bytes are
+    /// read — only the commit + manifest resolve (metadata), which is a
+    /// small fraction of even a single RG's payload here.
+    #[test]
+    fn test_read_rows_json_pruned_no_match_reads_no_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CountingStore::new(dir.path());
+        let counter = store.bytes_read.clone();
+        let kernel = &PondKernel::new_with_store(Box::new(store));
+
+        // 8 RGs × 100 rows × 60-char payloads — payload bytes dominate the
+        // commit/manifest metadata so the ratio assertion is meaningful.
+        let mut rgs: Vec<Vec<(&str, pond_core::TypedColumn)>> = Vec::new();
+        for rg in 0..8 {
+            let ids: Vec<i64> = (0..100).map(|i| (rg * 1000 + i) as i64).collect();
+            let payloads: Vec<String> = (0..100)
+                .map(|i| format!("nopayload-{}-{}", rg, "x".repeat(50 - i.to_string().len())))
+                .collect();
+            rgs.push(vec![
+                ("id", pond_core::TypedColumn::Int64(ids)),
+                ("payload", pond_core::TypedColumn::String(payloads)),
+            ]);
+        }
+        write_multi_rg_typed(kernel, "nomatch", "main", &rgs, "seed").unwrap();
+
+        counter.store(0, std::sync::atomic::Ordering::SeqCst);
+        let old_bytes = old_full_scan_bytes(kernel, "nomatch", "main");
+        assert!(old_bytes > 0);
+
+        counter.store(0, std::sync::atomic::Ordering::SeqCst);
+        let preds = vec![("id".to_string(), "=".to_string(), serde_json::json!(-999_999))];
+        let rows = read_rows_json_pruned(kernel, "nomatch", "main", &["_rowid".to_string()], None, &preds).unwrap();
+        let pruned_bytes = counter.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert!(rows.is_empty(), "no row can match id=-999999");
+
+        // Only the commit + manifest blobs were fetched — every data blob
+        // was skipped outright.
+        let ratio = pruned_bytes as f64 / old_bytes as f64;
+        assert!(ratio <= 0.10,
+            "all-RGs-pruned read transferred {:.1}% of the old full-scan bytes \
+             ({} of {} bytes)",
+            ratio * 100.0, pruned_bytes, old_bytes);
+    }
+
+    /// Correctness across ALL column types: the pruned+pre-filtered result
+    /// must equal the ground truth computed from the same input data, for
+    /// predicates on i64 / f64 / string columns and combinations. VT_VARIANT
+    /// (nested JSON incl. bools and nulls) and VT_BINARY round-trip through
+    /// the row assembly.
+    #[test]
+    fn test_read_rows_json_pruned_mixed_types_correctness() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        const N_RGS: usize = 4;
+        const ROWS_PER_RG: usize = 25;
+
+        // Build the input data + the ground-truth JSON rows side by side.
+        let mut rgs: Vec<Vec<(&str, pond_core::TypedColumn)>> = Vec::new();
+        let mut truth: Vec<JsonValue> = Vec::new();
+        let mut id = 0i64;
+        for _rg in 0..N_RGS {
+            let mut ids = Vec::new();
+            let mut scores = Vec::new();
+            let mut names = Vec::new();
+            let mut metas = Vec::new();
+            let mut blobs = Vec::new();
+            let mut rowids = Vec::new();
+            let mut versions = Vec::new();
+            for _r in 0..ROWS_PER_RG {
+                let score = (id as f64) * 0.25;
+                let name = format!("user_{}", id);
+                // Variant: mixed JSON — bools, nulls, nested objects.
+                let meta = if id % 3 == 0 {
+                    serde_json::json!({"flag": true, "nested": {"k": id}, "gap": null})
+                } else if id % 3 == 1 {
+                    serde_json::json!([id, "tag", false])
+                } else {
+                    serde_json::json!(id)
+                };
+                let blob: Vec<u8> = vec![0xDE, 0xAD, (id % 256) as u8];
+                let rowid = format!("rid_{:04}", id);
+                let version = format!("v_{:04}", id);
+
+                truth.push(serde_json::json!({
+                    "id": id,
+                    "score": score,
+                    "name": name,
+                    "meta": meta,
+                    "blob": format!("__bin_b64__:{}", base64_encode(&blob)),
+                    "_rowid": rowid,
+                    "_version": version,
+                }));
+
+                ids.push(id);
+                scores.push(score);
+                names.push(name);
+                metas.push(meta.to_string());
+                blobs.push(blob);
+                rowids.push(rowid);
+                versions.push(version);
+                id += 1;
+            }
+            rgs.push(vec![
+                ("id", pond_core::TypedColumn::Int64(ids)),
+                ("score", pond_core::TypedColumn::Float64(scores)),
+                ("name", pond_core::TypedColumn::String(names)),
+                ("meta", pond_core::TypedColumn::Variant(metas)),
+                ("blob", pond_core::TypedColumn::Binary(blobs)),
+                ("_rowid", pond_core::TypedColumn::String(rowids)),
+                ("_version", pond_core::TypedColumn::String(versions)),
+            ]);
+        }
+        write_multi_rg_typed(kernel, "mixed", "main", &rgs, "seed").unwrap();
+
+        let kc = vec!["_rowid".to_string()];
+
+        // Ground truth for a predicate = truth rows whose JSON cells satisfy
+        // the same scalar semantics the columnar pre-filter uses.
+        let expected = |col: &str, op: &str, target: JsonValue| -> Vec<JsonValue> {
+            truth.iter().filter(|row| {
+                let cell = &row[col];
+                match (cell, &target) {
+                    (JsonValue::Number(a), JsonValue::Number(b)) => {
+                        let (a, b) = (a.as_f64().unwrap(), b.as_f64().unwrap());
+                        match op {
+                            "=" | "==" => a == b,
+                            "!=" | "<>" => a != b,
+                            ">" => a > b,
+                            ">=" => a >= b,
+                            "<" => a < b,
+                            "<=" => a <= b,
+                            _ => true,
+                        }
+                    }
+                    (JsonValue::String(a), JsonValue::String(b)) => match op {
+                        "=" | "==" => a == b,
+                        "!=" | "<>" => a != b,
+                        ">" => a > b,
+                        ">=" => a >= b,
+                        "<" => a < b,
+                        "<=" => a <= b,
+                        _ => true,
+                    },
+                    _ => true,
+                }
+            }).cloned().collect()
+        };
+
+        let sort_rows = |mut rows: Vec<JsonValue>| -> Vec<JsonValue> {
+            rows.sort_by_key(|r| r["id"].as_i64().unwrap_or(-1));
+            rows
+        };
+
+        // Full scan (no predicates) equals ground truth exactly.
+        let full = read_rows_json_pruned(kernel, "mixed", "main", &kc, None, &[]).unwrap();
+        let full_rows: Vec<JsonValue> = full.into_iter().map(|(_, r)| r).collect();
+        assert_eq!(sort_rows(full_rows), sort_rows(truth.clone()),
+            "unpruned read must round-trip every column type exactly");
+
+        let cases: Vec<(&str, &str, JsonValue)> = vec![
+            ("id", "=", serde_json::json!(42)),
+            ("id", ">", serde_json::json!(90)),
+            ("id", "<=", serde_json::json!(10)),
+            ("id", ">=", serde_json::json!(30)),
+            ("score", "=", serde_json::json!(10.5)),
+            ("score", ">", serde_json::json!(80.0)),
+            ("name", "=", serde_json::json!("user_42")),
+            ("name", "<", serde_json::json!("user_10")),
+        ];
+        for (col, op, val) in cases {
+            let preds = vec![(col.to_string(), op.to_string(), val.clone())];
+            let got = read_rows_json_pruned(kernel, "mixed", "main", &kc, None, &preds).unwrap();
+            let got_rows: Vec<JsonValue> = got.into_iter().map(|(_, r)| r).collect();
+            assert_eq!(
+                sort_rows(got_rows),
+                sort_rows(expected(col, op, val.clone())),
+                "pruned read with {} {} {} must equal ground truth", col, op, val
+            );
+        }
+
+        // Conjunction of predicates (AND semantics across columns).
+        let preds = vec![
+            ("id".to_string(), ">=".to_string(), serde_json::json!(10)),
+            ("id".to_string(), "<".to_string(), serde_json::json!(20)),
+        ];
+        let got = read_rows_json_pruned(kernel, "mixed", "main", &kc, None, &preds).unwrap();
+        let got_rows: Vec<JsonValue> = got.into_iter().map(|(_, r)| r).collect();
+        assert_eq!(got_rows.len(), 10, "10 <= id < 20");
+        assert!(got_rows.iter().all(|r| {
+            let i = r["id"].as_i64().unwrap();
+            (10..20).contains(&i)
+        }));
+
+        // !=" is row-filterable but must NOT prune RGs (all 100 rows alive,
+        // every row survives the RG-level pass; the filter drops the rest).
+        let preds = vec![("id".to_string(), "!=".to_string(), serde_json::json!(42))];
+        let got = read_rows_json_pruned(kernel, "mixed", "main", &kc, None, &preds).unwrap();
+        assert_eq!(got.len(), 99, "!= keeps every row but id=42");
+    }
+
+    /// CRDT pre-filter safety: the RG/row-level pre-filter is an I/O
+    /// optimization ONLY — a HEAD row it drops is still delivered via its
+    /// shard copy when a shard updated it to match (and a HEAD row it kept
+    /// is removed by the authoritative post-merge filter when a shard
+    /// updated it to no longer match).
+    #[test]
+    fn test_read_rows_json_pruned_crdt_prefilter_safety() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        // HEAD: ids 5, 7, 9 (write_rows auto-adds _rowid + _version).
+        crate::write::write_rows(
+            kernel, "crdt", "main",
+            &[("id", pond_core::TypedColumn::Int64(vec![5, 7, 9]))],
+            "head",
+        ).unwrap();
+
+        let kc = vec!["_rowid".to_string()];
+        let full = read_rows_json_pruned(kernel, "crdt", "main", &kc, None, &[]).unwrap();
+        let rowid_of = |want: i64| -> String {
+            full.iter().find(|(_, r)| r["id"] == serde_json::json!(want))
+                .map(|(rid, _)| rid.clone()).unwrap()
+        };
+        let rid7 = rowid_of(7);
+        let rid9 = rowid_of(9);
+
+        // Observe HEAD versions so the shard writes strictly-newer versions.
+        let mut hlc = pond_kernel::crdt::HLC::new();
+        for (_, row) in &full {
+            if let Some(v) = row.get("_version").and_then(|v| v.as_str()) {
+                hlc.observe(v);
+            }
+        }
+
+        // Case A: HEAD row id=7 does NOT match `id = 5`; a shard updates it
+        // TO match. Case B: HEAD row id=9 does not match either, but its
+        // shard update moves it further away (id=99).
+        let shard_rows = vec![
+            serde_json::json!({"_rowid": rid7, "id": 5, "_deleted": false}),
+            serde_json::json!({"_rowid": rid9, "id": 99, "_deleted": false}),
+        ];
+        crate::shard::upsert_shard(kernel, "crdt", "main", "upd_1", &shard_rows, Some("_rowid"), &mut hlc).unwrap();
+
+        // The caller-side pipeline: pruned HEAD read + shard read + CRDT
+        // merge + authoritative filter (mirrors pyo3 read_rows).
+        let preds = vec![("id".to_string(), "=".to_string(), serde_json::json!(5))];
+        let mut all_rows = read_rows_json_pruned(kernel, "crdt", "main", &kc, None, &preds).unwrap();
+
+        let (_, shards) = crate::shard::read_with_shards(kernel, "crdt", "main");
+        for (_, shard_hash) in shards {
+            let data = kernel.read_blob(&shard_hash).unwrap();
+            let arr: Vec<JsonValue> = serde_json::from_slice(&data).unwrap();
+            for row in arr {
+                let rowid = determine_rowid_json(&row, &kc);
+                all_rows.push((rowid, row));
+            }
+        }
+
+        // Mini CRDT merge: dedup by _rowid, latest _version wins, drop tombstones.
+        let mut latest: std::collections::HashMap<String, (String, JsonValue)> =
+            std::collections::HashMap::new();
+        for (rowid, row) in all_rows {
+            let eff = row.get("_rowid").and_then(|v| v.as_str())
+                .map(|s| s.to_string()).unwrap_or_else(|| rowid.clone());
+            let ver = row.get("_version").and_then(|v| v.as_str())
+                .map(|s| s.to_string()).unwrap_or_default();
+            match latest.get(&eff) {
+                Some((existing, _)) if *existing >= ver => {}
+                _ => {
+                    latest.insert(eff, (ver, row));
+                }
+            }
+        }
+        let merged: Vec<JsonValue> = latest.into_values()
+            .filter(|(_, row)| {
+                !row.get("_deleted").and_then(|v| v.as_bool()).unwrap_or(false)
+            })
+            .map(|(_, row)| row)
+            .filter(|row| row["id"] == serde_json::json!(5)) // authoritative filter
+            .collect();
+
+        let ids: Vec<i64> = {
+            let mut v: Vec<i64> = merged.iter().map(|r| r["id"].as_i64().unwrap_or(-1)).collect();
+            v.sort_unstable();
+            v
+        };
+        // id=5 (HEAD) AND the shard-updated former id=7 row both match; the
+        // former id=9 row (updated to 99) is gone.
+        assert_eq!(ids, vec![5, 5],
+            "shard-updated row must survive the HEAD pre-filter, and the \
+             shard-unmatched row must be dropped post-merge");
+    }
+
+    /// Projection pushdown: requesting a single column decodes ONLY that
+    /// column (+ the CRDT/rowid metadata the post-merge pipeline needs) —
+    /// unrelated payload columns never leave the blob.
+    #[test]
+    fn test_read_rows_json_pruned_projection_pushdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+        let kernel = storage.kernel();
+
+        let rgs: Vec<Vec<(&str, pond_core::TypedColumn)>> = vec![vec![
+            ("id", pond_core::TypedColumn::Int64(vec![1, 2, 3])),
+            ("score", pond_core::TypedColumn::Float64(vec![1.5, 2.5, 3.5])),
+            ("name", pond_core::TypedColumn::String(vec![
+                "a".to_string(), "b".to_string(), "c".to_string()])),
+            ("payload", pond_core::TypedColumn::String(vec![
+                "x".repeat(64), "y".repeat(64), "z".repeat(64)])),
+            ("_rowid", pond_core::TypedColumn::String(vec![
+                "r1".to_string(), "r2".to_string(), "r3".to_string()])),
+            ("_version", pond_core::TypedColumn::String(vec![
+                "v1".to_string(), "v1".to_string(), "v1".to_string()])),
+        ]];
+        write_multi_rg_typed(kernel, "proj", "main", &rgs, "seed").unwrap();
+
+        let kc = vec!["_rowid".to_string()];
+        let projection = vec!["score".to_string()];
+        let rows = read_rows_json_pruned(
+            kernel, "proj", "main", &kc, Some(&projection), &[],
+        ).unwrap();
+
+        assert_eq!(rows.len(), 3);
+        for (rowid, row) in &rows {
+            let obj = row.as_object().unwrap();
+            // The requested column survives.
+            assert!(obj.contains_key("score"), "projected column must decode");
+            // Unrelated payload columns are NOT decoded (pushdown happened).
+            assert!(!obj.contains_key("name"), "non-requested column must not decode");
+            assert!(!obj.contains_key("payload"), "non-requested column must not decode");
+            // CRDT metadata stays decoded — the post-merge pipeline
+            // (determine_rowid/CRDT/RLS) depends on it exactly as the old
+            // full-decode path provided.
+            assert!(obj.contains_key("_rowid"), "CRDT _rowid must decode");
+            assert!(obj.contains_key("_version"), "CRDT _version must decode");
+            assert_eq!(row["_rowid"].as_str().unwrap(), rowid.as_str(),
+                "rowid must come from the decoded _rowid");
+        }
+        assert_eq!(rows[0].1["score"], serde_json::json!(1.5));
+
+        // And with the predicate column outside the projection, it is still
+        // decoded so the pre-filter can evaluate it.
+        let preds = vec![("id".to_string(), ">=".to_string(), serde_json::json!(2))];
+        let rows = read_rows_json_pruned(
+            kernel, "proj", "main", &kc, Some(&projection), &preds,
+        ).unwrap();
+        assert_eq!(rows.len(), 2, "predicate on non-projected column still filters");
+        assert!(rows.iter().all(|(_, r)| r["id"].as_i64().unwrap() >= 2));
     }
 }
 

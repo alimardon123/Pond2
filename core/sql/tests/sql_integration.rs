@@ -925,3 +925,152 @@ fn test_having_no_group_by() {
     .expect("having no group by filtered");
     assert_eq!(result.rows.len(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// WHERE pushdown into the pruned reader (read_rows_json_pruned routing)
+// ---------------------------------------------------------------------------
+
+/// Shard-updated rows must still appear when the UPDATE moved them INTO the
+/// WHERE range — the reader's pre-filter is conservative and the executor's
+/// post-merge WHERE eval is authoritative.
+#[test]
+fn test_where_pushdown_shard_updated_row_appears() {
+    let dir = setup();
+    let storage = open_storage(&dir);
+    seed_users(&storage);
+
+    // UPDATE writes a CRDT shard: bob (25) and erin (28) move to age >= 30.
+    // Their HEAD versions still carry age < 30 — the pre-filter would drop
+    // them if it were (incorrectly) authoritative.
+    execute(&storage, "UPDATE users SET age = 31 WHERE age < 30")
+        .expect("update");
+
+    let result = execute(&storage, "SELECT name, age FROM users WHERE age >= 30")
+        .expect("select after update");
+    // alice (30), carol (35), dave (40), bob (31), erin (31) → 5 rows.
+    assert_eq!(result.rows.len(), 5);
+    let names: Vec<String> = result.rows.iter()
+        .map(|r| row_col(r, "name").as_str().unwrap().to_string())
+        .collect();
+    for want in ["alice", "carol", "dave", "bob", "erin"] {
+        assert!(names.contains(&want.to_string()),
+            "shard-updated row {} must appear in the WHERE >= 30 result", want);
+    }
+}
+
+/// The mirror case: an UPDATE that moves a row OUT of the WHERE range must
+/// remove it from the result (the post-merge WHERE filter drops it).
+#[test]
+fn test_where_pushdown_shard_updated_row_disappears() {
+    let dir = setup();
+    let storage = open_storage(&dir);
+    seed_users(&storage);
+
+    // alice (30) → 22: HEAD still says 30, the shard says 22.
+    execute(&storage, "UPDATE users SET age = 22 WHERE name = 'alice'")
+        .expect("update");
+
+    let result = execute(&storage, "SELECT name FROM users WHERE age >= 30")
+        .expect("select after update");
+    // carol (35), dave (40) → 2 rows; alice must be gone.
+    assert_eq!(result.rows.len(), 2);
+    let names: Vec<String> = result.rows.iter()
+        .map(|r| row_col(r, "name").as_str().unwrap().to_string())
+        .collect();
+    assert!(!names.contains(&"alice".to_string()),
+        "shard-updated row moved out of range must not appear");
+}
+
+/// Non-conjunctive / non-comparison WHERE shapes take the no-pushdown path
+/// and must remain correct.
+#[test]
+fn test_where_or_like_in_not_pushed() {
+    let dir = setup();
+    let storage = open_storage(&dir);
+    seed_users(&storage);
+
+    // OR — not a conjunction, no pushdown.
+    let result = execute(
+        &storage,
+        "SELECT name FROM users WHERE age < 26 OR age > 38",
+    )
+    .expect("or");
+    // bob (25), erin (28)? no — 28 < 26 false; dave (40) → bob + dave.
+    assert_eq!(result.rows.len(), 2);
+
+    // LIKE.
+    let result = execute(
+        &storage,
+        "SELECT name FROM users WHERE name LIKE 'a%'",
+    )
+    .expect("like");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(row_col(&result.rows[0], "name").as_str(), Some("alice"));
+
+    // IN.
+    let result = execute(
+        &storage,
+        "SELECT name FROM users WHERE city IN ('NYC', 'SF')",
+    )
+    .expect("in");
+    // alice + carol (NYC), dave (SF) → 3.
+    assert_eq!(result.rows.len(), 3);
+
+    // NOT — wraps a comparison; the subtree contributes no pushdown.
+    let result = execute(
+        &storage,
+        "SELECT name FROM users WHERE NOT (age >= 30)",
+    )
+    .expect("not");
+    // bob (25) + erin (28) → 2.
+    assert_eq!(result.rows.len(), 2);
+
+    // IS NULL.
+    let result = execute(
+        &storage,
+        "SELECT name FROM users WHERE age IS NULL",
+    )
+    .expect("is null");
+    assert_eq!(result.rows.len(), 0);
+}
+
+/// A conjunction of comparisons pushes BOTH predicates; the result must
+/// match the intersection exactly.
+#[test]
+fn test_where_pushdown_conjunction() {
+    let dir = setup();
+    let storage = open_storage(&dir);
+    seed_users(&storage);
+
+    let result = execute(
+        &storage,
+        "SELECT name FROM users WHERE age >= 25 AND age <= 35 AND city = 'LA'",
+    )
+    .expect("conjunction");
+    // bob (25, LA) + erin (28, LA) → 2. alice is NYC, carol is NYC.
+    assert_eq!(result.rows.len(), 2);
+    let names: Vec<String> = result.rows.iter()
+        .map(|r| row_col(r, "name").as_str().unwrap().to_string())
+        .collect();
+    assert!(names.contains(&"bob".to_string()));
+    assert!(names.contains(&"erin".to_string()));
+}
+
+/// DELETE + SELECT still observes shard-tombstoned rows correctly with the
+/// pruned reader (delete writes tombstone shards; the merge suppresses).
+#[test]
+fn test_where_pushdown_after_delete() {
+    let dir = setup();
+    let storage = open_storage(&dir);
+    seed_users(&storage);
+
+    execute(&storage, "DELETE FROM users WHERE age >= 30").expect("delete");
+
+    let result = execute(&storage, "SELECT name FROM users WHERE age >= 30")
+        .expect("select after delete");
+    // alice, carol, dave tombstoned — none remain in range.
+    assert_eq!(result.rows.len(), 0);
+
+    let result = execute(&storage, "SELECT name FROM users").expect("all");
+    assert_eq!(result.rows.len(), 2);
+}

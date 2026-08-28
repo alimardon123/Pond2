@@ -25,7 +25,7 @@
 //   - Config holds Pond-level settings (NOT storage URL — that's passed via --root)
 
 use clap::{Parser, Subcommand};
-use pond_core::{pnd2_decode, TypedColumn, VT_BOOLEAN, VT_FLOAT64, VT_INT64, VT_STRING};
+use pond_core::{TypedColumn, VT_BOOLEAN, VT_FLOAT64, VT_INT64, VT_STRING};
 use pond_kernel::PondKernel;
 use pond_storage::manifest::CollectionManifest;
 use pond_storage::{branch, commit, read, write, UnifiedStorage};
@@ -1110,86 +1110,84 @@ fn read_rows_as_json(
     let kernel = storage.kernel();
     let active = storage.get_active_branch(collection);
 
-    // Resolve HEAD commit.
-    let head = kernel
-        .resolve(&pond_storage::branch_ref(collection, &active))
-        .or_else(|| kernel.resolve(collection))
-        .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
+    // Parse WHERE upfront so the predicates reach the pruned reader
+    // (leaf/zone-map/bloom pruning + columnar pre-filter). The filter
+    // below re-checks every surviving row — the reader's pre-filter is
+    // conservative, this one is authoritative.
+    let predicates: Vec<(String, String, JsonValue)> = match where_filter {
+        Some(w) if !w.trim().is_empty() => parse_where_clause(w)?,
+        _ => Vec::new(),
+    };
 
-    let manifest_bytes = commit::resolve_manifest_bytes(kernel, &head)
-        .map_err(|e| format!("Failed to read manifest: {}", e))?;
-
-    let manifest = CollectionManifest::decode(&manifest_bytes)
-        .ok_or_else(|| "Failed to decode manifest".to_string())?;
-
-    // Decode each row group's PND2 blob into JSON rows.
-    let mut all_rows: Vec<JsonValue> = Vec::new();
-    for rg in &manifest.row_groups {
-        let blob = kernel
-            .read_blob(&rg.blob_hash)
-            .map_err(|e| format!("Failed to read data blob: {}", e))?;
-        let cols = pnd2_decode(&blob).map_err(|e| format!("Failed to decode PND2: {}", e))?;
-        let n_rows = cols.first().map(|c| c.n_values).unwrap_or(0);
-        for row_idx in 0..n_rows {
-            let mut row_obj = serde_json::Map::new();
-            for col in &cols {
-                let name = col.name.to_string_lossy().to_string();
-                // Skip CRDT metadata columns — they're internal.
-                if name == "_rowid" || name == "_version" || name == "_deleted" {
-                    continue;
-                }
-                let val = match col.vtype {
-                    VT_INT64 => col
-                        .i64_data
-                        .get(row_idx)
-                        .map(|v| json!(*v))
-                        .unwrap_or(JsonValue::Null),
-                    VT_FLOAT64 => col
-                        .f64_data
-                        .get(row_idx)
-                        .and_then(|v| serde_json::Number::from_f64(*v))
-                        .map(JsonValue::Number)
-                        .unwrap_or(JsonValue::Null),
-                    VT_STRING => col
-                        .str_data
-                        .get(row_idx)
-                        .map(|v| json!(v.to_string_lossy().to_string()))
-                        .unwrap_or(JsonValue::Null),
-                    VT_BOOLEAN => col
-                        .i64_data
-                        .get(row_idx)
-                        .map(|v| json!(*v != 0))
-                        .unwrap_or(JsonValue::Null),
-                    _ => JsonValue::Null,
-                };
-                row_obj.insert(name, val);
-            }
-            all_rows.push(JsonValue::Object(row_obj));
-        }
-    }
-
-    // Apply WHERE filter.
-    if let Some(w) = where_filter {
-        if !w.trim().is_empty() {
-            let predicates = parse_where_clause(w)?;
-            all_rows.retain(|r| predicates.iter().all(|(c, op, v)| eval_predicate(r, c, op, v)));
-        }
-    }
-
-    // Apply column projection.
-    if let Some(cols_str) = columns {
-        if !cols_str.trim().is_empty() {
-            let col_list: Vec<String> = cols_str
+    // Parse the projection upfront — decode-time column pushdown (only the
+    // requested columns plus CRDT metadata are decoded off disk).
+    let projection: Option<Vec<String>> = columns
+        .filter(|c| !c.trim().is_empty())
+        .map(|cols_str| {
+            cols_str
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .collect();
+                .collect()
+        });
+
+    let key_fields: Vec<String> = vec!["_rowid".to_string()];
+
+    // THE pruned read pipeline (ARCHITECTURE.md D4): PMAN v3 leaf pruning
+    // → zone-map pruning → parallel bloom pre-check → slab-aware coalesced
+    // range reads → projection pushdown → columnar pre-filter. The previous
+    // inline implementation did a FULL `kernel.read_blob` per row group,
+    // decoded every column, and decoded the manifest with
+    // `CollectionManifest::decode` — which cannot resolve PMAN v3 root
+    // manifests (roots have leaves, not row_groups).
+    let head = kernel.resolve(&pond_storage::branch_ref(collection, &active));
+    let pairs = match head {
+        Some(_) => pond_storage::read::read_rows_json_pruned(
+            kernel, collection, &active, &key_fields, projection.as_deref(), &predicates,
+        )?,
+        None => {
+            // Legacy fallback (pre-branch data): the bare collection ref
+            // points at a PNPK pack hash. Route it through the SAME pruned
+            // pipeline via the head-override entry point.
+            match kernel.resolve(collection) {
+                Some(pack_hash) => pond_storage::read::read_rows_json_pruned_with_head(
+                    kernel, &pack_hash, &key_fields, projection.as_deref(), &predicates,
+                )?,
+                None => return Err(format!("Collection '{}' has no commits", collection)),
+            }
+        }
+    };
+
+    // CRDT metadata columns are internal — strip them (the old decode loop
+    // skipped _rowid/_version/_deleted inline; same set, same behavior).
+    const META_COLS: [&str; 3] = ["_rowid", "_version", "_deleted"];
+    let mut all_rows: Vec<JsonValue> = pairs
+        .into_iter()
+        .map(|(_, row)| match row {
+            JsonValue::Object(mut obj) => {
+                for m in META_COLS {
+                    obj.remove(m);
+                }
+                JsonValue::Object(obj)
+            }
+            other => other,
+        })
+        .collect();
+
+    // Authoritative WHERE filter (row-level, post-read).
+    if !predicates.is_empty() {
+        all_rows.retain(|r| predicates.iter().all(|(c, op, v)| eval_predicate(r, c, op, v)));
+    }
+
+    // Apply column projection (missing columns → Null, as before).
+    if let Some(col_list) = &projection {
+        if !col_list.is_empty() {
             all_rows = all_rows
                 .into_iter()
                 .map(|r| {
                     if let Some(obj) = r.as_object() {
                         let mut new_obj = serde_json::Map::new();
-                        for c in &col_list {
+                        for c in col_list {
                             if let Some(v) = obj.get(c) {
                                 new_obj.insert(c.clone(), v.clone());
                             } else {
