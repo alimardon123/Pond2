@@ -84,88 +84,82 @@ The project is done only when every statement below is demonstrably true:
 - CI runners are 2-vCPU: keep the bitpack benchmark calibrated (f85a351) —
   do not add uncalibrated long benchmarks.
 
-## This-cycle acceptance (crucible iteration N+5 — the Python-substrate delegation cycle)
+## This-cycle acceptance (crucible iteration N+6 — the error-channel + codec-laws cycle)
 
-Mission for this cycle: **open the C5-python fence — phase 1, the I/O
-substrate**. The pure-Python kernel stack (ObjectStoreNativeKernel +
-UnifiedStorage + SDK + the Python lens world) stops needing its own object
-store implementations: a new `pond.ObjectStore` pyo3 class exposes the Rust
-core's ObjectStore trait (LocalFS + S3/R2 with the 3-tier cache), a Python
-`RustObjectStore` adapter implements the exact LocalFSObjectStore/
-S3ObjectStore duck interface on top of it (byte-identical layouts — the
-stores were verified to converge: `blobs/{h[:2]}/{h}` + JSON `{"hash":...}`
-refs at `{path}`), and `make_kernel()` prefers the Rust backend whenever
-the compiled module is importable (graceful pure-Python fallback, env
-override `POND_PY_BACKEND=python|rust|auto`). The Python world keeps its
-formats/semantics this cycle; what it delegates is the I/O layer — so it
-inherits the Rust S3 client (SigV4, connection reuse, disk cache) instead
-of boto3 per-call, and Python-written stores become readable by the Rust
-kernel (same bytes, same keys). Plus two same-cycle repairs: **C8** (SQL
-executor must PROPAGATE HEAD-read errors like pyo3 does — no more silent
-partial SQL results on transient S3 failures) and **C13** (document the
-raw-path `pond read` journal staleness in the CLI help + docs; routing
-deferred with an honest CRITIQUE note).
+Mission for this cycle: **close the C17 error-channel hole end-to-end,
+land the C12 codec proptest laws, and validate against REAL object
+storage (R2)**. `ObjectStore::get_path` gains an error channel
+(`io::Result<Option<String>>`) so a transient ref-read failure (S3
+500/429/timeout) is an ERROR everywhere it occurs — journal snapshot
+resolution, epoch probes, branch reads, CAS pre-reads, the Python
+surface — never a silent `None` masquerading as "absent" (the empirically
+proven blindness: failing ref reads returned EMPTY query results). With
+C17 landed, `read::read` (the raw path) routes through the journal
+resolver (C13) so raw reads stop being fold-stale for structured data.
+In parallel, the two uncovered binary codecs (PNPK packs, PSLB slabs —
+C12's natural home, the C3 laws family) get property-based laws. And the
+whole storage stack runs once against REAL R2 object storage via an
+env-gated live harness (credentials NEVER in the repo, never in CI) —
+the journal's delimiter-LIST writer discovery and range reads have only
+ever run against moto emulation.
 
-1. **`pond.ObjectStore` pyo3 surface** (bindings/python/pyo3/src/lib.rs +
-   pond.pyi): constructors `ObjectStore(base_dir)` (LocalFS) and
-   `ObjectStore.from_s3(url, cache_dir=None)` (S3/R2 — cache wired via
-   the same `s3_kernel_cached` path Storage uses); semantic methods
-   mapping the trait — `put_blob/get_blob/get_blob_range/get_blob_suffix/
-   put_blob_batch/get_blob_batch/blob_exists/delete_blob/put_path/get_path/
-   delete_path/list_paths/list_dirs/store_id`; plus a raw-key escape
-   hatch `get_raw/put_raw/delete_raw/list_raw` (new default-Unsupported
-   trait methods, implemented by LocalFS + S3 only — the Python adapter
-   uses them for OLD-layout fallback reads `b/…` + `paths/…` and
-   `list_all_blob_hashes`). I/O-bound methods release the GIL
-   (`py.allow_threads`) so the Python kernel's ThreadPoolExecutor batches
-   actually parallelize.
-2. **`RustObjectStore` adapter** (bindings/python/core/rust_object_store.py):
-   duck-compatible with LocalFSObjectStore/S3ObjectStore (put_blob,
-   get_blob, put/get_blob_batch, has_blob, delete_blob,
-   list_all_blob_hashes, put_path, get_path, delete_path, list_paths,
-   stats, reset_stats, print_stats). NEW-layout ops delegate to the Rust
-   semantic methods; OLD-layout blob reads (`b/{h[:2]}/{h}`) and old refs
-   (`paths/{path}`) fall back via raw ops; hash computation comes from the
-   Rust `put_blob` return (sha256, identical to Python's `hash_bytes`).
-3. **`make_kernel` wiring** (bindings/python/core/make_kernel.py): new
-   `backend="auto"` kwarg — "auto" uses RustObjectStore when `import pond`
-   succeeds (file:// → `pond.ObjectStore(base_dir)`; s3:// →
-   `pond.ObjectStore.from_s3` with region/endpoint/creds translated to URL
-   query params + env, mirroring pond.Storage's constructor), falls back to
-   the pure-Python stores (with a one-time stderr note) when the module is
-   absent or construction fails; `POND_PY_BACKEND=python` forces the
-   fallback; `memory://` unchanged (InMemoryObjectStore).
-4. **Byte-interop pinned by tests**: (a) a store written via pure-Python
-   LocalFSObjectStore reads identically through RustObjectStore and
-   vice versa (same dir, same files — blobs + JSON refs byte-identical);
-   (b) `hash_bytes` equality across the boundary for identical data;
-   (c) old-layout fallback: a `b/…` blob + `paths/…` ref written by hand
-   (pre-layout-change shape) resolves through RustObjectStore.
-5. **The Python kernel stack works end-to-end on the Rust store**:
-   ObjectStoreNativeKernel(RustObjectStore) + UnifiedStorage write/read/
-   point-lookup round trip; PondStorage (SDK) write/read round trip;
-   make_kernel("file://…", backend="auto") picks Rust when built and
-   pure-Python when not (both asserted in tests via forced backends).
-6. **S3 via the Rust client, pinned by moto**: ObjectStoreNativeKernel on
-   RustObjectStore.from_s3(moto endpoint) — put/get/list/delete round
-   trips, ref resolution, kernel read-your-write; proves the Python world
-   no longer needs boto3 for its object I/O.
-7. **C8 repaired**: `read_collection_as_json_rows` (core/sql executor)
-   propagates HEAD-read errors (Err no longer swallowed); a test pins a
-   failing store → SQL query returns an error, not silently-partial rows.
-8. **C13 documented**: `pond read --help` + docs/API_WORKFLOW.md note that
-   the raw path resolves the branch ref (a CACHE of the last fold) and can
-   be journal-stale for structured data; use `pond read-rows`/SQL for
-   journal-aware reads. CRITIQUE keeps C13 open for the routing fix.
-9. Zero-warning build: `cargo clippy --workspace --all-targets -- -D
-   warnings` clean (pond_python included in clippy; excluded from cargo
-   test per CI policy — its surface is covered by the pytest job);
-   `cargo test --workspace --exclude pond_python --exclude pond_sql` green
-   (CI command) + pond_sql suite green; pytest green (existing suites +
-   the new tests in tests/test_rust_object_store.py); lens laws
-   untouched-green; moto S3 (Rust suite) green.
-10. CI green on the pushed HEAD (the pytest job builds pond_python and
-    runs the new tests through `import pond`).
-11. Honest gap report: C5-python phase 2 (format unification — Python
-    manifests/encoding vs PND2/PMAN; the SDK's semantics still live in
-    Python), C12/C14/C15/C16 dispositions unchanged, C13 routing deferred.
+1. **C17 trait refactor**: `ObjectStore::get_path` returns
+   `io::Result<Option<String>>` across the trait + every backend (LocalFS
+   discriminates NotFound; S3 discriminates 404 via the existing
+   `is_s3_not_found`; CachingObjectStore passes errors through WITHOUT
+   poisoning the ref cache — errors are not absence; S3's
+   `get_path_with_etag` and `get_path_async` follow suit) +
+   `PondKernel::resolve` returns `io::Result<Option<String>>` + EVERY
+   caller updated: production read paths propagate with context
+   ("Failed to read branch ref for collection 'x': …"), `journal::
+   probe_writer` becomes fallible (a failed epoch probe is a TRUNCATED
+   journal view — an error, not an empty suffix), existence probes
+   become `?.is_some()`, tests unwrap. The pyo3 `pond.ObjectStore.
+   get_path` surface raises `IOError` on failure (PyResult), keeping
+   `None` for absent; the Python adapter propagates.
+2. **C17 pinned by tests**: a ref-outage store (get_path fails, blobs
+   healthy) makes (a) `read_rows_json_pruned` return an error, (b) the
+   SQL executor return an error (not empty rows), (c) `journal::
+   resolve_view` return an error (not an empty view) — the exact
+   blindness the C8 test's first version exposed. REVERT-VERIFIED: at
+   least one new test fails against the pre-refactor code.
+3. **C13 raw-reader routing**: `read::read` (and the CLI `pond read`)
+   resolves the journal view via `journal::resolve_packs` — snapshot
+   pack + live journal entries at RG granularity — and concatenates the
+   live RG bytes (byte-exact for raw-write collections; journal-union
+   for mixed usage). A raw read after `write_rows` (no fold yet) returns
+   the journal data, not "has no commits" / stale bytes. Docs updated:
+   API_WORKFLOW §2.1 caveat replaced with the new contract; `pond read
+   --help` updated; CRITIQUE C13 closed.
+4. **C12 codec laws**: proptest suites for PNPK (`pond_pack::
+   encode_pack`/`decode_pack`/`is_pack` — JSON ref + manifest bytes +
+   optional bloom round-trip through arbitrary-byte and degenerate
+   inputs, magic discrimination) and PSLB (`slab::encode_slab`/
+   `decode_slab`/`decode_slab_tail`/`decode_slab_footer`, the
+   COMPRESSED variant, `plan_ranges` — multi-RG round-trips, footer
+   offset/len invariants, tail-magic discrimination, bloom-flag
+   consistency, malformed-truncation rejection). Follow the
+   laws_pman.rs patterns (deterministic seeds, boxed strategies,
+   regressions file honored).
+5. **R2 live harness**: an env-gated integration script/test
+   (POND_R2_ENDPOINT + POND_R2_BUCKET + POND_R2_ACCESS_KEY_ID +
+   POND_R2_SECRET_ACCESS_KEY absent → SKIP silently) exercising the REAL
+   S3 client end-to-end: blob put/get/range, refs, list_paths,
+   list_dirs delimiter semantics, the journal write→probe→read cycle,
+   cache warm-read timing. Run locally against the owner-provided R2
+   bucket; ZERO credential material in the repo, .gitignore-safe, CI
+   unaffected. Results (timings, round-trip counts) recorded in the
+   worklog.
+6. **Zero-warning build + full validation**: `cargo clippy --workspace
+   --all-targets -- -D warnings` clean; `cargo test --workspace
+   --exclude pond_python --exclude pond_sql` green (CI command) +
+   pond_sql green; pytest green (test_all + test_rust_object_store +
+   any new surface); lens laws green; moto green; the R2 harness green
+   when credentials present.
+7. **CI green on the pushed HEAD** (credentials available this cycle:
+   PAT stored at /home/z/.secrets/pond-credentials.env, never in the
+   repo).
+8. **Honest gap report**: C5-python phase 2 unchanged (conditional),
+   C14/C15/C16 unchanged, C12's lenient-skip DECISION may be revisited
+   in the laws' light (documented either way), new findings recorded
+   with locations + root-cause hypotheses.

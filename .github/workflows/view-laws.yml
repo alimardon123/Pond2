@@ -149,11 +149,17 @@ jobs:
       - name: Build Rust workspace (release) for PyO3 + C ABI + pond CLI
         run: cargo build --release --workspace --exclude pond_sql
 
+      # NOTE: this MUST be an unconditional SYMBOLIC link (-sf, relative
+      # target). The restored cargo target cache can contain a pond.so
+      # HARD link from a previous run (created by the old `ln` without
+      # -s): cargo rebuilds libpond.so by REPLACING the file (new inode),
+      # so a cached hard link keeps serving the STALE module forever —
+      # CI run 33259199081 failed exactly this way (pond.ObjectStore
+      # missing from a pre-D8 pond.so while libpond.so was current).
+      # A relative symlink resolves to the CURRENT libpond.so after any
+      # rebuild, and -f overwrites whatever the cache restored.
       - name: Symlink libpond.so → pond.so (Python expects the latter)
-        run: |
-          if [ -f target/release/libpond.so ] && [ ! -f target/release/pond.so ]; then
-            ln target/release/libpond.so target/release/pond.so
-          fi
+        run: ln -sf libpond.so target/release/pond.so
 
       - name: Run pytest
         env:
