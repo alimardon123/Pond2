@@ -1,0 +1,13 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# The seed below is the shrunk counterexample for FINDING #1 (see the
+# laws_pnps.rs header): the strict law `law_pnpk_roundtrip_is_lossless`
+# is #[ignore]d until serde_json's `float_roundtrip` feature is enabled —
+# this seed replays the minimal case (a f64 whose JSON text re-parse is
+# 1 ULP off) the moment the law is un-ignored.
+cc fbd4e3a8574449516c5d8a15efac8513849cba7bfd851c5dd2dbaac9fa370b06 # shrinks to commit = Number(3.237893019965854e-46), manifest = [], inline = None

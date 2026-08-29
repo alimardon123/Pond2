@@ -70,7 +70,7 @@ pub trait ObjectStore: Send + Sync {
     /// **Default impl**: read-check-write. Not atomic on concurrent writers.
     /// Backends should override with atomic CAS (S3 If-Match, FS rename).
     fn put_path_if(&self, path: &str, expected_hash: Option<&str>, new_hash: &str) -> io::Result<bool> {
-        let current = self.get_path(path);
+        let current = self.get_path(path)?;
         match (&expected_hash, &current) {
             (None, None) => {}
             (Some(expected), Some(current)) if expected == current => {}
@@ -80,8 +80,16 @@ pub trait ObjectStore: Send + Sync {
         Ok(true)
     }
 
-    /// Resolve a named path to its content hash. Returns None if unbound.
-    fn get_path(&self, path: &str) -> Option<String>;
+    /// Resolve a named path to its content hash.
+    ///
+    /// `Ok(None)` = the path is unbound (a legitimate absent ref).
+    /// `Err` = the ref read itself FAILED — a transient backend error
+    /// (S3 500/429/timeout), a localfs I/O error (permission denied), or a
+    /// corrupt ref body. Callers MUST NOT collapse `Err` into "unbound":
+    /// an outage is not an absent ref (CRITIQUE C17 — a failed pre-read in
+    /// `put_path_if` used to masquerade as a phantom "absent" and CAS-lost
+    /// legitimately).
+    fn get_path(&self, path: &str) -> io::Result<Option<String>>;
 
     /// Delete a named path. Returns true if it existed.
     fn delete_path(&self, path: &str) -> io::Result<bool>;
@@ -421,14 +429,20 @@ impl ObjectStore for LocalFSObjectStore {
         Ok(())
     }
 
-    fn get_path(&self, path: &str) -> Option<String> {
+    fn get_path(&self, path: &str) -> io::Result<Option<String>> {
         let file = self.path_file(path);
         match fs::read_to_string(&file) {
             Ok(body) => {
-                // Parse JSON {"hash":"..."} — minimal parser
-                extract_hash_from_json(&body)
+                // Parse JSON {"hash":"..."} — minimal parser. A body that
+                // does not parse as a ref is an UNBOUND path (Ok(None)),
+                // not an I/O failure — same semantics as before C17.
+                Ok(extract_hash_from_json(&body))
             }
-            Err(_) => None,
+            // Absent ref: ENOENT is the one fs error that means "unbound".
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            // Everything else (permission denied, EISDIR, transient I/O)
+            // is a FAILED ref read — surfaced, not swallowed (C17).
+            Err(e) => Err(e),
         }
     }
 

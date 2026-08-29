@@ -174,6 +174,31 @@ cache-wrapped). All pyo3 ObjectStore methods release the GIL, so the
 Python kernel's ThreadPoolExecutor batches parallelize into the Rust
 core's native pools.
 
+**D9 — The ref-surface error channel (settled N+6; C17 + C13).**
+`ObjectStore::get_path` returns `io::Result<Option<String>>` — `Ok(None)`
+is a legitimate absent ref, `Err` is a FAILED read (transient S3
+500/429/timeout, localfs permission error, corrupt ref body). NO caller
+may collapse the two: an outage is not an absence. Backends discriminate
+precisely (LocalFS: `ErrorKind::NotFound`; S3: the shared
+`is_s3_not_found` 404 test — a corrupt-but-fetched ref body is
+`InvalidData`, not absence); CachingObjectStore propagates errors
+WITHOUT poisoning the ref cache (errors are not cacheable, absence is
+not cacheable); the pyo3 surface raises `IOError` (Python parity:
+LocalFSObjectStore raises OSError on real I/O failures). The kernel's
+`resolve` delegates bare, so every consumer inherits the channel:
+journal snapshot resolution, epoch probes (a FAILED probe is a
+potentially-TRUNCATED journal view — `probe_writer` is fallible and a
+mid-log outage errors rather than silently ending the epoch), branch
+reads, CAS pre-reads, existence probes, the SQL executor ("an outage is
+not a fresh collection" — distinct error arms from "has no commits").
+The C ABI is the one surface that CANNOT carry the channel (null-return
+API) — documented limitation (CRITIQUE C18). Same cycle, the RAW read
+path (`read::read` / `pond read`) became journal-aware (C13 closed): it
+resolves the D6 read plan (snapshot + live entries) instead of the
+branch ref alone (a cache of the last fold), concatenating live RG
+bytes — byte-exact for raw-write collections, journal-union for
+structured ones; CRDT row merge remains the row readers' job.
+
 **D4 — One pruned read pipeline (settled).** There is exactly ONE production
 read pipeline: leaf pruning (PMAN v3) → zone-map pruning → parallel bloom
 pre-check → slab-aware range GETs + coalescing → projection pushdown →

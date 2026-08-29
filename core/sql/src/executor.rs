@@ -1271,7 +1271,9 @@ fn read_collection_as_json_rows(
     }
 
     // --- Read shard data (CRDT) ---
-    let (_, shards) = shard::read_with_shards(kernel, collection, &active);
+    // C17: a FAILED shard-ref enumeration is an Err (read_with_shards) —
+    // a shard silently missing from the list is silently-missing rows.
+    let (_, shards) = shard::read_with_shards(kernel, collection, &active)?;
     for (_, shard_hash) in shards {
         // Propagate shard read/parse failures: silently skipping a shard on a
         // transient S3 500/429 returned QUIETLY INCOMPLETE results (missing

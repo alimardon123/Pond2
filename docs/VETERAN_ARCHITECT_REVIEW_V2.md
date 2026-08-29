@@ -1203,7 +1203,7 @@ $ python3 scripts/phase_l_property_tests.py
 RESULTS: 491 pass, 0 fail, 0 skip
 (was 490 pass, 1 fail in V1 — A7 law test correctly refined)
 
-$ grep -rn "4331a4a6283b1d929cda0085d24450e0\|286c9be9d520e15fee90145147a43f15001209d192b63ca7a9e2ba53dde31122" /home/z/my-project/pond_repo
+$ grep -rn "4331a4a6283b…\|286c9be9d520…" [full values redacted N+6 — even grep examples must not carry live credentials] /home/z/my-project/pond_repo
 → only match: docs/VETERAN_ARCHITECT_REVIEW.md (the V1 review itself)
 → credentials are gone from all source
 ```

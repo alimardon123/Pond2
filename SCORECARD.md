@@ -29,12 +29,26 @@
 | Versatility | 8 | same plan for pyo3/SQL/CLI/lenses; legacy + journal surfaces both covered |
 | D-S1..D-S6 | 9/7/9/10/9/9 | item 2 scored pre-repair (single-writer laws); the multi-writer law closed it same-cycle |
 
-## Component scorecard (whole repo, updated for the N+5 substrate cycle)
+
+## Tribunal r5 scores (N+6: C17 error channel + C12 codec laws + live R2)
+
+| Axis | r5 score | Note |
+|---|---|---|
+| Simplicity | 9 | one law everywhere: Err ≠ absence; the sweep is mechanical, the semantics are one sentence |
+| Efficiency | 9 | no extra round trips anywhere in the fix; warm-read 9.8 µs → 1.4 µs vs cold 207–253 ms measured LIVE on R2 |
+| Beauty | 9 | the raw reader now tells the same story as every other reader (the D6 plan) — C13 was the last stale surface |
+| Scalability | 9 | probe failures error instead of truncating — a PB-scale outage can no longer masquerade as a short journal |
+| Power | 8 | C18 (C-ABI channel) + C19 (R2 delete "existed") recorded honestly |
+| Performance | 9 | ~21,000× warm/cold speedup pinned by a live test, not a benchmark harness |
+| Full-functionality | 9 | 2 real bugs found by the new laws and fixed same-cycle (float 1-ULP loss; 192 GiB alloc abort) |
+| Versatility | 9 | the error channel spans kernel, journal, SQL, CLI, pyo3, lenses, extensions, mcp-server |
+
+## Component scorecard (whole repo, updated for the N+6 error-channel + laws + live-R2 cycle)
 
 | Component | Simplicity | Efficiency | Beauty | Scalability | Power | Performance | Full-func | Versatility | Trend / note |
 |---|---|---|---|---|---|---|---|---|---|
-| **Journal (D3+D6, journal.rs)** | 9 | 9 | 9 | 9 | 9 | 8 | 9 | 8 | resolve_packs: ONE plan builder, RG-level coverage, zombie cleanup; F1/F2/F3/F6 + C7/C11 all closed |
-| Pruned read pipeline (read.rs) | 9 | 9 | 8 | 9 | 8 | 9 | 8 | 7 | delegates to the plan; lenient non-PND2 skip (C12) |
+| **Journal (D3+D6, journal.rs)** | 9 | 9 | 9 | 9 | 9 | 8 | 9 | 8 | resolve_packs: ONE plan builder, RG-level coverage, zombie cleanup; F1/F2/F3/F6 + C7/C11 all closed; N+6: fallible probes (C17 — an outage is a truncated-view error, never a silent suffix) |
+| Pruned read pipeline (read.rs) | 9 | 9 | 8 | 9 | 8 | 9 | 8 | 7 | delegates to the plan; N+6: raw path journal-aware (C13 closed); lenient non-PND2 skip stands informed (C12) |
 | pyo3 binding | 8 | 8 | 8 | 8 | 8 | 8 | 8 | 8 | journal-aware via reader; C10 tiebreak fixed; compact_shards real fold; N+5: +ObjectStore raw surface (GIL-releasing, cache-wired) — the Python substrate delegates through it |
 | Python core/kernel (bindings/python/core) | 8 | 9 | 8 | 8 | 8 | 9 | 8 | 9 | N+5: RustObjectStore adapter (byte-identical layout, old-layout fallbacks, KeyError parity) + make_kernel(backend=…) auto-Rust with byte-identical pure-Python fallback; moto-proven S3 via the Rust client |
 | Write path | 8 | 9 | 8 | 8 | 9 | 8 | 9 | 8 | all 5 paths journal-append; CAS DELETED; zero shared-object writes |

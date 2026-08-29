@@ -240,8 +240,8 @@ current repo is not in that state.
 `scripts/benchmark_r2_quick.py:13-14`:
 
 ```python
-R2_ACCESS_KEY = "4331a4a6283b1d929cda0085d24450e0"
-R2_SECRET_KEY = "286c9be9d520e15fee90145147a43f15001209d192b63ca7a9e2ba53dde31122"
+R2_ACCESS_KEY = "4331a4a6283b…[REDACTED N+6 — never commit credential material, even in reviews documenting leaks]"
+R2_SECRET_KEY = "286c9be9d520…[REDACTED N+6]"
 ```
 
 Same credentials appear in `benchmark_r2_tpch.py`, `benchmark_full_r2.py`,

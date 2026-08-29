@@ -339,7 +339,11 @@ impl LakehouseLens {
 
         // Resolve manifest to get RG metadata
         let commit_ref = pond_storage::branch_ref(table_name, branch);
+        // C17: a FAILED branch-ref read is an Err — an outage is not a
+        // fresh table (distinct from the "has no commits" arm).
         let commit_hash = kernel.resolve(&commit_ref)
+            .map_err(|e| format!(
+                "Failed to read branch ref for collection '{}': {}", table_name, e))?
             .ok_or_else(|| format!("Table '{}' has no commits", table_name))?;
         let manifest_bytes = pond_storage::commit::resolve_manifest_bytes(kernel, &commit_hash)
             .map_err(|e| format!("Failed to read manifest: {}", e))?;

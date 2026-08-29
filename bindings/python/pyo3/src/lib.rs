@@ -2522,7 +2522,10 @@ impl Storage {
 
                         if is_composite {
                             let ref_name = format!("collections/{}/indexes/{}", collection, index_name);
-                            if let Some(hash) = kernel.resolve(&ref_name) {
+                            // C17: a FAILED ref read is an Err — an outage
+                            // must not look like "key not in index" (which
+                            // early-exits with an EMPTY result).
+                            if let Some(hash) = kernel.resolve(&ref_name).map_err(py_io_err)? {
                                 if let Ok(data) = kernel.read_blob(&hash) {
                                     if let Ok(index) = serde_json::from_slice::<std::collections::HashMap<String, String>>(&data) {
                                         let found = index.keys().any(|k| {
@@ -2772,9 +2775,11 @@ impl Storage {
         let storage = self.storage.lock().unwrap();
         let active = storage.get_active_branch(collection);
 
-        // Get the current commit hash
+        // Get the current commit hash. C17: a FAILED read is an IOError —
+        // an outage is not "no commit".
         let commit_ref = format!("collections/{}/_branches/{}/commit", collection, active);
         let commit_hash = storage.kernel().resolve(&commit_ref)
+            .map_err(py_io_err)?
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!(
                 "no commit found for collection '{}' on branch '{}'", collection, active
             )))?;
@@ -3076,7 +3081,10 @@ impl Storage {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         let gc = pond_storage::maintenance::GarbageCollector::new(kernel);
-        let stats = gc.collect(None, compute_size);
+        // C17: a ref-read failure aborts GC (an outage must not classify
+        // live blobs as dead) — surfaces as IOError here.
+        let stats = gc.collect(None, compute_size)
+            .map_err(pyo3::exceptions::PyIOError::new_err)?;
 
         let dict = PyDict::new_bound(py);
         dict.set_item("live", stats.live)?;
@@ -3097,7 +3105,10 @@ impl Storage {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         let gc = pond_storage::maintenance::GarbageCollector::new(kernel);
-        let result = gc.vacuum(None, preserve_days, dry_run);
+        // C17: a ref-read failure aborts the vacuum — deleting blobs whose
+        // reachability could not be established would destroy live data.
+        let result = gc.vacuum(None, preserve_days, dry_run)
+            .map_err(pyo3::exceptions::PyIOError::new_err)?;
 
         let dict = PyDict::new_bound(py);
         dict.set_item("deleted", result.deleted)?;
@@ -3239,7 +3250,10 @@ impl Storage {
         let kernel = storage.kernel();
         let active = storage.get_active_branch(collection);
 
-        let (head_manifest, shards) = pond_storage::shard::read_with_shards(kernel, collection, &active);
+        // C17: a FAILED HEAD/shard-ref enumeration is an IOError — an
+        // outage is not "empty result".
+        let (head_manifest, shards) = pond_storage::shard::read_with_shards(kernel, collection, &active)
+            .map_err(pyo3::exceptions::PyIOError::new_err)?;
 
         let result = PyList::empty_bound(py);
 
@@ -3277,11 +3291,13 @@ impl Storage {
     /// Count the live LEGACY shards for a collection's active branch
     /// (pre-D7 shard namespace only — D7 journal-era upserts/deletes keep
     /// this at 0; their live entries are reported by `journal_status`).
-    fn shard_count(&self, collection: &str) -> usize {
+    /// C17: raises IOError when the shard enumeration fails.
+    fn shard_count(&self, collection: &str) -> PyResult<usize> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         let active = storage.get_active_branch(collection);
         pond_storage::shard::shard_count(kernel, collection, &active)
+            .map_err(pyo3::exceptions::PyIOError::new_err)
     }
 
     /// Compact — fold the journal + legacy shards into ONE snapshot.
@@ -3363,24 +3379,32 @@ impl Storage {
     }
 
     /// Check if a transaction has been committed.
-    fn is_tx_committed(&self, tx_id: &str) -> bool {
+    /// C17: raises IOError when the marker ref read fails (an outage is
+    /// not "not committed").
+    fn is_tx_committed(&self, tx_id: &str) -> PyResult<bool> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         pond_storage::transaction::is_tx_committed(kernel, tx_id)
+            .map_err(pyo3::exceptions::PyIOError::new_err)
     }
 
     /// Check if a transaction has been aborted.
-    fn is_tx_aborted(&self, tx_id: &str) -> bool {
+    /// C17: raises IOError when the marker ref read fails.
+    fn is_tx_aborted(&self, tx_id: &str) -> PyResult<bool> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
         pond_storage::transaction::is_tx_aborted(kernel, tx_id)
+            .map_err(pyo3::exceptions::PyIOError::new_err)
     }
 
     /// Get transaction status: "committed", "aborted", or "pending".
-    fn tx_status(&self, tx_id: &str) -> String {
+    /// C17: raises IOError when a marker ref read fails.
+    fn tx_status(&self, tx_id: &str) -> PyResult<String> {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
-        pond_storage::transaction::tx_status(kernel, tx_id).to_string()
+        pond_storage::transaction::tx_status(kernel, tx_id)
+            .map(|s| s.to_string())
+            .map_err(pyo3::exceptions::PyIOError::new_err)
     }
 
     /// Read data at a specific commit (snapshot isolation).
@@ -3442,7 +3466,14 @@ impl Storage {
 
         for coll in &collections {
             let active = storage.get_active_branch(coll);
-            let shard_n = pond_storage::shard::shard_count(kernel, coll, &active);
+            // C17: a FAILED shard enumeration (outage) skips THIS collection
+            // — same best-effort batch semantics as the clear_shards arm
+            // below. Unlike pre-C17, the Err is distinguishable from
+            // "0 shards"; it just doesn't abort the whole batch.
+            let shard_n = match pond_storage::shard::shard_count(kernel, coll, &active) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
             if shard_n > 0 {
                 match pond_storage::shard::clear_shards(kernel, coll, &active) {
                     Ok(n) => shards_compacted += n,
@@ -3604,9 +3635,16 @@ impl Storage {
                     .or_else(|| row.get("blob_hash").and_then(|v| v.as_str()));
 
                 if let Some(ref_str) = blob_ref {
-                    // Try to resolve as a name first, then as a hash
-                    let hash = kernel.resolve(ref_str)
-                        .unwrap_or_else(|| ref_str.to_string());
+                    // Try to resolve as a name first, then as a hash.
+                    // C17: a FAILED name resolve falls back to the raw
+                    // string (a 64-hex hash reads directly; a NAME that
+                    // failed to resolve then fails at read_blob with the
+                    // underlying blob error — not a silent miss).
+                    let hash = match kernel.resolve(ref_str) {
+                        Ok(Some(h)) => h,
+                        Ok(None) => ref_str.to_string(),
+                        Err(_) => ref_str.to_string(),
+                    };
                     match kernel.read_blob(&hash) {
                         Ok(data) => return Ok(PyBytes::new_bound(py, &data).into()),
                         Err(_) => {
@@ -3651,9 +3689,11 @@ impl Storage {
         let storage = self.storage.lock().unwrap();
         let kernel = storage.kernel();
 
-        // Create layer metadata if it doesn't exist
+        // Create layer metadata if it doesn't exist. C17: a FAILED read
+        // is an IOError — an outage must not create a duplicate default
+        // layer over an existing one.
         let layer_ref = format!("semantic_layers/{}/_meta", name);
-        if kernel.resolve(&layer_ref).is_none() {
+        if kernel.resolve(&layer_ref).map_err(py_io_err)?.is_none() {
             // Default to ['ossie'] if no adapters specified
             let adapter_list = adapters.unwrap_or_else(|| vec!["ossie".to_string()]);
             let layer_meta = serde_json::json!({
@@ -4248,6 +4288,7 @@ impl SemanticLayer {
         // Read layer metadata
         let layer_ref = format!("semantic_layers/{}/_meta", self.name);
         let layer_hash = kernel.resolve(&layer_ref)
+            .map_err(py_io_err)?
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(
                 format!("Semantic layer '{}' not found", self.name)))?;
         let layer_data = kernel.read_blob(&layer_hash)
@@ -4315,6 +4356,7 @@ impl SemanticLayer {
         let kernel = storage.kernel();
         let layer_ref = format!("semantic_layers/{}/_meta", self.name);
         let hash = kernel.resolve(&layer_ref)
+            .map_err(py_io_err)?
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Layer not found"))?;
         let data = kernel.read_blob(&hash)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
@@ -4373,6 +4415,7 @@ impl SemanticLayer {
             a.to_string()
         } else {
             let hash = kernel.resolve(&layer_ref)
+                .map_err(py_io_err)?
                 .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Layer not found"))?;
             let data = kernel.read_blob(&hash)
                 .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
@@ -4385,12 +4428,15 @@ impl SemanticLayer {
             }
         };
 
-        // Read all definitions
+        // Read all definitions. C17: enumeration is best-effort per entry
+        // (matching the pre-existing `if let Ok(data)` blob leniency) — a
+        // FAILED ref read skips that one entry; the primary `_meta` read
+        // above carries the loud IOError for outages.
         let mut defs = SemanticDefinitions::new();
 
         let metric_prefix = format!("semantic_layers/{}/metrics/", self.name);
         for ref_name in kernel.list_names_prefix(&metric_prefix) {
-            if let Some(hash) = kernel.resolve(&ref_name) {
+            if let Ok(Some(hash)) = kernel.resolve(&ref_name) {
                 if let Ok(data) = kernel.read_blob(&hash) {
                     if let Ok(m) = serde_json::from_slice::<serde_json::Value>(&data) {
                         defs.metrics.push(pond_semantic::Metric {
@@ -4406,7 +4452,7 @@ impl SemanticLayer {
 
         let dim_prefix = format!("semantic_layers/{}/dimensions/", self.name);
         for ref_name in kernel.list_names_prefix(&dim_prefix) {
-            if let Some(hash) = kernel.resolve(&ref_name) {
+            if let Ok(Some(hash)) = kernel.resolve(&ref_name) {
                 if let Ok(data) = kernel.read_blob(&hash) {
                     if let Ok(d) = serde_json::from_slice::<serde_json::Value>(&data) {
                         defs.dimensions.push(pond_semantic::Dimension {
@@ -4421,7 +4467,7 @@ impl SemanticLayer {
 
         let rel_prefix = format!("semantic_layers/{}/relationships/", self.name);
         for ref_name in kernel.list_names_prefix(&rel_prefix) {
-            if let Some(hash) = kernel.resolve(&ref_name) {
+            if let Ok(Some(hash)) = kernel.resolve(&ref_name) {
                 if let Ok(data) = kernel.read_blob(&hash) {
                     if let Ok(r) = serde_json::from_slice::<serde_json::Value>(&data) {
                         defs.relationships.push(pond_semantic::Relationship {
@@ -4501,6 +4547,7 @@ impl SemanticLayer {
         // Read existing meta
         let layer_ref = format!("semantic_layers/{}/_meta", self.name);
         let hash = kernel.resolve(&layer_ref)
+            .map_err(py_io_err)?
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Layer not found"))?;
         let data = kernel.read_blob(&hash)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
@@ -4531,6 +4578,7 @@ impl SemanticLayer {
 
         let layer_ref = format!("semantic_layers/{}/_meta", self.name);
         let hash = kernel.resolve(&layer_ref)
+            .map_err(py_io_err)?
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Layer not found"))?;
         let data = kernel.read_blob(&hash)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
@@ -5408,7 +5456,9 @@ fn read_collection_as_json_rows_filtered(
 
     // --- Read shard data (CRDT) ---
     // Shards are JSON — no columnar filter possible (they're already JSON)
-    let (_, shards) = shard::read_with_shards(kernel, collection, &active);
+    // C17: a FAILED shard-ref enumeration is an Err — a shard silently
+    // missing from the list is silently-missing rows.
+    let (_, shards) = shard::read_with_shards(kernel, collection, &active)?;
     for (_, shard_hash) in shards {
         // Propagate shard read/parse failures: silently skipping a shard on a
         // transient S3 500/429 returned QUIETLY INCOMPLETE results (missing
@@ -5629,7 +5679,7 @@ fn evaluate_udf(
 /// h = store.put_blob(b"hello")                    # content-addressed
 /// assert store.get_blob(h) == b"hello"
 /// store.put_path("collections/users/HEAD", h)     # JSON ref at {path}
-/// assert store.get_path("collections/users/HEAD") == h
+/// assert store.get_path("collections/users/HEAD") == h  # raises IOError on failure
 /// assert store.blob_exists(h)
 ///
 /// # Raw-key escape hatch (legacy layouts, foreign key spaces):
@@ -5802,9 +5852,15 @@ impl RawObjectStore {
             .map_err(py_io_err)
     }
 
-    /// Resolve a named path to its hash, or None if unbound.
-    fn get_path(&self, py: Python<'_>, path: String) -> Option<String> {
+    /// Resolve a named path to its hash.
+    ///
+    /// Returns None when the path is unbound; raises IOError when the
+    /// ref read itself fails (C17 — a transient backend outage is NOT an
+    /// absent ref; parity with LocalFSObjectStore, which raises OSError
+    /// on real I/O failures).
+    fn get_path(&self, py: Python<'_>, path: String) -> PyResult<Option<String>> {
         py.allow_threads(move || self.store.get_path(&path))
+            .map_err(py_io_err)
     }
 
     /// Delete a named path. True if it existed.

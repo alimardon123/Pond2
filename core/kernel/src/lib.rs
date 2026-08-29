@@ -140,7 +140,7 @@ impl PondKernel {
         if is_hash(hash_or_name) {
             return self.read_blob(hash_or_name);
         }
-        let h = self.resolve(hash_or_name)
+        let h = self.resolve(hash_or_name)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound,
                 format!("Name '{}' not found", hash_or_name)))?;
         self.read_blob(&h)
@@ -217,7 +217,12 @@ impl PondKernel {
         Ok(ok)
     }
 
-    pub fn resolve(&self, name: &str) -> Option<String> {
+    /// Resolve a named reference to its hash.
+    ///
+    /// `Ok(None)` = unbound; `Err` = the ref read FAILED (C17: a transient
+    /// backend outage is not an absent ref — callers must not collapse the
+    /// two). Bare delegation to `ObjectStore::get_path`.
+    pub fn resolve(&self, name: &str) -> io::Result<Option<String>> {
         self.store.get_path(name)
     }
 
@@ -328,7 +333,7 @@ impl PondKernel {
         if is_hash(hash_or_name) {
             return self.read_blob_async(hash_or_name).await;
         }
-        let h = self.resolve(hash_or_name)
+        let h = self.resolve(hash_or_name)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound,
                 format!("Name '{}' not found", hash_or_name)))?;
         self.read_blob_async(&h).await
@@ -421,8 +426,8 @@ mod tests {
         let kernel = PondKernel::new_local(dir.path()).unwrap();
         let h = kernel.write(b"data").unwrap();
         kernel.reference("my_coll", &h).unwrap();
-        assert_eq!(kernel.resolve("my_coll"), Some(h.clone()));
-        assert_eq!(kernel.resolve("nope"), None);
+        assert_eq!(kernel.resolve("my_coll").unwrap(), Some(h.clone()));
+        assert_eq!(kernel.resolve("nope").unwrap(), None);
     }
 
     #[test]
@@ -442,7 +447,7 @@ mod tests {
         kernel.reference("collections/users/_branches/main/commit", &h).unwrap();
         kernel.reference("collections/users/_branches/exp/commit", &h).unwrap();
         assert_eq!(
-            kernel.resolve("collections/users/_branches/main/commit"),
+            kernel.resolve("collections/users/_branches/main/commit").unwrap(),
             Some(h.clone())
         );
         let branches = kernel.list_names_prefix("collections/users/_branches");
@@ -460,7 +465,7 @@ mod tests {
         }
         {
             let kernel = PondKernel::new_local(&path).unwrap();
-            assert!(kernel.resolve("my_coll").is_some());
+            assert!(kernel.resolve("my_coll").unwrap().is_some());
             assert_eq!(kernel.read("my_coll").unwrap(), b"persistent");
         }
     }
@@ -471,9 +476,9 @@ mod tests {
         let kernel = PondKernel::new_local(dir.path()).unwrap();
         let h = kernel.write(b"data").unwrap();
         kernel.reference("temp", &h).unwrap();
-        assert!(kernel.resolve("temp").is_some());
+        assert!(kernel.resolve("temp").unwrap().is_some());
         kernel.delete_ref("temp").unwrap();
-        assert!(kernel.resolve("temp").is_none());
+        assert!(kernel.resolve("temp").unwrap().is_none());
         assert_eq!(kernel.read_blob(&h).unwrap(), b"data");
     }
 
@@ -622,7 +627,7 @@ mod async_tests {
         let kernel = PondKernel::new_local(dir.path()).unwrap();
         let h = kernel.write_async(b"by name async".to_vec()).await.unwrap();
         kernel.reference_async("my_coll", &h).await.unwrap();
-        assert_eq!(kernel.resolve("my_coll"), Some(h.clone()));
+        assert_eq!(kernel.resolve("my_coll").unwrap(), Some(h.clone()));
         let data = kernel.read_async("my_coll").await.unwrap();
         assert_eq!(data, b"by name async");
     }

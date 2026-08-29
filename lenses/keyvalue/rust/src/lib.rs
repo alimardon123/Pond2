@@ -180,7 +180,7 @@ impl KeyValueLens {
             self.storage.kernel(),
             collection,
             &active_branch,
-        );
+        )?;
 
         let mut result = HashMap::new();
         for blob in data {

@@ -107,7 +107,7 @@ fn test_upsert_roundtrip_and_rowid_stability() {
         "unrelated rows must be untouched");
 
     // No JSON shard blob was written anywhere (D7).
-    assert_eq!(shard::shard_count(kernel, "users", "main"), 0);
+    assert_eq!(shard::shard_count(kernel, "users", "main").unwrap(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +148,7 @@ fn test_delete_tombstone_suppresses_and_resurrect() {
     assert_eq!(revived.1["val"], json!("revived"));
 
     // No JSON shards anywhere (D7).
-    assert_eq!(shard::shard_count(kernel, "t", "main"), 0);
+    assert_eq!(shard::shard_count(kernel, "t", "main").unwrap(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -264,7 +264,7 @@ fn test_mixed_legacy_shard_plus_journal_upsert() {
     shard::append_shard(kernel, "mixed", "main", "legacy_shard", &legacy_bytes).unwrap();
 
     // read_with_shards (legacy-compat) sees the LEGACY shard...
-    let (_, shards) = shard::read_with_shards(kernel, "mixed", "main");
+    let (_, shards) = shard::read_with_shards(kernel, "mixed", "main").unwrap();
     assert_eq!(shards.len(), 1, "the hand-written legacy shard must be visible");
     assert_eq!(shards[0].0, "legacy_shard");
 
@@ -290,7 +290,7 @@ fn test_mixed_legacy_shard_plus_journal_upsert() {
         "post-compact read must see the legacy row (fold RG) + the journal row");
     assert!(live.iter().any(|(r, _)| r == "legacy-1"));
     assert!(live.iter().any(|(r, _)| r == "journal-1"));
-    assert_eq!(shard::shard_count(kernel, "mixed", "main"), 0);
+    assert_eq!(shard::shard_count(kernel, "mixed", "main").unwrap(), 0);
 
     let fresh = UnifiedStorage::new_local(dir.path()).unwrap();
     let live2 = read::read_rows_json_pruned(fresh.kernel(), "mixed", "main", &kc, None, &[])

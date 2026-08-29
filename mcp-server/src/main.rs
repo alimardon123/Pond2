@@ -584,7 +584,9 @@ fn tool_vacuum(storage: &UnifiedStorage, args: &JsonValue) -> Result<JsonValue, 
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let gc = GarbageCollector::new(storage.kernel());
-    let result = gc.vacuum(None, preserve_days, dry_run);
+    // C17: vacuum aborts on ref-read failures (deleting blobs whose
+    // reachability could not be established would destroy live data).
+    let result = gc.vacuum(None, preserve_days, dry_run)?;
     Ok(json!({
         "deleted": result.deleted,
         "preserved": result.preserved,
@@ -601,7 +603,11 @@ fn tool_get_schema(storage: &UnifiedStorage, args: &JsonValue) -> Result<JsonVal
     let active = storage.get_active_branch(collection);
 
     // Resolve HEAD, decode manifest, extract schema.
+    // C17: a FAILED branch-ref read is an Err — an outage is not a fresh
+    // collection (distinct from the "has no commits" arm).
     let head = kernel.resolve(&pond_storage::branch_ref(collection, &active))
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?
         .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
 
     let manifest_bytes = commit::resolve_manifest_bytes(kernel, &head)

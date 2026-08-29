@@ -233,8 +233,12 @@ impl WriteBuffer {
         }
 
         // Capture base_head on first write (avoids N ref-resolve calls).
+        // C17: a FAILED branch-ref read is an Err — a phantom-None base_head
+        // would both fork history and silently pass the staleness check.
         if buf.base_head.is_none() {
-            buf.base_head = self.kernel.resolve(&branch_ref(collection, branch));
+            buf.base_head = self.kernel.resolve(&branch_ref(collection, branch))
+                .map_err(|e| format!(
+                    "Failed to read branch ref for collection '{}': {}", collection, e))?;
             let idx = buf.base_head.as_ref()
                 .and_then(|h| commit::read_commit(&self.kernel, h))
                 .map(|c| c.index + 1)
@@ -402,8 +406,12 @@ impl WriteBuffer {
             }
 
             // Check staleness: if the branch HEAD moved (e.g., concurrent
-            // unbuffered write), discard and error.
-            let current_head = self.kernel.resolve(&branch_ref(collection, branch));
+            // unbuffered write), discard and error. C17: a FAILED read is
+            // an Err — an unreadable HEAD must not silently pass the check
+            // (that would flush on top of an unknown base).
+            let current_head = self.kernel.resolve(&branch_ref(collection, branch))
+                .map_err(|e| format!(
+                    "Failed to read branch ref for collection '{}': {}", collection, e))?;
             let stale = buf.generation > 0
                 && buf.base_head.as_ref()
                     .is_none_or(|h| {
@@ -578,7 +586,7 @@ mod tests {
         assert!(!hash.is_empty());
 
         // Read the manifest and verify 2 RGs.
-        let head = kernel.resolve(&branch_ref("t", "main")).unwrap();
+        let head = kernel.resolve(&branch_ref("t", "main")).unwrap().unwrap();
         let pack_bytes = kernel.read_blob(&head).unwrap();
         let (_, manifest_bytes, _inline) =
             pond_pack::decode_pack(&pack_bytes).unwrap();
@@ -761,7 +769,7 @@ mod tests {
         fn put_path(&self, path: &str, hash: &str) -> std::io::Result<()> {
             self.inner.put_path(path, hash)
         }
-        fn get_path(&self, path: &str) -> Option<String> {
+        fn get_path(&self, path: &str) -> std::io::Result<Option<String>> {
             self.inner.get_path(path)
         }
         fn delete_path(&self, path: &str) -> std::io::Result<bool> {

@@ -643,20 +643,27 @@ impl S3ObjectStore {
     ///
     /// Used by the trait's `put_path_if` override to combine content
     /// verification and ETag capture into a single GET (was two: HEAD + GET).
-    fn get_path_with_etag(&self, path: &str) -> Option<(String, String)> {
+    ///
+    /// C17 error channel: `Ok(None)` = unbound, `Err` = the ref GET failed
+    /// (a failed CAS pre-read must NOT masquerade as "absent" — that used
+    /// to make `put_path_if` return Ok(false) on outages).
+    fn get_path_with_etag(&self, path: &str) -> io::Result<Option<(String, String)>> {
         let key = self.path_key(path);
         match self.s3_request("GET", &key, None, None, &[]) {
             Ok(resp) => {
                 let etag = resp.header("etag").unwrap_or("").to_string();
                 let mut body = String::new();
-                if resp.into_reader().read_to_string(&mut body).is_err() {
-                    return None;
+                if let Err(e) = resp.into_reader().read_to_string(&mut body) {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData,
+                        format!("failed reading ref body for '{}': {}", path, e)));
                 }
                 let mut s = self.stats.lock().unwrap();
                 s.gets += 1;
-                extract_hash_from_json(&body).map(|hash| (hash, etag))
+                Ok(extract_hash_from_json(&body).map(|hash| (hash, etag)))
             }
-            Err(_) => None,
+            // 404 = unbound; anything else is a FAILED ref read (C17).
+            Err(e) if is_s3_not_found(&e) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
@@ -1125,8 +1132,13 @@ impl ObjectStore for S3ObjectStore {
             // Single GET: verify content hash AND capture ETag for If-Match.
             // Previous impl wasted a separate HEAD (3 RTTs total).
             let (current_hash, etag) = match self.get_path_with_etag(path) {
-                Some(pair) => pair,
-                None => return Ok(false),
+                Ok(Some(pair)) => pair,
+                // Unbound ref: cannot match a Some(expected) → CAS loses.
+                Ok(None) => return Ok(false),
+                // FAILED pre-read (C17): propagate — a failed GET must not
+                // masquerade as a phantom "absent" (same as the trait's
+                // default put_path_if).
+                Err(e) => return Err(e),
             };
 
             if current_hash != expected {
@@ -1178,19 +1190,26 @@ impl ObjectStore for S3ObjectStore {
         }
     }
 
-    fn get_path(&self, path: &str) -> Option<String> {
+    fn get_path(&self, path: &str) -> io::Result<Option<String>> {
         let key = self.path_key(path);
         match self.s3_request("GET", &key, None, None, &[]) {
             Ok(resp) => {
                 let mut body = String::new();
-                if resp.into_reader().read_to_string(&mut body).is_err() {
-                    return None;
+                if let Err(e) = resp.into_reader().read_to_string(&mut body) {
+                    // The GET succeeded but the body is unreadable — a
+                    // corrupt/truncated ref object, NOT an absent one.
+                    return Err(io::Error::new(io::ErrorKind::InvalidData,
+                        format!("failed reading ref body for '{}': {}", path, e)));
                 }
                 let mut s = self.stats.lock().unwrap();
                 s.gets += 1;
-                extract_hash_from_json(&body)
+                Ok(extract_hash_from_json(&body))
             }
-            Err(_) => None,
+            // 404 = unbound (same helper delete_path/list use); every other
+            // status (403/429/500, transport timeout) is a FAILED ref read
+            // — surfaced instead of masquerading as an absent ref (C17).
+            Err(e) if is_s3_not_found(&e) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
@@ -1596,23 +1615,40 @@ impl S3ObjectStore {
     }
 
     /// Async variant of [`ObjectStore::get_path`]. Resolves a named path
-    /// to its content hash. Returns `None` if the path is unbound or on error.
-    pub async fn get_path_async(&self, path: &str) -> Option<String> {
+    /// to its content hash. `Ok(None)` = unbound; `Err` = the ref GET
+    /// failed (C17 — parity with the sync method; no callers today, kept
+    /// coherent with the trait contract).
+    pub async fn get_path_async(&self, path: &str) -> io::Result<Option<String>> {
         let key = self.path_key(path);
         let resp = match self.s3_request_async("GET", &key, None, None, &[]).await {
             Ok(r) => r,
-            Err(_) => return None,
+            Err(e) => {
+                if is_s3_not_found(&e) {
+                    return Ok(None);
+                }
+                return Err(e);
+            }
         };
         if !resp.status().is_success() {
-            return None;
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 404 {
+                return Ok(None);
+            }
+            return Err(io::Error::other(
+                format!("S3 returned {}: {}", status, body),
+            ));
         }
         let body = match resp.text().await {
             Ok(b) => b,
-            Err(_) => return None,
+            Err(e) => {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    format!("failed reading ref body for '{}': {}", path, e)));
+            }
         };
         let mut s = self.stats.lock().unwrap();
         s.gets += 1;
-        extract_hash_from_json(&body)
+        Ok(extract_hash_from_json(&body))
     }
 }
 

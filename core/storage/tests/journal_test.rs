@@ -177,7 +177,7 @@ impl ObjectStore for CountingStore {
     fn put_path(&self, path: &str, hash: &str) -> std::io::Result<()> {
         self.inner.put_path(path, hash)
     }
-    fn get_path(&self, path: &str) -> Option<String> {
+    fn get_path(&self, path: &str) -> std::io::Result<Option<String>> {
         self.get_path_calls.fetch_add(1, Ordering::SeqCst);
         self.get_path_paths.lock().unwrap().push(path.to_string());
         self.inner.get_path(path)
@@ -596,7 +596,7 @@ fn test_legacy_repo_reads_correctly() {
     ).unwrap();
     assert_eq!(head_rows.len(), 10, "legacy HEAD rows read through the new resolver");
 
-    let (_, shards) = shard::read_with_shards(kernel, "legacy", "main");
+    let (_, shards) = shard::read_with_shards(kernel, "legacy", "main").unwrap();
     assert_eq!(shards.len(), 2, "both legacy shards discovered");
     let mut all: Vec<Value> = head_rows.iter().map(|(_, r)| r.clone()).collect();
     for (_, shard_hash) in &shards {
@@ -652,7 +652,7 @@ fn test_compact_folds_journal_and_shards() {
 
     // branch_ref → the new snapshot pack, whose manifest holds ALL RGs:
     // 3 write RGs + 1 shard-fold RG.
-    let head = kernel.resolve(&branch_ref("foldme", "main")).unwrap();
+    let head = kernel.resolve(&branch_ref("foldme", "main")).unwrap().unwrap();
     assert_eq!(head, stats.new_snapshot, "compaction advanced the branch ref (LWW)");
     let manifest_bytes = pond_storage::commit::resolve_manifest_bytes(kernel, &head).unwrap();
     let manifest = CollectionManifest::decode(&manifest_bytes).unwrap();
@@ -669,16 +669,16 @@ fn test_compact_folds_journal_and_shards() {
     for seq in 1..=5u64 {
         let path = entry_path("foldme", "main", &writer_id, seq);
         if seq == 5 {
-            assert!(kernel.resolve(&path).is_some(),
+            assert!(kernel.resolve(&path).unwrap().is_some(),
                 "the compactor's own entry pointer survives the fold");
         } else {
-            assert!(kernel.resolve(&path).is_none(),
+            assert!(kernel.resolve(&path).unwrap().is_none(),
                 "folded entry path must be deleted: {}", path);
         }
     }
 
     // Shards cleared.
-    assert!(shard::list_shards(kernel, "foldme", "main").is_empty(),
+    assert!(shard::list_shards(kernel, "foldme", "main").unwrap().is_empty(),
         "folded shards are cleared");
 
     // The full state survives the fold: 25 rows.
@@ -753,7 +753,7 @@ fn test_compact_preserves_tombstones_no_resurrection() {
     let head_rows = read::read_rows_json_pruned(
         kernel, "graves", "main", &key_fields(), None, &[],
     ).unwrap();
-    let (_, shards) = shard::read_with_shards(kernel, "graves", "main");
+    let (_, shards) = shard::read_with_shards(kernel, "graves", "main").unwrap();
     let mut all: Vec<Value> = head_rows.iter().map(|(_, r)| r.clone()).collect();
     for (_, shard_hash) in &shards {
         let data = kernel.read_blob(shard_hash).unwrap();
@@ -767,7 +767,7 @@ fn test_compact_preserves_tombstones_no_resurrection() {
     // Fold. The shard-fold RG must carry the TOMBSTONES, not just live rows.
     let stats = compact(kernel, "graves", "main", &["id".to_string()]).unwrap();
     assert_eq!(stats.shards_folded, 1);
-    assert!(shard::list_shards(kernel, "graves", "main").is_empty(),
+    assert!(shard::list_shards(kernel, "graves", "main").unwrap().is_empty(),
         "shards cleared by the fold");
 
     // Post-fold read: STILL 3 live rows — no resurrection.
@@ -812,14 +812,14 @@ fn test_compact_race_benign() {
     ).unwrap();
 
     let stats1 = compact(kernel, "benign", "main", &["id".to_string()]).unwrap();
-    let head1 = kernel.resolve(&branch_ref("benign", "main")).unwrap();
+    let head1 = kernel.resolve(&branch_ref("benign", "main")).unwrap().unwrap();
     assert_eq!(head1, stats1.new_snapshot);
 
     // Second compaction — folds the first fold (no new data). Both folds
     // are valid states; LWW picks the second.
     let stats2 = compact(kernel, "benign", "main", &["id".to_string()]).unwrap();
     assert_ne!(stats1.new_snapshot, stats2.new_snapshot);
-    let head2 = kernel.resolve(&branch_ref("benign", "main")).unwrap();
+    let head2 = kernel.resolve(&branch_ref("benign", "main")).unwrap().unwrap();
     assert_eq!(head2, stats2.new_snapshot, "LWW: the later fold wins the ref");
 
     // Both packs still exist as blobs (immutable content) and carry the
@@ -952,8 +952,8 @@ fn test_journal_status() {
     compact(&kernel, "st", "main", &["id".to_string()]).unwrap();
     let st = status(&kernel, "st", "main").unwrap();
     let snapshot = st.snapshot.expect("compaction created the snapshot");
-    assert!(kernel.resolve(&branch_ref("st", "main")).is_some());
-    assert_eq!(kernel.resolve(&branch_ref("st", "main")), Some(snapshot));
+    assert!(kernel.resolve(&branch_ref("st", "main")).unwrap().is_some());
+    assert_eq!(kernel.resolve(&branch_ref("st", "main")).unwrap(), Some(snapshot));
     assert_eq!(st.snapshot_upto.get("writer-0"), Some(&2u64));
     assert_eq!(st.snapshot_upto.get("writer-1"), Some(&2u64));
     assert_eq!(st.live_entries, 0, "everything is folded below the watermarks");
@@ -983,11 +983,11 @@ fn test_journal_append_never_touches_shared_refs() {
     let ids: Vec<i64> = (0..3).collect();
     let vals: Vec<i64> = ids.iter().map(|i| i * 2).collect();
     write::write_rows_i64(kernel, "refs", "main", &[("id", &ids), ("val", &vals)], "first").unwrap();
-    let branch_before = kernel.resolve(&branch_ref("refs", "main"));
-    let manifest_before = kernel.resolve(&pond_storage::manifest_ref("refs", "main"));
-    let bare_before = kernel.resolve("refs");
+    let branch_before = kernel.resolve(&branch_ref("refs", "main")).unwrap();
+    let manifest_before = kernel.resolve(&pond_storage::manifest_ref("refs", "main")).unwrap();
+    let bare_before = kernel.resolve("refs").unwrap();
     let writer_id = writer_for(kernel, "refs", "main").lock().unwrap().writer_id.clone();
-    let entry1 = kernel.resolve(&entry_path("refs", "main", &writer_id, 1));
+    let entry1 = kernel.resolve(&entry_path("refs", "main", &writer_id, 1)).unwrap();
 
     let ids2: Vec<i64> = (3..6).collect();
     let vals2: Vec<i64> = ids2.iter().map(|i| i * 2).collect();
@@ -997,13 +997,13 @@ fn test_journal_append_never_touches_shared_refs() {
     // entry #1's pointer is untouched (unique paths are never overwritten),
     // and the ONLY new ref is the writer's own entry #3 (seq 2 was the
     // bootstrap fold).
-    assert_eq!(kernel.resolve(&branch_ref("refs", "main")), branch_before);
-    assert_eq!(kernel.resolve(&pond_storage::manifest_ref("refs", "main")), manifest_before);
-    assert_eq!(kernel.resolve("refs"), bare_before);
-    assert_eq!(kernel.resolve(&entry_path("refs", "main", &writer_id, 1)), entry1);
-    assert!(kernel.resolve(&entry_path("refs", "main", &writer_id, 2)).is_some(),
+    assert_eq!(kernel.resolve(&branch_ref("refs", "main")).unwrap(), branch_before);
+    assert_eq!(kernel.resolve(&pond_storage::manifest_ref("refs", "main")).unwrap(), manifest_before);
+    assert_eq!(kernel.resolve("refs").unwrap(), bare_before);
+    assert_eq!(kernel.resolve(&entry_path("refs", "main", &writer_id, 1)).unwrap(), entry1);
+    assert!(kernel.resolve(&entry_path("refs", "main", &writer_id, 2)).unwrap().is_some(),
         "the bootstrap fold's own pointer exists");
-    assert!(kernel.resolve(&entry_path("refs", "main", &writer_id, 3)).is_some(),
+    assert!(kernel.resolve(&entry_path("refs", "main", &writer_id, 3)).unwrap().is_some(),
         "the second append's unique-path pointer exists");
 
     // put_path_if has NO production callers in the journal era — the CAS
@@ -1023,7 +1023,7 @@ fn test_compact_on_empty_collection_is_a_clean_noop() {
     assert_eq!(stats.entries_folded, 0);
     assert_eq!(stats.shards_folded, 0);
     assert!(stats.new_snapshot.is_empty(), "no-op compaction writes no snapshot");
-    assert!(kernel.resolve(&branch_ref("ghosts", "main")).is_none(),
+    assert!(kernel.resolve(&branch_ref("ghosts", "main")).unwrap().is_none(),
         "a no-op compaction must not create refs");
 }
 
@@ -1680,12 +1680,12 @@ fn test_c11_zombie_loser_entry_cleaned_up_by_next_compact() {
     let stats = journal::compact(kernel, "zombie", "main", &[]).unwrap();
     assert_eq!(stats.entries_folded, 1, "the stale loser entry was folded (it is live in the raw view)");
     assert!(
-        kernel.resolve(&entry_path("zombie", "main", "W_B", 1)).is_none(),
+        kernel.resolve(&entry_path("zombie", "main", "W_B", 1)).unwrap().is_none(),
         "the zombie loser entry path must be DELETED by the fold's delete loop"
     );
 
     // The folded snapshot: D1's RG + D2's RG, each identity exactly once.
-    let head = kernel.resolve(&branch_ref("zombie", "main")).unwrap();
+    let head = kernel.resolve(&branch_ref("zombie", "main")).unwrap().unwrap();
     let manifest_bytes = pond_storage::commit::resolve_manifest_bytes(kernel, &head).unwrap();
     let manifest = CollectionManifest::decode(&manifest_bytes).unwrap();
     let identities: Vec<(String, Option<u64>)> = manifest
@@ -1744,7 +1744,7 @@ fn test_resolve_packs_fast_path_zero_extra_reads() {
     get_blob_calls.store(0, Ordering::SeqCst);
     let plans = journal::resolve_packs(&kernel, "fast", "main", true).unwrap();
     assert_eq!(plans.len(), 2, "snapshot + one live data entry");
-    let snapshot = kernel.resolve(&branch_ref("fast", "main")).unwrap();
+    let snapshot = kernel.resolve(&branch_ref("fast", "main")).unwrap().unwrap();
     assert_eq!(plans[0].pack_hash, snapshot, "the snapshot plan is first");
     assert!(plans.iter().all(|p| p.only_rgs.is_none()),
         "no compact entry live → no coverage filtering");
@@ -1802,7 +1802,7 @@ fn test_resolve_packs_plan_order_is_stable() {
         .cloned()
         .collect();
     live.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
-    let snapshot = kernel.resolve(&branch_ref("planorder", "main")).unwrap();
+    let snapshot = kernel.resolve(&branch_ref("planorder", "main")).unwrap().unwrap();
     let mut expected: Vec<String> = vec![snapshot];
     expected.extend(live.iter().map(|(_, _, h)| h.clone()));
 
@@ -1826,4 +1826,250 @@ fn test_resolve_packs_plan_order_is_stable() {
     assert_eq!(got.len(), 45, "all 45 rows visible through the plan");
     got.dedup();
     assert_eq!(got.len(), 45, "each row exactly once");
+}
+
+// ---------------------------------------------------------------------------
+// C17 — a FAILED journal epoch probe is a TRUNCATED-view error, never an
+// empty suffix. `ObjectStore::get_path` used to return Option with no error
+// channel: a transient ref GET failure at seq N looked exactly like "the
+// writer's log ends at N-1", and resolve_view returned a view silently
+// missing every entry from N on — a TRUNCATED journal, no signal.
+// ---------------------------------------------------------------------------
+
+/// A store wrapper whose get_path fails ONLY for journal ENTRY paths
+/// (`.../journal/<writer>/<seq>`) once the shared flag is set — the branch
+/// ref, manifest ref, and shard refs stay healthy, isolating exactly the
+/// epoch-probe failure class. `store_id` is deliberately UNIQUE per
+/// instance: the journal's process-local discovery cache is keyed by
+/// store_id, so the reading kernel starts with a cold cache and MUST probe
+/// for the tail entries (a warm cache with remembered entries could mask
+/// the probe outage).
+struct EntryOutageStore {
+    inner: LocalFSObjectStore,
+    fail_entries: Arc<AtomicU64>, // 0 = healthy, 1 = entry reads fail
+    id: String,
+}
+
+impl EntryOutageStore {
+    fn new(dir: &std::path::Path) -> (Self, Arc<AtomicU64>) {
+        static INSTANCE: AtomicU64 = AtomicU64::new(0);
+        let fail_entries = Arc::new(AtomicU64::new(0));
+        let n = INSTANCE.fetch_add(1, Ordering::SeqCst);
+        (
+            Self {
+                inner: LocalFSObjectStore::new(dir).unwrap(),
+                fail_entries: Arc::clone(&fail_entries),
+                // Unique identity: same backing dir, but a DIFFERENT cache
+                // key than the seeding (plain) kernel — see the struct doc.
+                id: format!("entry-outage-{}-{}", dir.display(), n),
+            },
+            fail_entries,
+        )
+    }
+}
+
+impl ObjectStore for EntryOutageStore {
+    fn put_blob(&self, data: &[u8]) -> std::io::Result<String> {
+        self.inner.put_blob(data) // writes stay healthy (outage = read-side)
+    }
+    fn get_blob(&self, hash: &str) -> std::io::Result<Vec<u8>> {
+        self.inner.get_blob(hash) // blob reads stay healthy (isolates the ref hole)
+    }
+    fn put_path(&self, path: &str, hash: &str) -> std::io::Result<()> {
+        self.inner.put_path(path, hash)
+    }
+    fn get_path(&self, path: &str) -> std::io::Result<Option<String>> {
+        // Entry paths are exactly `.../journal/<writer>/<seq:012>`; the
+        // branch/manifest/shard refs never contain "/journal/".
+        if self.fail_entries.load(Ordering::SeqCst) == 1 && path.contains("/journal/") {
+            return Err(std::io::Error::other("simulated ref outage"));
+        }
+        self.inner.get_path(path)
+    }
+    fn delete_path(&self, path: &str) -> std::io::Result<bool> {
+        self.inner.delete_path(path)
+    }
+    fn list_paths(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        self.inner.list_paths(prefix) // discovery LISTs stay healthy
+    }
+    fn list_dirs(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        self.inner.list_dirs(prefix)
+    }
+    fn store_id(&self) -> String {
+        self.id.clone() // unique → cold discovery cache for the reader
+    }
+    fn blob_exists(&self, hash: &str) -> bool {
+        self.inner.blob_exists(hash)
+    }
+    fn delete_blob(&self, hash: &str) -> std::io::Result<bool> {
+        self.inner.delete_blob(hash)
+    }
+}
+
+/// REVERT CHECK (C17): before the `get_path` error channel, this exact test
+/// FAILED — the failed entry probe at seq 1 masqueraded as "the writer's
+/// log is empty", `resolve_packs` returned `Ok([snapshot])`, and the reader
+/// silently missed every row the external writer had committed (a
+/// TRUNCATED journal view). With `io::Result<Option<String>>`, the failed
+/// probe propagates as `Err("journal entry probe failed (writer W_OUTAGE
+/// seq 1): ...")` — and after the outage clears, the SAME view resolves
+/// complete (nothing was corrupted; the failure was transient).
+#[test]
+fn test_c17_probe_outage_is_error_not_truncation() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // 1. Seed through a PLAIN kernel (healthy; its discovery cache lives
+    //    under the canonical store id and cannot warm the reader below):
+    //    one journal write (bootstrap-folds into the branch ref) + two
+    //    fabricated entries for an EXTERNAL writer, live above the
+    //    snapshot's watermark.
+    let plain = UnifiedStorage::new_local(dir.path()).unwrap();
+    let kernel = plain.kernel();
+    let ids = vec![1i64];
+    let vals = vec![10i64];
+    write::write_rows_i64(kernel, "probe17", "main", &[("id", &ids), ("val", &vals)], "base")
+        .expect("seed write (bootstrap fold)");
+    let e_ids = vec![2i64];
+    let e_vals = vec![20i64];
+    let pack2 = fabricate_entry(kernel, "probe17", "main", "W_OUTAGE", 1, &e_ids, &e_vals);
+    let e_ids2 = vec![3i64];
+    let e_vals2 = vec![30i64];
+    let pack3 = fabricate_entry(kernel, "probe17", "main", "W_OUTAGE", 2, &e_ids2, &e_vals2);
+    assert!(!pack2.is_empty() && !pack3.is_empty());
+
+    // Healthy baseline through the outage-wrapped reader (cold cache): the
+    // full view = snapshot + both external entries.
+    let (store, fail_entries) = EntryOutageStore::new(dir.path());
+    let reader = PondKernel::new_with_store(Box::new(store));
+    let plans = journal::resolve_packs(&reader, "probe17", "main", true)
+        .expect("healthy resolve through the outage-wrapped reader");
+    assert_eq!(plans.len(), 3, "snapshot + two live external entries");
+
+    // 2. Flip the entry-read outage: resolve_packs must ERROR (the probe
+    //    cannot distinguish "absent" from "failed" anymore — it KNOWS the
+    //    read failed). Pre-C17 this returned Ok with the entries missing.
+    fail_entries.store(1, Ordering::SeqCst);
+    let err = journal::resolve_packs(&reader, "probe17", "main", true)
+        .expect_err("a failed epoch probe must surface as an Err, not an empty suffix");
+    assert!(
+        err.contains("journal entry probe failed"),
+        "error should name the failed probe: {err}"
+    );
+    // NOTE (orchestrator fix): the failing probe may belong to EITHER
+    // discovered writer — the real seed writer's log ends at its
+    // watermark, so its first probe PAST the watermark (seq 3) fails just
+    // like W_OUTAGE's first probe (seq 1); std::thread::scope probing
+    // order is nondeterministic. What matters: the error names SOME
+    // writer + seq AND the underlying io error (probe attribution), and
+    // the view resolution ERRORED instead of silently truncating.
+    assert!(
+        err.contains("seq") && err.contains("simulated ref outage"),
+        "error should carry writer/seq and the underlying io error: {err}"
+    );
+
+    // 3. Recovery: outage off → the SAME resolution is complete again (the
+    //    failure was transient; no state was corrupted by the failed read).
+    fail_entries.store(0, Ordering::SeqCst);
+    let rows = read::read_rows_json_pruned(&reader, "probe17", "main", &key_fields(), None, &[])
+        .expect("full view after recovery");
+    let mut ids: Vec<i64> = rows
+        .iter()
+        .map(|(_, r)| r.get("id").and_then(|v| v.as_i64()).unwrap_or(-1))
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 2, 3], "recovered view is complete, not truncated");
+}
+
+/// C13 (N+6): the RAW read path (`read::read` / `pond read` / `s.read`)
+/// routes through the journal resolver instead of the branch ref alone.
+/// Pre-C13, after D3 the branch ref is a CACHE of the last fold: raw
+/// reads silently missed every journal pack appended since — a second
+/// `write_rows_i64` (no fold yet) was INVISIBLE to `read::read` (it
+/// returned the folded snapshot's bytes only). Post-C13 the raw read
+/// concatenates the live RG bytes of the full D6 plan.
+#[test]
+fn test_c13_raw_read_is_journal_aware() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+    let kernel = storage.kernel();
+    let coll = "c13raw";
+
+    // Two journal writes, NO manual compact: the first bootstraps (folds
+    // into the branch ref), the second stays live above the watermark.
+    let ids1: Vec<i64> = vec![1, 2, 3];
+    let vals1: Vec<i64> = vec![10, 20, 30];
+    write::write_rows_i64(kernel, coll, "main", &[("id", &ids1), ("val", &vals1)], "w1")
+        .expect("first write (bootstrap fold)");
+    let bytes_after_first = read::read(kernel, coll, "main")
+        .expect("raw read after the first write");
+
+    let ids2: Vec<i64> = vec![4, 5];
+    let vals2: Vec<i64> = vec![40, 50];
+    write::write_rows_i64(kernel, coll, "main", &[("id", &ids2), ("val", &vals2)], "w2")
+        .expect("second write (journal-live, no fold)");
+    let bytes_after_second = read::read(kernel, coll, "main")
+        .expect("raw read must succeed with live journal entries");
+
+    // The journal's live packs must contribute bytes: pre-C13 this read
+    // returned the folded snapshot only (byte-identical to after the
+    // first write — the second write's RG was silently missing).
+    assert!(
+        bytes_after_second.len() > bytes_after_first.len(),
+        "C13: the raw read must include the live journal pack's bytes \
+         ({} bytes after w2 vs {} after w1)",
+        bytes_after_second.len(),
+        bytes_after_first.len()
+    );
+
+    // Semantic anchor: the journal-aware reader sees all 5 rows — the raw
+    // path's plan is the SAME plan (resolve_packs), so the raw bytes'
+    // RG count matches the rows' RG provenance.
+    let rows = read::read_rows_json_pruned(kernel, coll, "main", &[], None, &[])
+        .expect("journal-aware rows");
+    assert_eq!(rows.len(), 5, "sanity: both writes visible to the row reader");
+
+    // After an explicit compact, the branch ref folds everything: the raw
+    // read stays correct (now from the snapshot alone) — same 5 rows.
+    pond_storage::journal::compact(kernel, coll, "main", &[]).expect("compact");
+    let rows_after_fold = read::read_rows_json_pruned(kernel, coll, "main", &[], None, &[])
+        .expect("rows after fold");
+    assert_eq!(rows_after_fold.len(), 5, "fold preserves all rows");
+    let bytes_after_fold = read::read(kernel, coll, "main")
+        .expect("raw read after fold");
+    assert!(
+        !bytes_after_fold.is_empty(),
+        "raw read after fold returns the snapshot's bytes"
+    );
+}
+
+/// C13 companion: a FRESH collection (journal entries but the branch ref
+/// not yet written by any fold — the bootstrap window) still reads: the
+/// raw path's plan is entries-only, so the read returns the entry RGs,
+/// NOT the pre-C13 "has no commits" error.
+#[test]
+fn test_c13_raw_read_no_fold_yet_returns_entry_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = UnifiedStorage::new_local(dir.path()).unwrap();
+    let kernel = storage.kernel();
+    let coll = "c13fresh";
+
+    // Fabricate a live entry WITHOUT any fold: fabricate_entry writes the
+    // pack + entry ref directly (an external writer the snapshot never
+    // folded — the same construction the C17 probe test uses).
+    let ids: Vec<i64> = vec![7];
+    let vals: Vec<i64> = vec![70];
+    let pack = fabricate_entry(kernel, coll, "main", "C13W", 1, &ids, &vals);
+    assert!(!pack.is_empty(), "entry fabricated");
+
+    // No branch ref exists. Pre-C13: Err("Collection 'c13fresh' has no
+    // commits"). Post-C13: the entry's RG bytes concatenate to non-empty
+    // output (the journal IS the state during the bootstrap window).
+    let bytes = read::read(kernel, coll, "main")
+        .expect("entries-only collections read their live packs");
+    assert!(!bytes.is_empty(), "the fabricated entry contributes bytes");
+
+    let rows = read::read_rows_json_pruned(kernel, coll, "main", &[], None, &[])
+        .expect("rows from the entries-only view");
+    assert_eq!(rows.len(), 1, "the row reader sees the same live entry");
+    assert_eq!(rows[0].1["id"], json!(7));
 }

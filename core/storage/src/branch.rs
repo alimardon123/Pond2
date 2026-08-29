@@ -33,19 +33,25 @@ pub fn branch(
     // + shards), not just the last folded snapshot. Skipped when nothing
     // is live: compact would be a pointless rewrite, and legacy fixtures
     // may carry non-PMAN manifests that correctly refuse to fold.
-    if crate::journal::has_live_state(kernel, collection, active_branch) {
+    if crate::journal::has_live_state(kernel, collection, active_branch)? {
         crate::journal::compact(kernel, collection, active_branch, &[])?;
     }
 
     let source_commit = kernel.resolve(&branch_ref(collection, active_branch))
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?
         .ok_or_else(|| format!("Collection '{}' has no commits to branch from", collection))?;
 
     // Copy commit ref
     kernel.reference(&branch_ref(collection, branch_name), &source_commit)
         .map_err(|e| format!("Failed to create branch ref: {}", e))?;
 
-    // Copy manifest ref (matches Python branch())
-    if let Some(source_manifest) = kernel.resolve(&manifest_ref(collection, active_branch)) {
+    // Copy manifest ref (matches Python branch()). C17: a FAILED read is
+    // an Err — not a phantom "no manifest ref".
+    if let Some(source_manifest) = kernel.resolve(&manifest_ref(collection, active_branch))
+        .map_err(|e| format!(
+            "Failed to read manifest ref for collection '{}': {}", collection, e))?
+    {
         let _ = kernel.reference(&manifest_ref(collection, branch_name), &source_manifest);
     }
 
@@ -59,7 +65,11 @@ pub fn checkout(
     collection: &str,
     branch_name: &str,
 ) -> Result<(), String> {
-    if kernel.resolve(&branch_ref(collection, branch_name)).is_none() {
+    if kernel.resolve(&branch_ref(collection, branch_name))
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?
+        .is_none()
+    {
         return Err(format!("Branch '{}' does not exist in '{}'", branch_name, collection));
     }
     Ok(())
@@ -119,17 +129,22 @@ pub fn merge(
     // silently dropped from the merge (the moto merge test's exact
     // failure: dave written to feat existed only as a live journal entry).
     // Skipped when nothing is live (see has_live_state).
-    if crate::journal::has_live_state(kernel, collection, source_branch) {
+    if crate::journal::has_live_state(kernel, collection, source_branch)? {
         crate::journal::compact(kernel, collection, source_branch, &[])?;
     }
-    if crate::journal::has_live_state(kernel, collection, target_branch) {
+    if crate::journal::has_live_state(kernel, collection, target_branch)? {
         crate::journal::compact(kernel, collection, target_branch, &[])?;
     }
 
-    // Resolve both branch HEADs
+    // Resolve both branch HEADs. C17: a FAILED read is an Err — an outage
+    // is not a missing branch.
     let target_head = kernel.resolve(&branch_ref(collection, target_branch))
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?
         .ok_or_else(|| format!("Target branch '{}' not found", target_branch))?;
     let source_head = kernel.resolve(&branch_ref(collection, source_branch))
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?
         .ok_or_else(|| format!("Source branch '{}' not found", source_branch))?;
 
     // Resolve manifest hashes (handles PNPK "packed" sentinel)
@@ -272,7 +287,7 @@ pub fn merge(
     // CRDT shards (upsert_shard, delete_shard) live alongside HEAD. When merging
     // branches, these shards must be copied so that row-level CRDT updates/deletes
     // from the source branch are visible in the target branch after merge.
-    let source_shards = crate::shard::list_shards(kernel, collection, source_branch);
+    let source_shards = crate::shard::list_shards(kernel, collection, source_branch)?;
     let target_shard_prefix = crate::shards_prefix(collection, target_branch);
     for (shard_name, shard_hash) in &source_shards {
         let target_ref = format!("{}{}", target_shard_prefix, shard_name);
@@ -290,6 +305,8 @@ pub fn undo(
     steps: usize,
 ) -> Result<String, String> {
     let mut current = kernel.resolve(&branch_ref(collection, active_branch))
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?
         .ok_or_else(|| "No commits to undo".to_string())?;
 
     for _ in 0..steps {
@@ -605,13 +622,13 @@ mod tests {
 
         // Both branches should point at the same commit
         assert_eq!(
-            kernel.resolve(&branch_ref("users", "main")),
-            kernel.resolve(&branch_ref("users", "experiment"))
+            kernel.resolve(&branch_ref("users", "main")).unwrap(),
+            kernel.resolve(&branch_ref("users", "experiment")).unwrap()
         );
         // Both manifest refs should match
         assert_eq!(
-            kernel.resolve(&manifest_ref("users", "main")),
-            kernel.resolve(&manifest_ref("users", "experiment"))
+            kernel.resolve(&manifest_ref("users", "main")).unwrap(),
+            kernel.resolve(&manifest_ref("users", "experiment")).unwrap()
         );
     }
 
@@ -709,7 +726,7 @@ mod tests {
 
         // main should now point at c1
         assert_eq!(
-            kernel.resolve(&branch_ref("users", "main")),
+            kernel.resolve(&branch_ref("users", "main")).unwrap(),
             Some(c1)
         );
     }
@@ -758,7 +775,7 @@ mod tests {
         assert_eq!(merge_commit.second_parent, Some(branch_pack_hash.clone()));
 
         // Verify main can now read the merged manifest
-        let main_head = kernel.resolve(&branch_ref("users", "main")).unwrap();
+        let main_head = kernel.resolve(&branch_ref("users", "main")).unwrap().unwrap();
         let manifest_data = commit::resolve_manifest_bytes(kernel, &main_head).unwrap();
         let merged_manifest = CollectionManifest::decode(&manifest_data).unwrap();
         // Should have 4 row groups (3 from main + 1 from feature, different keys = no conflict)
@@ -793,7 +810,7 @@ mod tests {
         let result = undo(kernel, "users", "main", 1).unwrap();
         assert_eq!(result, c1);
         // Manifest ref should point to data (c1's manifest)
-        assert_eq!(kernel.resolve(&manifest_ref("users", "main")), Some(data));
+        assert_eq!(kernel.resolve(&manifest_ref("users", "main")).unwrap(), Some(data));
     }
 
     /// Helper: create a minimal PMAN manifest with N row groups.

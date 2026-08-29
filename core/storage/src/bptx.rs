@@ -559,6 +559,8 @@ pub fn build_index_for_collection(
 ) -> Result<String, String> {
     let commit_ref = super::branch_ref(collection, active_branch);
     let commit_hash = kernel.resolve(&commit_ref)
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?
         .ok_or_else(|| format!("No commits in '{}' on branch '{}'", collection, active_branch))?;
 
     let manifest_hash = commit::resolve_manifest_hash(kernel, &commit_hash)
@@ -644,6 +646,8 @@ pub fn index_lookup(
 ) -> Result<Option<IndexHit>, String> {
     let meta_ref = BptxIndexMeta::meta_ref(collection, column);
     let meta_hash = kernel.resolve(&meta_ref)
+        .map_err(|e| format!(
+            "Failed to read BPTX index meta ref for '{}.{}': {}", collection, column, e))?
         .ok_or_else(|| format!("No BPTX index on column '{}' in '{}'", column, collection))?;
     let meta_bytes = kernel.read_blob(&meta_hash)
         .map_err(|e| format!("Failed to read index metadata: {}", e))?;
@@ -652,6 +656,8 @@ pub fn index_lookup(
 
     let blob_ref = BptxIndexMeta::blob_ref(collection, column);
     let blob_hash = kernel.resolve(&blob_ref)
+        .map_err(|e| format!(
+            "Failed to read BPTX index blob ref for '{}.{}': {}", collection, column, e))?
         .ok_or_else(|| "Index blob ref not found".to_string())?;
     let blob = kernel.read_blob(&blob_hash)
         .map_err(|e| format!("Failed to read index blob: {}", e))?;
@@ -678,6 +684,8 @@ pub fn index_lookup_checked(
     // 1. Resolve current HEAD manifest hash
     let commit_ref = super::branch_ref(collection, branch);
     let commit_hash = kernel.resolve(&commit_ref)
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?
         .ok_or_else(|| format!("No commits in '{}' on branch '{}'", collection, branch))?;
     let current_manifest_hash = commit::resolve_manifest_hash(kernel, &commit_hash)
         .ok_or_else(|| "Cannot resolve manifest from HEAD commit".to_string())?;
@@ -685,8 +693,12 @@ pub fn index_lookup_checked(
     // 2. Read index metadata and check staleness
     let meta_ref = BptxIndexMeta::meta_ref(collection, column);
     let meta_hash = match kernel.resolve(&meta_ref) {
-        Some(h) => h,
-        None => return Err("no_bptx_index".to_string()), // No index — caller falls through
+        Ok(Some(h)) => h,
+        // No index — caller falls through to the un-indexed path.
+        Ok(None) => return Err("no_bptx_index".to_string()),
+        // C17: a FAILED meta-ref read must not masquerade as "no index".
+        Err(e) => return Err(format!(
+            "Failed to read BPTX index meta ref for '{}.{}': {}", collection, column, e)),
     };
     let meta_bytes = kernel.read_blob(&meta_hash)
         .map_err(|e| format!("Failed to read index metadata: {}", e))?;
@@ -706,6 +718,8 @@ pub fn index_lookup_checked(
     //    then only the target leaf (1 Range GET).
     let blob_ref = BptxIndexMeta::blob_ref(collection, column);
     let blob_hash = kernel.resolve(&blob_ref)
+        .map_err(|e| format!(
+            "Failed to read BPTX index blob ref for '{}.{}': {}", collection, column, e))?
         .ok_or_else(|| "Index blob ref not found".to_string())?;
 
     // Step 1: Load header (48 bytes) to get tree geometry
@@ -763,14 +777,19 @@ pub fn index_lookup_checked(
 }
 
 /// Check if a BPTX index exists for the given collection+column.
-/// Returns true if the meta ref resolves.
+/// Returns Ok(true) if the meta ref resolves, Ok(false) if unbound.
+/// C17: a FAILED read is an Err — an outage is not "no index". (No
+/// callers today; the Result signature is kept C17-honest.)
 pub fn has_bptx_index(
     kernel: &PondKernel,
     collection: &str,
     column: &str,
-) -> bool {
+) -> Result<bool, String> {
     let meta_ref = BptxIndexMeta::meta_ref(collection, column);
-    kernel.resolve(&meta_ref).is_some()
+    Ok(kernel.resolve(&meta_ref)
+        .map_err(|e| format!(
+            "Failed to read BPTX index meta ref for '{}.{}': {}", collection, column, e))?
+        .is_some())
 }
 
 // ---------------------------------------------------------------------------
@@ -930,6 +949,8 @@ pub fn range_scan_checked(
     // 1. Resolve current HEAD manifest hash
     let commit_ref = super::branch_ref(collection, branch);
     let commit_hash = kernel.resolve(&commit_ref)
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?
         .ok_or_else(|| format!("No commits in '{}' on branch '{}'", collection, branch))?;
     let current_manifest_hash = commit::resolve_manifest_hash(kernel, &commit_hash)
         .ok_or_else(|| "Cannot resolve manifest from HEAD commit".to_string())?;
@@ -937,8 +958,12 @@ pub fn range_scan_checked(
     // 2. Read index metadata and check staleness
     let meta_ref = BptxIndexMeta::meta_ref(collection, column);
     let meta_hash = match kernel.resolve(&meta_ref) {
-        Some(h) => h,
-        None => return Err("no_bptx_index".to_string()),
+        Ok(Some(h)) => h,
+        // No index — caller falls through to the un-indexed path.
+        Ok(None) => return Err("no_bptx_index".to_string()),
+        // C17: a FAILED meta-ref read must not masquerade as "no index".
+        Err(e) => return Err(format!(
+            "Failed to read BPTX index meta ref for '{}.{}': {}", collection, column, e)),
     };
     let meta_bytes = kernel.read_blob(&meta_hash)
         .map_err(|e| format!("Failed to read index metadata: {}", e))?;
@@ -956,6 +981,8 @@ pub fn range_scan_checked(
     // 3. Load the full BPTX blob (typically small: <1MB for 100K entries)
     let blob_ref = BptxIndexMeta::blob_ref(collection, column);
     let blob_hash = kernel.resolve(&blob_ref)
+        .map_err(|e| format!(
+            "Failed to read BPTX index blob ref for '{}.{}': {}", collection, column, e))?
         .ok_or_else(|| "Index blob ref not found".to_string())?;
     let blob = kernel.read_blob(&blob_hash)
         .map_err(|e| format!("Failed to read index blob: {}", e))?;

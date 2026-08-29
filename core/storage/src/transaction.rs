@@ -31,7 +31,7 @@ pub fn commit_tx(
     tx_id: &str,
     message: &str,
 ) -> Result<String, String> {
-    if is_tx_aborted(kernel, tx_id) { return Err(format!("Transaction '{}' was already aborted", tx_id)); }
+    if is_tx_aborted(kernel, tx_id)? { return Err(format!("Transaction '{}' was already aborted", tx_id)); }
     // Write a commit marker blob
     let marker_data = format!(r#"{{"tx_id":"{}","message":"{}","status":"committed"}}"#,
                               tx_id, message);
@@ -52,7 +52,7 @@ pub fn commit_tx(
 /// The shards remain on storage but are invisible to readers (because
 /// the commit marker doesn't exist). GC will eventually delete them.
 pub fn abort_tx(kernel: &PondKernel, tx_id: &str) -> Result<String, String> {
-    if is_tx_committed(kernel, tx_id) { return Err(format!("Transaction '{}' was already committed", tx_id)); }
+    if is_tx_committed(kernel, tx_id)? { return Err(format!("Transaction '{}' was already committed", tx_id)); }
     let marker = serde_json::json!({"tx_id": tx_id, "status": "aborted", "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)});
     let bytes = serde_json::to_vec(&marker).map_err(|e| format!("Failed to serialize: {}", e))?;
     let hash = kernel.write(&bytes).map_err(|e| format!("Failed to write abort marker: {}", e))?;
@@ -60,24 +60,40 @@ pub fn abort_tx(kernel: &PondKernel, tx_id: &str) -> Result<String, String> {
     Ok(hash)
 }
 
-pub fn is_tx_aborted(kernel: &PondKernel, tx_id: &str) -> bool {
-    if let Some(hash) = kernel.resolve(&format!("transactions/{}_aborted", tx_id)) {
+/// C17: `Err` = the aborted-marker ref read FAILED (an outage is not
+/// "not aborted" — commit_tx must not proceed on an unreadable guard).
+pub fn is_tx_aborted(kernel: &PondKernel, tx_id: &str) -> Result<bool, String> {
+    if let Some(hash) = kernel.resolve(&format!("transactions/{}_aborted", tx_id))
+        .map_err(|e| format!(
+            "Failed to read abort marker for transaction '{}': {}", tx_id, e))?
+    {
         if let Ok(data) = kernel.read_blob(&hash) {
             if let Ok(m) = serde_json::from_slice::<serde_json::Value>(&data) {
-                return m.get("status").and_then(|s| s.as_str()) == Some("aborted");
+                return Ok(m.get("status").and_then(|s| s.as_str()) == Some("aborted"));
             }
         }
     }
-    false
+    Ok(false)
 }
 
-pub fn tx_status(kernel: &PondKernel, tx_id: &str) -> &'static str {
-    if is_tx_committed(kernel, tx_id) { "committed" } else if is_tx_aborted(kernel, tx_id) { "aborted" } else { "pending" }
+pub fn tx_status(kernel: &PondKernel, tx_id: &str) -> Result<&'static str, String> {
+    if is_tx_committed(kernel, tx_id)? {
+        Ok("committed")
+    } else if is_tx_aborted(kernel, tx_id)? {
+        Ok("aborted")
+    } else {
+        Ok("pending")
+    }
 }
 
 /// Check if a transaction has been committed.
-pub fn is_tx_committed(kernel: &PondKernel, tx_id: &str) -> bool {
-    kernel.resolve(&tx_ref(tx_id)).is_some()
+///
+/// C17: `Err` = the tx ref read FAILED (an outage is not "not committed").
+pub fn is_tx_committed(kernel: &PondKernel, tx_id: &str) -> Result<bool, String> {
+    Ok(kernel.resolve(&tx_ref(tx_id))
+        .map_err(|e| format!(
+            "Failed to read commit marker for transaction '{}': {}", tx_id, e))?
+        .is_some())
 }
 
 // ---------------------------------------------------------------------------
@@ -105,10 +121,10 @@ mod tests {
         let kernel = storage.kernel();
 
         let tx_id = begin_tx();
-        assert!(!is_tx_committed(kernel, &tx_id));
+        assert!(!is_tx_committed(kernel, &tx_id).unwrap());
 
         commit_tx(kernel, &tx_id, "test commit").unwrap();
-        assert!(is_tx_committed(kernel, &tx_id));
+        assert!(is_tx_committed(kernel, &tx_id).unwrap());
     }
 
     #[test]
@@ -119,6 +135,6 @@ mod tests {
 
         let tx_id = begin_tx();
         let _ = abort_tx(kernel, &tx_id);
-        assert!(!is_tx_committed(kernel, &tx_id)); // not committed
+        assert!(!is_tx_committed(kernel, &tx_id).unwrap()); // not committed
     }
 }

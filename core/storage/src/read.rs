@@ -9,40 +9,71 @@ use crate::shard;
 use pond_kernel::PondKernel;
 use serde_json::Value as JsonValue;
 
-/// Read the current data for a collection (from the active branch's HEAD).
+/// Read the current data for a collection (journal-aware).
 ///
-/// Returns the raw data blob for the HEAD commit's manifest.
-/// For a full row-level read (with shard merging), use read_with_shards.
+/// C13 (N+6): resolves the JOURNAL view via [`crate::journal::resolve_packs`]
+/// — the snapshot pack plus every live journal entry, stale compaction
+/// packs filtered at RG granularity (ARCHITECTURE.md D6) — and
+/// concatenates the live RG bytes. Before C13 this resolved the branch
+/// ref alone, which after D3 is a CACHE of the last compaction fold: raw
+/// reads silently missed every journal pack appended since (write_rows,
+/// SQL INSERT/UPDATE/DELETE, upserts) until the next `compact`. The raw
+/// path now sees ALL committed bytes:
+/// - Raw-write collections (`write()` full-replace, the OLTP/streaming
+///   lens pattern): unchanged bytes — their journals carry no entries,
+///   so the plan is just the snapshot.
+/// - Structured collections: the concatenated live RGs (base + journal
+///   packs until the next fold unions them). CRDT row-level merge is
+///   NOT the raw path's job — use read_rows/SQL for merged rows.
+///
+/// Returns Err when the view resolution or a blob read fails (C17: an
+/// outage is an error, never silently-missing bytes).
 pub fn read(
     kernel: &PondKernel,
     collection: &str,
     branch: &str,
 ) -> Result<Vec<u8>, String> {
-    // Resolve HEAD commit
-    let head = kernel.resolve(&branch_ref(collection, branch))
-        .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
-
-    // Load the manifest (handles both v2 flat and v3 tree)
-    // Uses resolve_manifest_bytes which handles PNPK packs transparently
-    let manifest_bytes = commit::resolve_manifest_bytes(kernel, &head)
-        .map_err(|e| format!("Failed to read manifest: {}", e))?;
-    let manifest = resolve_manifest(kernel, &manifest_bytes, None)?;
-
-    // Read ALL row groups (slab-aware) and concatenate.
-    // Previous impl only read the first RG — silent data loss for multi-RG.
-    // For raw-byte writes (write() path, 1 RG), behavior is unchanged.
-    // For structured PND2 writes (write_rows_i64() with >1 RG), callers
-    // that need to decode individual PND2 blobs should use
-    // `read_all_row_groups()` which returns `Vec<Vec<u8>>` (one per RG).
-    if manifest.row_groups.is_empty() {
-        return Err("Manifest has no row groups".to_string());
+    // Resolve the D6 read plan (snapshot + live journal entries).
+    // resolve_packs surfaces ref-read failures (C17) and "no snapshot AND
+    // no entries" as an empty plan — the caller maps that to the familiar
+    // "has no commits" error (the executor's legitimate-empty arm).
+    let plans = crate::journal::resolve_packs(kernel, collection, branch, false)?;
+    if plans.is_empty() {
+        return Err(format!("Collection '{}' has no commits", collection));
     }
-    let blobs = read_all_row_groups_from_manifest(kernel, &manifest)?;
-    let total: usize = blobs.iter().map(|b| b.len()).sum();
-    let mut out = Vec::with_capacity(total);
-    for b in &blobs {
-        out.extend_from_slice(b);
+
+    let mut out: Vec<u8> = Vec::new();
+    for plan in &plans {
+        // Resolve this pack's manifest (handles PNPK packs transparently).
+        let manifest_bytes = commit::resolve_manifest_bytes(kernel, &plan.pack_hash)
+            .map_err(|e| format!("Failed to read manifest: {}", e))?;
+        let mut manifest = resolve_manifest(kernel, &manifest_bytes, None)?;
+
+        // D6 plan filter (C11): when set, keep only the RGs the plan says
+        // this pack still owns (partially-covered compaction packs).
+        if let Some(only) = &plan.only_rgs {
+            manifest
+                .row_groups
+                .retain(|rg| only.contains(&(rg.blob_hash.clone(), rg.slab_byte_offset)));
+        }
+
+        // A plan pack with zero surviving RGs contributes nothing (a
+        // fully-covered compaction pack, or a delete-only journal state) —
+        // skip it rather than erroring: other packs may still hold data.
+        if manifest.row_groups.is_empty() {
+            continue;
+        }
+
+        // Slab-aware RG reads (range reads for slab-backed RGs), then
+        // concatenate into the output stream in plan order.
+        let blobs = read_all_row_groups_from_manifest(kernel, &manifest)?;
+        for b in &blobs {
+            out.extend_from_slice(b);
+        }
     }
+
+    // All packs contributed nothing (e.g. every live entry is a deletion)
+    // — the collection's current state is genuinely empty bytes.
     Ok(out)
 }
 
@@ -642,7 +673,11 @@ pub async fn read_rows_async(
     branch: &str,
 ) -> Result<Vec<u8>, String> {
     // 1. Resolve HEAD commit ref — sync, fast (one stat / one HEAD request).
+    //    C17: a FAILED read is its own arm — an outage is not a fresh
+    //    collection (same labeling as the sync `read`).
     let head = kernel.resolve(&branch_ref(collection, branch))
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?
         .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
 
     // 2. Read manifest bytes (handles PNPK packs transparently).
@@ -722,27 +757,34 @@ pub async fn read_at_snapshot_async(
 ///
 /// Returns the HEAD data plus all unmerged shard data.
 /// For snapshot isolation, use read_at_snapshot instead.
+///
+/// C17: `Err` when the shard enumeration (read_with_shards) fails — a
+/// shard silently missing from the list is silently-missing rows. The
+/// legacy leniency BELOW is unchanged: HEAD blobs that fail to read are
+/// skipped (this is the pre-C8 gatherer; the pruned reader + executor are
+/// the honest surfaces).
 pub fn read_full(
     kernel: &PondKernel,
     collection: &str,
     branch: &str,
-) -> Vec<Vec<u8>> {
+) -> Result<Vec<Vec<u8>>, String> {
     let mut results = Vec::new();
 
-    // Read HEAD data
+    // Read HEAD data (legacy-lenient: skipped when unreadable — pre-existing
+    // semantics, kept for this gatherer).
     if let Ok(data) = read(kernel, collection, branch) {
         results.push(data);
     }
 
-    // Read all shard data
-    let (_, shards) = shard::read_with_shards(kernel, collection, branch);
+    // Read all shard data (the enumeration itself must NOT be lenient).
+    let (_, shards) = shard::read_with_shards(kernel, collection, branch)?;
     for (_, shard_hash) in shards {
         if let Ok(data) = kernel.read_blob(&shard_hash) {
             results.push(data);
         }
     }
 
-    results
+    Ok(results)
 }
 
 /// Read structured INT64 columns from a collection with optional pruning.
@@ -1708,6 +1750,8 @@ pub fn read_rows_i64_indexed(
             // get the manifest columns at least.
             let commit_ref = branch_ref(collection, branch);
             let commit_hash = kernel.resolve(&commit_ref)
+                .map_err(|e| format!(
+                    "Failed to read branch ref for collection '{}': {}", collection, e))?
                 .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
             let manifest_bytes = commit::resolve_manifest_bytes(kernel, &commit_hash)
                 .map_err(|e| format!("Failed to read manifest: {}", e))?;
@@ -1738,6 +1782,8 @@ pub fn read_rows_i64_indexed(
     // We have an IndexHit — read ONLY the specific RG
     let commit_ref = branch_ref(collection, branch);
     let commit_hash = kernel.resolve(&commit_ref)
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?
         .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
     let manifest_bytes = commit::resolve_manifest_bytes(kernel, &commit_hash)
         .map_err(|e| format!("Failed to read manifest: {}", e))?;
@@ -1843,6 +1889,8 @@ pub fn read_rows_i64_range_indexed(
         // No matching keys — return empty columns with correct schema
         let commit_ref = branch_ref(collection, branch);
         let commit_hash = kernel.resolve(&commit_ref)
+            .map_err(|e| format!(
+                "Failed to read branch ref for collection '{}': {}", collection, e))?
             .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
         let manifest_bytes = commit::resolve_manifest_bytes(kernel, &commit_hash)
             .map_err(|e| format!("Failed to read manifest: {}", e))?;
@@ -1868,6 +1916,8 @@ pub fn read_rows_i64_range_indexed(
     // 2. Load manifest for RG metadata and schema
     let commit_ref = branch_ref(collection, branch);
     let commit_hash = kernel.resolve(&commit_ref)
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?
         .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
     let manifest_bytes = commit::resolve_manifest_bytes(kernel, &commit_hash)
         .map_err(|e| format!("Failed to read manifest: {}", e))?;
@@ -2113,7 +2163,7 @@ mod tests {
         write::write(kernel, "events", "main", b"head data", "init").unwrap();
         crate::shard::append_shard(kernel, "events", "main", "s1", b"shard1").unwrap();
 
-        let data = read_full(kernel, "events", "main");
+        let data = read_full(kernel, "events", "main").unwrap();
         assert_eq!(data.len(), 2); // HEAD + 1 shard
         assert!(data.iter().any(|d| d == b"head data"));
         assert!(data.iter().any(|d| d == b"shard1"));
@@ -2276,7 +2326,7 @@ mod tests {
         fn put_path(&self, path: &str, hash: &str) -> std::io::Result<()> {
             self.inner.put_path(path, hash)
         }
-        fn get_path(&self, path: &str) -> Option<String> {
+        fn get_path(&self, path: &str) -> std::io::Result<Option<String>> {
             self.inner.get_path(path)
         }
         fn delete_path(&self, path: &str) -> std::io::Result<bool> {
@@ -2365,7 +2415,7 @@ mod tests {
 
         let manifest_bytes = manifest.encode();
         let manifest_hash = kernel.write(&manifest_bytes).map_err(|e| e.to_string())?;
-        let parent = kernel.resolve(&branch_ref(collection, branch));
+        let parent = kernel.resolve(&branch_ref(collection, branch)).unwrap();
         let parent_index = parent.as_ref()
             .and_then(|p| crate::commit::read_commit(kernel, p))
             .map(|c| c.index + 1)
@@ -2825,7 +2875,7 @@ mod tests {
         let preds = vec![("id".to_string(), "=".to_string(), serde_json::json!(5))];
         let mut all_rows = read_rows_json_pruned(kernel, "crdt", "main", &kc, None, &preds).unwrap();
 
-        let (_, shards) = crate::shard::read_with_shards(kernel, "crdt", "main");
+        let (_, shards) = crate::shard::read_with_shards(kernel, "crdt", "main").unwrap();
         for (_, shard_hash) in shards {
             let data = kernel.read_blob(&shard_hash).unwrap();
             let arr: Vec<JsonValue> = serde_json::from_slice(&data).unwrap();

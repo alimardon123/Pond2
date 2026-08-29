@@ -123,9 +123,14 @@ pub extern "C" fn pond_kernel_resolve(
     let handle = unsafe { match handle.as_ref() { Some(h) => h, None => return ptr::null_mut() }};
     if name.is_null() { return ptr::null_mut(); }
     let name = match unsafe { CStr::from_ptr(name) }.to_str() { Ok(s) => s, Err(_) => return ptr::null_mut() };
+    // C ABI LIMITATION (C17): `resolve` is fallible at the Rust level
+    // (io::Result<Option<String>> — a transient backend failure is NOT an
+    // absent ref), but this C entry point has no error channel, so Err(_)
+    // maps to NULL exactly like None: C callers cannot distinguish a
+    // transient failure from an unbound ref. Recorded in CRITIQUE.md C17.
     match handle.kernel.resolve(name) {
-        Some(hash) => CString::new(hash).map(|cs| cs.into_raw()).unwrap_or(ptr::null_mut()),
-        None => ptr::null_mut(),
+        Ok(Some(hash)) => CString::new(hash).map(|cs| cs.into_raw()).unwrap_or(ptr::null_mut()),
+        Ok(None) | Err(_) => ptr::null_mut(),
     }
 }
 

@@ -85,9 +85,11 @@ impl<'a> SimpleIndex<'a> {
     /// Drop an index (tombstone the ref).
     ///
     /// Returns: true if the index existed and was dropped.
+    /// C17: a FAILED ref read yields false (best-effort mutation guard —
+    /// an outage does NOT tombstone an index it could not verify).
     pub fn drop_index(&self, collection: &str, index_name: &str) -> bool {
         let ref_name = self.index_ref(collection, index_name);
-        let current = self.kernel.resolve(&ref_name);
+        let current = self.kernel.resolve(&ref_name).ok().flatten();
 
         if current.is_none() || current.as_deref() == Some(&maintenance::tombstone_hash()) {
             return false;
@@ -102,7 +104,9 @@ impl<'a> SimpleIndex<'a> {
     /// O(1) GET: reads the index JSON and returns the rowid directly.
     pub fn lookup(&self, collection: &str, index_name: &str, index_key: &str) -> Option<String> {
         let ref_name = self.index_ref(collection, index_name);
-        let index_hash = maintenance::resolve_active(self.kernel, &ref_name)?;
+        // C17: best-effort Option API (mirrors the read_blob().ok()? chain
+        // below) — the Result/Err distinction lives in the storage core.
+        let index_hash = maintenance::resolve_active(self.kernel, &ref_name).ok().flatten()?;
 
         let index_data = self.kernel.read_blob(&index_hash).ok()?;
         let index: HashMap<String, String> = serde_json::from_slice(&index_data).ok()?;
@@ -130,8 +134,10 @@ impl<'a> SimpleIndex<'a> {
             .filter_map(|n| {
                 // Strip the prefix to get the index name
                 let idx_name = n.strip_prefix(&prefix)?;
-                // Skip tombstoned indexes
-                if maintenance::is_dropped(self.kernel, &n) {
+                // Skip tombstoned indexes. C17: conservative on ref-read
+                // failure — an unreadable name STAYS listed (unwrap_or(false)
+                // treats an outage as "not dropped").
+                if maintenance::is_dropped(self.kernel, &n).unwrap_or(false) {
                     return None;
                 }
                 Some(idx_name.to_string())
@@ -140,15 +146,19 @@ impl<'a> SimpleIndex<'a> {
     }
 
     /// Check if an index exists and is active (not tombstoned).
+    /// C17: a FAILED ref read yields false (best-effort predicate).
     pub fn index_exists(&self, collection: &str, index_name: &str) -> bool {
         let ref_name = self.index_ref(collection, index_name);
-        maintenance::resolve_active(self.kernel, &ref_name).is_some()
+        maintenance::resolve_active(self.kernel, &ref_name)
+            .is_ok_and(|h| h.is_some())
     }
 
     /// Get statistics about an index.
     pub fn index_stats(&self, collection: &str, index_name: &str) -> Option<IndexStats> {
         let ref_name = self.index_ref(collection, index_name);
-        let index_hash = maintenance::resolve_active(self.kernel, &ref_name)?;
+        // C17: best-effort Option API (mirrors the read_blob().ok()? chain
+        // below).
+        let index_hash = maintenance::resolve_active(self.kernel, &ref_name).ok().flatten()?;
 
         let index_data = self.kernel.read_blob(&index_hash).ok()?;
         let index: HashMap<String, String> = serde_json::from_slice(&index_data).ok()?;
@@ -209,12 +219,15 @@ impl<'a> SimpleIndex<'a> {
         let meta_refs = self.kernel.list_names_prefix(&meta_prefix);
 
         for meta_ref in meta_refs {
-            if maintenance::is_dropped(self.kernel, &meta_ref) {
+            // C17: conservative on ref-read failure (an outage treats the
+            // name as not-dropped and the entry is skipped by the lenient
+            // resolve below — the same best-effort enumeration as before).
+            if maintenance::is_dropped(self.kernel, &meta_ref).unwrap_or(false) {
                 continue;
             }
             let index_name = meta_ref.strip_prefix(&meta_prefix)?.to_string();
 
-            if let Some(hash) = self.kernel.resolve(&meta_ref) {
+            if let Some(hash) = self.kernel.resolve(&meta_ref).ok().flatten() {
                 if let Ok(data) = self.kernel.read_blob(&hash) {
                     if let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&data) {
                         // Check if column is in key_fields array
@@ -237,9 +250,11 @@ impl<'a> SimpleIndex<'a> {
     }
 
     /// Get the key_fields for an index (from metadata).
+    /// C17: best-effort Option API — a FAILED ref read yields None
+    /// (mirrors the read_blob().ok()? chain below).
     pub fn get_index_key_fields(&self, collection: &str, index_name: &str) -> Option<Vec<String>> {
         let meta_ref = self.meta_ref(collection, index_name);
-        let hash = self.kernel.resolve(&meta_ref)?;
+        let hash = self.kernel.resolve(&meta_ref).ok()??;
         let data = self.kernel.read_blob(&hash).ok()?;
         let meta: serde_json::Value = serde_json::from_slice(&data).ok()?;
 

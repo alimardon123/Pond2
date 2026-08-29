@@ -100,8 +100,12 @@ pub fn write(
     let data_hash = kernel.write(data)
         .map_err(|e| format!("Failed to write data: {}", e))?;
 
-    // Get parent commit (current HEAD of active branch)
-    let parent = kernel.resolve(&branch_ref(collection, active_branch));
+    // Get parent commit (current HEAD of active branch). C17: a FAILED
+    // branch-ref read is an Err — the parent must not silently become
+    // None (that would fork history at a phantom root).
+    let parent = kernel.resolve(&branch_ref(collection, active_branch))
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?;
     let parent_index = parent.as_ref()
         .and_then(|p| commit::read_commit(kernel, p))
         .map(|c| c.index + 1)
@@ -241,7 +245,11 @@ pub fn write_rows_i64(
     // retries, on localfs and S3/R2 identically. No branch_ref write, no
     // derived refs: journal-era writes touch ZERO shared objects (C4),
     // and readers union the snapshot with every live entry (C9 fix).
-    let parent = kernel.resolve(&branch_ref(collection, active_branch));
+    // C17: a FAILED branch-ref read is an Err (phantom-None parent would
+    // fork history).
+    let parent = kernel.resolve(&branch_ref(collection, active_branch))
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?;
     let parent_index = parent.as_ref()
         .and_then(|p| commit::read_commit(kernel, p))
         .map(|c| c.index + 1)
@@ -296,8 +304,10 @@ pub fn write_rows_i64_packed(
     let data_hash = kernel.write(&blob)
         .map_err(|e| format!("Failed to write PND2 blob: {}", e))?;
 
-    // 2. Get parent commit
-    let parent = kernel.resolve(&branch_ref(collection, active_branch));
+    // 2. Get parent commit. C17: a FAILED read is an Err, not None.
+    let parent = kernel.resolve(&branch_ref(collection, active_branch))
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?;
     let parent_index = parent.as_ref()
         .and_then(|p| commit::read_commit(kernel, p))
         .map(|c| c.index + 1)
@@ -509,7 +519,10 @@ fn write_rows_inner(
     // objects (CRITIQUE C4) — no branch_ref, no manifest_ref, no bare
     // collection ref. Those stay where the legacy paths left them until
     // `journal::compact` LWW-advances the branch ref to a folded snapshot.
-    let parent = kernel.resolve(&branch_ref(collection, active_branch));
+    // C17: a FAILED branch-ref read is an Err, not None.
+    let parent = kernel.resolve(&branch_ref(collection, active_branch))
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?;
     let parent_index = parent.as_ref()
         .and_then(|p| commit::read_commit(kernel, p))
         .map(|c| c.index + 1)
@@ -640,8 +653,10 @@ pub fn write_rows_i64_slab<'a>(
     let footer = slab::decode_slab_footer(&slab_bytes[footer_offset..footer_end], has_bloom)
         .ok_or_else(|| "Failed to decode slab footer after encode".to_string())?;
 
-    // 5. Get parent commit
-    let parent = kernel.resolve(&branch_ref(collection, active_branch));
+    // 5. Get parent commit. C17: a FAILED read is an Err, not None.
+    let parent = kernel.resolve(&branch_ref(collection, active_branch))
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?;
     let parent_index = parent.as_ref()
         .and_then(|p| commit::read_commit(kernel, p))
         .map(|c| c.index + 1)
@@ -991,7 +1006,9 @@ impl<'a> SlabWriter<'a> {
     /// path, plain PUT, zero shared-object writes (the branch ref moves
     /// only at compaction).
     fn commit(&self, manifest_bytes: &[u8], message: &str) -> Result<String, String> {
-        let parent = self.kernel.resolve(&branch_ref(self.collection, self.active_branch));
+        let parent = self.kernel.resolve(&branch_ref(self.collection, self.active_branch))
+            .map_err(|e| format!(
+                "Failed to read branch ref for collection '{}': {}", self.collection, e))?;
         let parent_index = parent.as_ref()
             .and_then(|p| commit::read_commit(self.kernel, p))
             .map(|c| c.index + 1)
@@ -1090,7 +1107,7 @@ mod tests {
 
         // Verify the branch ref points at the commit
         assert_eq!(
-            kernel.resolve(&branch_ref("users", "main")),
+            kernel.resolve(&branch_ref("users", "main")).unwrap(),
             Some(hash.clone())
         );
     }
@@ -1133,7 +1150,7 @@ mod tests {
         assert_eq!(commit.message, "insert 5 users");
         assert_eq!(commit.index, 0);
         assert_eq!(commit.manifest, "packed", "pack carries the manifest inline");
-        let branch = kernel.resolve(&branch_ref("users", "main"))
+        let branch = kernel.resolve(&branch_ref("users", "main")).unwrap()
             .expect("bootstrap fold advanced the branch ref (sanctioned writer: compact)");
         assert_ne!(branch, hash, "branch_ref is the FOLD pack, not the entry pack");
 
@@ -1569,12 +1586,12 @@ mod tests {
         // HEAD untouched — this is the guard against lost updates.
         let won = kernel.reference_if(&b_ref, Some(&c1), &c1).unwrap();
         assert!(!won, "stale CAS must lose");
-        assert_eq!(kernel.resolve(&b_ref), Some(c2.clone()), "HEAD unchanged after lost CAS");
+        assert_eq!(kernel.resolve(&b_ref).unwrap(), Some(c2.clone()), "HEAD unchanged after lost CAS");
 
         // Fresh writer (current HEAD as expected): CAS wins.
         let won = kernel.reference_if(&b_ref, Some(&c2), &c1).unwrap();
         assert!(won, "fresh CAS must win");
-        assert_eq!(kernel.resolve(&b_ref), Some(c1.clone()));
+        assert_eq!(kernel.resolve(&b_ref).unwrap(), Some(c1.clone()));
 
         // Expected=Some(h) but ref absent → fail (no false create).
         let won = kernel.reference_if(&branch_ref("cas_sem", "ghost"), Some(&c1), &c2).unwrap();
@@ -1586,7 +1603,7 @@ mod tests {
         assert!(won, "create-if-absent on fresh ref must win");
         let won = kernel.reference_if(&fresh, None, &c2).unwrap();
         assert!(!won, "create-if-absent must LOSE when the ref already exists");
-        assert_eq!(kernel.resolve(&fresh), Some(c1), "existing binding survives failed create");
+        assert_eq!(kernel.resolve(&fresh).unwrap(), Some(c1), "existing binding survives failed create");
     }
 
     #[test]

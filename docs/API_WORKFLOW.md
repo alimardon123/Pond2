@@ -215,16 +215,20 @@ Raw bytes get the same benefits as structured data: versioning (branch/merge),
 content-addressed dedup, and storage-independence. But they do NOT get
 _rowid/_version (no structure to tag) — use `write_rows` for CRDT compatibility.
 
-**C13 caveat — the raw path is journal-stale for structured data.** The raw
-read (`pond read` / `s.read` / `storage_read::read`) resolves the branch ref,
-which after the D3 journal is a CACHE of the last compaction fold: structured
-writes (`write_rows`, SQL INSERT/UPDATE/DELETE, upserts) append journal packs
-the raw path does not resolve, so a raw read can miss them until the next
-`compact`. Raw reads stay byte-exact for blobs written with the RAW write
-path (`pond write` / `s.write`) — those carry the journal watermark and fold
-correctly. For journal-aware structured reads use `read_rows` / `pond
-read-rows` / SQL. (CRITIQUE.md C13 tracks routing the raw reader through
-the journal resolver; until then this caveat is the contract.)
+**C13 fixed (N+6) — the raw path is journal-aware.** The raw read
+(`pond read` / `storage_read::read`) resolves the JOURNAL view: the last
+fold's snapshot PLUS every live journal pack (stale compaction packs
+filtered at RG granularity — the same D6 read plan `read_rows` uses).
+Structured writes (`write_rows`, SQL INSERT/UPDATE/DELETE, upserts) are
+visible to raw reads immediately — no waiting for the next `compact`.
+Semantics: the returned bytes are the CONCATENATED live row groups —
+byte-exact for blobs written with the RAW write path (`pond write` /
+`s.write`, whose journals carry no entries, so the plan is just the
+snapshot); for structured collections the union of base + not-yet-folded
+packs. CRDT row-level merge is NOT the raw path's job — use
+`read_rows` / `pond read-rows` / SQL for merged rows. (Pre-N+6 the raw
+path resolved the branch ref alone — a cache of the last fold — and
+silently missed journal packs; CRITIQUE.md C13 tracked and closed this.)
 
 ### 2.2 Semi-structured data (JSON in columns or as raw blobs)
 

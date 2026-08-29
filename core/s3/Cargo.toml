@@ -40,3 +40,8 @@ tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 tempfile = { workspace = true }
 # For async tests in the S3 crate (when the `async` feature is on).
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+# R2 LIVE harness (tests/r2_live.rs — env-gated, never in CI): the cache
+# wrapper for warm-read timing + sha256 for content-addressing assertions.
+pond_cache = { path = "../cache" }
+sha2 = "0.10"
+hex = "0.4"

@@ -513,24 +513,33 @@ impl ObjectStore for CachingObjectStore {
         Ok(won)
     }
 
-    fn get_path(&self, path: &str) -> Option<String> {
+    fn get_path(&self, path: &str) -> io::Result<Option<String>> {
         let now = Instant::now();
         {
             let refs = self.ref_cache.lock().unwrap();
             if let Some(entry) = refs.get(path) {
                 if now.duration_since(entry.inserted_at) < self.ref_ttl {
-                    return Some(entry.hash.clone());
+                    return Ok(Some(entry.hash.clone()));
                 }
             }
         }
         // Cache miss or expired: fetch from inner store.
+        //
+        // C17 error-channel semantics:
+        //   - `Ok(None)` (unbound) returns WITHOUT inserting into the ref
+        //     cache — absence is not cacheable (a later binding must be
+        //     visible immediately), same as pre-C17 behavior.
+        //   - `Err` propagates WITHOUT touching the cache — a transient
+        //     failure must not poison or evict anything; the next call
+        //     retries the inner store.
         let hash = self.inner.get_path(path)?;
+        let Some(hash) = hash else { return Ok(None) };
         let mut refs = self.ref_cache.lock().unwrap();
         refs.insert(path.to_string(), RefEntry {
             hash: hash.clone(),
             inserted_at: now,
         });
-        Some(hash)
+        Ok(Some(hash))
     }
 
     fn delete_path(&self, path: &str) -> io::Result<bool> {
@@ -847,7 +856,7 @@ mod tests {
         let h = store.put_blob(b"data").unwrap();
         store.put_path("my_ref", &h).unwrap();
         let resolved = store.get_path("my_ref").unwrap();
-        assert_eq!(resolved, h);
+        assert_eq!(resolved, Some(h));
     }
 
     #[test]
@@ -856,7 +865,7 @@ mod tests {
         let h = store.put_blob(b"temp").unwrap();
         store.put_path("tmp_ref", &h).unwrap();
         store.delete_path("tmp_ref").unwrap();
-        assert!(store.get_path("tmp_ref").is_none());
+        assert!(store.get_path("tmp_ref").unwrap().is_none());
     }
 
     #[test]

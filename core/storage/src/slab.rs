@@ -380,6 +380,17 @@ pub fn decode_slab_footer(footer_bytes: &[u8], has_bloom_flag: bool) -> Option<S
     let n_entries = u32::from_le_bytes([
         footer_bytes[0], footer_bytes[1], footer_bytes[2], footer_bytes[3],
     ]) as usize;
+    // C12 FINDING #2 (laws_pnps): n_entries is UNVALIDATED input — a
+    // footer claiming u32::MAX entries would ask the allocator for
+    // ~192 GiB and ABORT the process (allocation failure does not
+    // unwind), violating the format's own "malformed input never
+    // crashes" contract (C1/C2). Every entry needs ≥21 bytes (rg_index 4
+    // + byte_offset 8 + byte_len 4 + n_rows 4 + n_columns 1), so the
+    // count can never exceed footer_len / 21 — reject anything larger
+    // as malformed BEFORE allocating.
+    if n_entries > footer_bytes.len() / 21 {
+        return None;
+    }
     let mut pos = 4;
     let mut entries = Vec::with_capacity(n_entries);
 

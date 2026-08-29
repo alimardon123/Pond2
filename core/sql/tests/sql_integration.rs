@@ -1086,11 +1086,10 @@ fn test_where_pushdown_after_delete() {
 /// mid-session (the S3 500/429 class: a data GET fails while tiny ref
 /// GETs succeed or are cached). Ref ops stay healthy, which isolates
 /// exactly the failure class C8 covers: data-read errors surfacing
-/// through the pruned reader. (Ref-read failures are a SEPARATE hole:
-/// `get_path` returns Option with no error channel, so a failed ref GET
-/// is indistinguishable from an absent ref — recorded as C17, out of
-/// scope here.) The flag lives in an Arc so the test can flip it while
-/// the kernel owns the store.
+/// through the pruned reader. (Ref-read failures are the C17 class —
+/// closed by the `get_path` error channel; see RefOutageStore below.)
+/// The flag lives in an Arc so the test can flip it while the kernel owns
+/// the store.
 struct FlakyStore {
     inner: pond_kernel::LocalFSObjectStore,
     fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1126,7 +1125,7 @@ impl pond_kernel::ObjectStore for FlakyStore {
     fn put_path(&self, path: &str, hash: &str) -> std::io::Result<()> {
         self.inner.put_path(path, hash)
     }
-    fn get_path(&self, path: &str) -> Option<String> {
+    fn get_path(&self, path: &str) -> std::io::Result<Option<String>> {
         self.inner.get_path(path) // ref reads stay healthy (see C17 note)
     }
     fn delete_path(&self, path: &str) -> std::io::Result<bool> {
@@ -1201,4 +1200,142 @@ fn test_c8_no_commits_is_empty_not_error() {
         .expect("insert into fresh collection");
     let result = execute(&storage, "SELECT * FROM never_written").expect("read back");
     assert_eq!(result.rows.len(), 1);
+}
+
+// ===========================================================================
+// C17 — REF-read errors must surface (get_path io::Result error channel)
+//
+// The ref half of the outage story: a store whose REF (get_path) reads fail
+// while blob reads stay healthy. Pre-C17, `get_path` returned Option with
+// NO error channel, so a failed ref GET (transient S3 500/429/timeout,
+// localfs permission error) was indistinguishable from an absent ref for
+// EVERY caller — the SQL executor, journal snapshot resolution, branch
+// reads. This was the empirically-proven blindness that opened C17 (the
+// C8 test's first version used failing ref reads and got Ok(EMPTY)).
+// ===========================================================================
+
+/// A store wrapper with healthy blobs and FAILING ref reads once the shared
+/// `fail` flag is set — the C17 mirror of FlakyStore (which fails blobs and
+/// keeps refs healthy). Writes stay healthy so the outage is read-side only
+/// (mirrors the S3 500/429 class on small ref GETs).
+struct RefOutageStore {
+    inner: pond_kernel::LocalFSObjectStore,
+    fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RefOutageStore {
+    fn new(dir: &std::path::Path) -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            Self {
+                inner: pond_kernel::LocalFSObjectStore::new(dir).unwrap(),
+                fail: std::sync::Arc::clone(&fail),
+            },
+            fail,
+        )
+    }
+    fn failing(&self) -> bool {
+        self.fail.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl pond_kernel::ObjectStore for RefOutageStore {
+    fn put_blob(&self, data: &[u8]) -> std::io::Result<String> {
+        self.inner.put_blob(data) // writes stay healthy (outage = read-side)
+    }
+    fn get_blob(&self, hash: &str) -> std::io::Result<Vec<u8>> {
+        self.inner.get_blob(hash) // blob reads stay healthy (isolates the REF hole)
+    }
+    fn put_path(&self, path: &str, hash: &str) -> std::io::Result<()> {
+        self.inner.put_path(path, hash)
+    }
+    fn get_path(&self, path: &str) -> std::io::Result<Option<String>> {
+        if self.failing() {
+            return Err(std::io::Error::other("simulated ref outage"));
+        }
+        self.inner.get_path(path)
+    }
+    fn delete_path(&self, path: &str) -> std::io::Result<bool> {
+        self.inner.delete_path(path)
+    }
+    fn list_paths(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        self.inner.list_paths(prefix)
+    }
+    fn list_dirs(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        self.inner.list_dirs(prefix)
+    }
+    fn store_id(&self) -> String {
+        // Same-store identity: delegate so the journal writer registry
+        // converges with the underlying directory.
+        self.inner.store_id()
+    }
+    fn blob_exists(&self, hash: &str) -> bool {
+        self.inner.blob_exists(hash)
+    }
+    fn delete_blob(&self, hash: &str) -> std::io::Result<bool> {
+        self.inner.delete_blob(hash)
+    }
+}
+
+/// A transient REF-read outage during a SELECT must surface as an SQL error
+/// naming the ref — NOT silently-empty (or silently-partial) results.
+///
+/// REVERT CHECK (C17): before the `get_path` error channel, this exact test
+/// FAILED — the failed branch-ref GET masqueraded as "no snapshot" and the
+/// query returned `Ok` with truncated/empty rows (the empirically-proven
+/// blindness the N+5 cycle recorded as C17; the C8 test's first version hit
+/// it live). With `io::Result<Option<String>>`, the outage propagates:
+/// journal::resolve_view → "Failed to read branch ref for collection
+/// 'users'" → executor → "Failed to read collection 'users': ... ref ...".
+#[test]
+fn test_c17_ref_outage_errors_not_empty() {
+    let dir = setup();
+    let (store, fail) = RefOutageStore::new(dir.path());
+    let kernel = pond_kernel::PondKernel::new_with_store(Box::new(store));
+    let storage = UnifiedStorage::new(kernel);
+
+    // Seed while healthy (INSERT → journal packs + bootstrap fold on the
+    // ref-outage store; ref WRITES are healthy throughout).
+    execute(&storage, "INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob')")
+        .expect("seed while healthy");
+    let result = execute(&storage, "SELECT * FROM users").expect("healthy read");
+    assert_eq!(result.rows.len(), 2, "seeded rows readable while healthy");
+
+    // Flip the ref outage: the SAME query must now ERROR loudly — a failed
+    // branch-ref read is NOT "collection has no commits" (the executor's
+    // legitimate-empty arm) and NOT zero rows.
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = execute(&storage, "SELECT * FROM users")
+        .expect_err("ref outage must surface as an SQL error, not empty rows");
+    assert!(
+        err.contains("ref"),
+        "error should name the failed ref read: {err}"
+    );
+    assert!(
+        !err.contains("has no commits"),
+        "an outage is not a fresh collection (distinct error arms): {err}"
+    );
+}
+
+/// Recovery after the ref outage: the same query returns the same rows —
+/// the failure was transient; nothing was corrupted or half-read.
+#[test]
+fn test_c17_ref_outage_recovery() {
+    let dir = setup();
+    let (store, fail) = RefOutageStore::new(dir.path());
+    let kernel = pond_kernel::PondKernel::new_with_store(Box::new(store));
+    let storage = UnifiedStorage::new(kernel);
+
+    execute(&storage, "INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob')")
+        .expect("seed while healthy");
+
+    // Outage, then recovery.
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = execute(&storage, "SELECT * FROM users")
+        .expect_err("ref outage must surface as an SQL error");
+    assert!(err.contains("ref"), "error should name the ref: {err}");
+
+    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    let result = execute(&storage, "SELECT * FROM users").expect("recovered read");
+    assert_eq!(result.rows.len(), 2, "rows intact after the transient outage");
 }

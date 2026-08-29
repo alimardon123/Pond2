@@ -85,7 +85,7 @@ fn read_live_rows(kernel: &PondKernel, collection: &str, branch: &str) -> Vec<Va
             .collect();
 
     // 2. Legacy shard union (the CRDT layer the python lenses still write).
-    let (_, shards) = shard::read_with_shards(kernel, collection, branch);
+    let (_, shards) = shard::read_with_shards(kernel, collection, branch).unwrap();
     for (_, shard_hash) in shards {
         if let Ok(data) = kernel.read_blob(&shard_hash) {
             if let Ok(arr) = serde_json::from_slice::<Vec<Value>>(&data) {

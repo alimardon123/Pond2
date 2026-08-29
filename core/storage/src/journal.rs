@@ -412,24 +412,38 @@ pub(crate) fn read_snapshot_upto(kernel: &PondKernel, snapshot_hash: &str) -> BT
 /// Entries within a writer log are strictly sequential (the writer's own
 /// counter, appended under its registry Mutex), so the first miss is the
 /// log's current end — there is never a gap to re-scan.
+///
+/// C17: a probe that FAILS (ref read error) returns `Err` — a failed
+/// probe is a potentially TRUNCATED journal view, never an empty suffix.
+/// The first `Ok(None)` (a real gap) still terminates the epoch.
 fn probe_writer(
     kernel: &PondKernel,
     collection: &str,
     branch: &str,
     writer: &str,
     start: u64,
-) -> Vec<JournalEntry> {
+) -> Result<Vec<JournalEntry>, String> {
     let mut entries = Vec::new();
     let mut seq = start;
-    while let Some(pack_hash) = kernel.resolve(&entry_path(collection, branch, writer, seq)) {
-        entries.push(JournalEntry {
-            writer: writer.to_string(),
-            seq,
-            pack_hash,
-        });
-        seq += 1;
+    loop {
+        match kernel.resolve(&entry_path(collection, branch, writer, seq)) {
+            Ok(Some(pack_hash)) => {
+                entries.push(JournalEntry {
+                    writer: writer.to_string(),
+                    seq,
+                    pack_hash,
+                });
+                seq += 1;
+            }
+            // A real gap: the writer's log ends here — the epoch is done.
+            Ok(None) => return Ok(entries),
+            // A FAILED probe = a potentially TRUNCATED journal view. A
+            // transient ref outage mid-log must surface as Err, not as
+            // "the log ended at seq-1" (the C17 blindness).
+            Err(e) => return Err(format!(
+                "journal entry probe failed (writer {} seq {}): {}", writer, seq, e)),
+        }
     }
-    entries
 }
 
 /// Resolve the RAW journal view: snapshot pack + every live entry above
@@ -468,7 +482,11 @@ pub fn resolve_view(
 
     // 1. Snapshot base: the branch ref. None on a fresh collection →
     //    empty base (the caller treats "no snapshot, no entries" as empty).
-    let snapshot = kernel.resolve(&branch_ref(collection, branch));
+    //    C17: a FAILED branch-ref read is an Err (today it masqueraded as
+    //    "no snapshot" — a transient outage looked like a fresh branch).
+    let snapshot = kernel.resolve(&branch_ref(collection, branch))
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?;
     let snapshot_upto = snapshot
         .as_ref()
         .map(|h| read_snapshot_upto(kernel, h))
@@ -504,7 +522,9 @@ pub fn resolve_view(
             .collect();
         for h in handles {
             match h.join() {
-                Ok(entries) => probed.extend(entries),
+                Ok(Ok(entries)) => probed.extend(entries),
+                // A probe FAILED (C17): truncated-view error, propagate.
+                Ok(Err(e)) => return Some(e),
                 Err(_) => return Some("journal probe thread panicked".to_string()),
             }
         }
@@ -837,7 +857,13 @@ pub fn append_pack(
         // until entry #32. The branch ref is still written ONLY by
         // `compact` (the sanctioned LWW writer) — the write paths
         // themselves touch zero shared objects.
-        let bootstrap = kernel.resolve(&branch_ref(collection, branch)).is_none();
+        //
+        // C17: a FAILED bootstrap probe is an Err, not a phantom
+        // "collection is fresh" — an outage must not skip the fold.
+        let bootstrap = kernel.resolve(&branch_ref(collection, branch))
+            .map_err(|e| format!(
+                "Failed to read branch ref for collection '{}': {}", collection, e))?
+            .is_none();
         let due = {
             let writer = writer_arc.lock().unwrap();
             // next_seq - 1 == the seq just appended; fold once the log has
@@ -925,7 +951,7 @@ pub fn compact(
     let view = resolve_view(kernel, collection, branch, true)?;
     if view.snapshot.is_none()
         && view.entries.is_empty()
-        && shard::list_shards(kernel, collection, branch).is_empty()
+        && shard::list_shards(kernel, collection, branch)?.is_empty()
     {
         // Nothing to fold — NOT an error: idempotent no-op compaction
         // (matches the old compact_shards(Ok(0)) convention so lens-layer
@@ -1002,7 +1028,7 @@ pub fn compact(
     //    cannot join a manifest union as-is: their merged live rows are
     //    re-encoded as a PND2 row group (the write_rows encode machinery)
     //    and that RG joins the union manifest.
-    let shards = shard::list_shards(kernel, collection, branch);
+    let shards = shard::list_shards(kernel, collection, branch)?;
     let shards_folded = shards.len();
     let mut shard_rows: Vec<Value> = Vec::new();
     for (_name, hash) in &shards {
@@ -1371,11 +1397,15 @@ fn collect_rg_identities(
 /// snapshot's manifest — including hand-built fixtures whose "manifest"
 /// bytes predate PMAN, which correctly fail decode). When nothing is live,
 /// the branch ref already IS the full folded state.
-pub fn has_live_state(kernel: &PondKernel, collection: &str, branch: &str) -> bool {
+///
+/// C17: a FAILED view resolution propagates (`Err`) — during an outage
+/// the caller must not mistake "cannot read the journal" for "nothing
+/// live" and skip a fold it needed (the caller's own branch-ref resolve
+/// would fail anyway, but loudly failing here names the real cause).
+pub fn has_live_state(kernel: &PondKernel, collection: &str, branch: &str) -> Result<bool, String> {
     let has_entries = resolve_view(kernel, collection, branch, true)
-        .map(|v| !v.entries.is_empty())
-        .unwrap_or(false);
-    has_entries || !shard::list_shards(kernel, collection, branch).is_empty()
+        .map(|v| !v.entries.is_empty())?;
+    Ok(has_entries || !shard::list_shards(kernel, collection, branch)?.is_empty())
 }
 
 // ---------------------------------------------------------------------------

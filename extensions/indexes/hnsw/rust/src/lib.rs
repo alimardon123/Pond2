@@ -138,7 +138,10 @@ impl<'a> HNSWIndex<'a> {
     ) -> Result<Vec<(f64, String)>, String> {
         // 1. Load header
         let ref_name = format!("collections/{}/indexes/hnsw", collection);
+        // C17: a FAILED ref read is an Err — an outage is not "no index".
         let header_hash = self.kernel.resolve(&ref_name)
+            .map_err(|e| format!(
+                "Failed to read HNSW index ref for '{}': {}", collection, e))?
             .ok_or_else(|| format!("No HNSW index for collection '{}'", collection))?;
 
         let header_data = self.kernel.read_blob(&header_hash)
@@ -201,9 +204,13 @@ impl<'a> HNSWIndex<'a> {
     }
 
     /// Get index statistics.
+    ///
+    /// Best-effort (Option) API, mirroring the lenient `read_blob().ok()`
+    /// chains below — a FAILED ref read yields None here (C17: the Err
+    /// distinction lives in `search`/`read_all_vectors`).
     pub fn stats(&self, collection: &str) -> Option<HNSWStats> {
         let ref_name = format!("collections/{}/indexes/hnsw", collection);
-        let header_hash = self.kernel.resolve(&ref_name)?;
+        let header_hash = self.kernel.resolve(&ref_name).ok()??;
         let header_data = self.kernel.read_blob(&header_hash).ok()?;
         let header: Value = serde_json::from_slice(&header_data).ok()?;
 
@@ -231,7 +238,11 @@ impl<'a> HNSWIndex<'a> {
         _n_dimensions: Option<usize>,
     ) -> Result<(Vec<Vec<f64>>, Vec<String>), String> {
         let branch = "main";
+        // C17: a FAILED branch-ref read is an Err — an outage is not a
+        // fresh collection.
         let head = self.kernel.resolve(&pond_storage::branch_ref(collection, branch))
+            .map_err(|e| format!(
+                "Failed to read branch ref for collection '{}': {}", collection, e))?
             .ok_or_else(|| format!("Collection '{}' has no commits", collection))?;
 
         let manifest_bytes = pond_storage::commit::resolve_manifest_bytes(self.kernel, &head)

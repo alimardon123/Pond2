@@ -55,20 +55,28 @@ pub fn drop_name(kernel: &PondKernel, name: &str) {
 
 /// True iff name is bound to TOMBSTONE_HASH.
 ///
-/// Returns false for names bound to a non-tombstone hash or unbound names.
-pub fn is_dropped(kernel: &PondKernel, name: &str) -> bool {
-    kernel.resolve(name).as_deref() == Some(&tombstone_hash())
+/// Returns Ok(false) for names bound to a non-tombstone hash or unbound
+/// names; `Err` when the ref read itself failed (C17 — an outage is not
+/// "not tombstoned").
+pub fn is_dropped(kernel: &PondKernel, name: &str) -> Result<bool, String> {
+    Ok(kernel.resolve(name)
+        .map_err(|e| format!(
+            "Failed to read ref for tombstone check on '{}': {}", name, e))?
+        .as_deref() == Some(&tombstone_hash()))
 }
 
 /// Resolve a name to its hash, returning None for unbound OR tombstoned names.
 ///
 /// This is what Lens code should call when it wants "active names only."
-pub fn resolve_active(kernel: &PondKernel, name: &str) -> Option<String> {
-    let h = kernel.resolve(name)?;
-    if h == tombstone_hash() {
-        return None;
-    }
-    Some(h)
+/// C17: `Err` = the ref read failed (distinct from unbound/tombstoned).
+pub fn resolve_active(kernel: &PondKernel, name: &str) -> Result<Option<String>, String> {
+    let h = kernel.resolve(name)
+        .map_err(|e| format!("Failed to read ref '{}': {}", name, e))?;
+    Ok(if h.as_deref() == Some(&tombstone_hash()) {
+        None
+    } else {
+        h
+    })
 }
 
 /// Remove tombstoned name rows from the kernel's namespace.
@@ -85,9 +93,14 @@ pub fn compact_tombstones(kernel: &PondKernel) -> usize {
     let names = kernel.list_names();
     let mut compacted = 0;
     for name in &names {
-        if kernel.resolve(name).as_deref() == Some(&ts_hash) {
-            let _ = kernel.delete_ref(name);
-            compacted += 1;
+        // Conservative-skip on FAILED reads (C17): physical compaction only
+        // removes names it POSITIVELY identified as tombstones — an
+        // unreadable ref is left untouched (a later vacuum retries).
+        if let Ok(Some(h)) = kernel.resolve(name) {
+            if h == ts_hash {
+                let _ = kernel.delete_ref(name);
+                compacted += 1;
+            }
         }
     }
     compacted
@@ -120,15 +133,15 @@ mod tests {
         kernel.reference("my_coll", &h).unwrap();
 
         // Not dropped initially
-        assert!(!is_dropped(&kernel, "my_coll"));
-        assert_eq!(resolve_active(&kernel, "my_coll"), Some(h.clone()));
+        assert!(!is_dropped(&kernel, "my_coll").unwrap());
+        assert_eq!(resolve_active(&kernel, "my_coll").unwrap(), Some(h.clone()));
 
         // Drop it
         drop_name(&kernel, "my_coll");
-        assert!(is_dropped(&kernel, "my_coll"));
-        assert_eq!(resolve_active(&kernel, "my_coll"), None);
+        assert!(is_dropped(&kernel, "my_coll").unwrap());
+        assert_eq!(resolve_active(&kernel, "my_coll").unwrap(), None);
         // kernel.resolve still returns the tombstone hash
-        assert_eq!(kernel.resolve("my_coll"), Some(tombstone_hash()));
+        assert_eq!(kernel.resolve("my_coll").unwrap(), Some(tombstone_hash()));
     }
 
     #[test]
@@ -140,15 +153,15 @@ mod tests {
 
         drop_name(&kernel, "coll");
         drop_name(&kernel, "coll"); // second time is a no-op
-        assert!(is_dropped(&kernel, "coll"));
+        assert!(is_dropped(&kernel, "coll").unwrap());
     }
 
     #[test]
     fn test_resolve_active_for_unbound() {
         let dir = tempdir().unwrap();
         let kernel = PondKernel::new_local(dir.path()).unwrap();
-        assert_eq!(resolve_active(&kernel, "nonexistent"), None);
-        assert!(!is_dropped(&kernel, "nonexistent"));
+        assert_eq!(resolve_active(&kernel, "nonexistent").unwrap(), None);
+        assert!(!is_dropped(&kernel, "nonexistent").unwrap());
     }
 
     #[test]
@@ -169,14 +182,14 @@ mod tests {
         assert_eq!(compacted, 2);
 
         // Dropped names are now unbound (not just tombstoned)
-        assert!(!is_dropped(&kernel, "drop1")); // unbound, not tombstoned
-        assert_eq!(kernel.resolve("drop1"), None);
-        assert!(!is_dropped(&kernel, "drop2"));
-        assert_eq!(kernel.resolve("drop2"), None);
+        assert!(!is_dropped(&kernel, "drop1").unwrap()); // unbound, not tombstoned
+        assert_eq!(kernel.resolve("drop1").unwrap(), None);
+        assert!(!is_dropped(&kernel, "drop2").unwrap());
+        assert_eq!(kernel.resolve("drop2").unwrap(), None);
 
         // Active name is untouched
-        assert!(!is_dropped(&kernel, "keep"));
-        assert_eq!(resolve_active(&kernel, "keep"), Some(h));
+        assert!(!is_dropped(&kernel, "keep").unwrap());
+        assert_eq!(resolve_active(&kernel, "keep").unwrap(), Some(h));
     }
 
     #[test]
@@ -269,8 +282,12 @@ impl<'a> GarbageCollector<'a> {
     ///   - compute_size: if True, read each dead blob to compute its size (slow).
     ///
     /// Returns: GcStats { live, dead, dead_hashes, dead_size_bytes }
-    pub fn collect(&self, collection: Option<&str>, compute_size: bool) -> GcStats {
-        let live_set = self.build_live_set(collection.map(|c| vec![c.to_string()]));
+    ///
+    /// C17: `Err` when ANY ref read failed — liveness classification is
+    /// unreliable during an outage, and the stats would undercount live
+    /// blobs (they'd look dead). Abort instead of guessing.
+    pub fn collect(&self, collection: Option<&str>, compute_size: bool) -> Result<GcStats, String> {
+        let live_set = self.build_live_set(collection.map(|c| vec![c.to_string()]))?;
         let all_blobs = self.list_all_blob_hashes();
         let all_set: HashSet<String> = all_blobs.into_iter().collect();
         let dead_set: HashSet<String> = all_set.difference(&live_set).cloned().collect();
@@ -290,12 +307,12 @@ impl<'a> GarbageCollector<'a> {
         let mut dead_hashes: Vec<String> = dead_set.into_iter().collect();
         dead_hashes.sort();
 
-        GcStats {
+        Ok(GcStats {
             live: live_set.len(),
             dead: dead_hashes.len(),
             dead_hashes,
             dead_size_bytes: dead_size,
-        }
+        })
     }
 
     /// Delete unreachable blobs, optionally preserving recent commits.
@@ -306,13 +323,17 @@ impl<'a> GarbageCollector<'a> {
     ///   - dry_run: if True, report what would be deleted without deleting.
     ///
     /// Returns: VacuumResult { deleted, preserved, freed_bytes, dry_run }
+    ///
+    /// C17: `Err` when ANY ref read failed — deleting blobs whose
+    /// reachability could not be established (because a ref GET failed)
+    /// would destroy LIVE data. Vacuum aborts loudly instead.
     pub fn vacuum(
         &self,
         collections: Option<&[String]>,
         _preserve_days: u32,
         dry_run: bool,
-    ) -> VacuumResult {
-        let live_set = self.build_live_set(collections.map(|v| v.to_vec()));
+    ) -> Result<VacuumResult, String> {
+        let live_set = self.build_live_set(collections.map(|v| v.to_vec()))?;
         let all_blobs = self.list_all_blob_hashes();
         let dead: Vec<String> = all_blobs.into_iter()
             .filter(|h| !live_set.contains(h))
@@ -343,12 +364,12 @@ impl<'a> GarbageCollector<'a> {
             }
         }
 
-        VacuumResult {
+        Ok(VacuumResult {
             deleted,
             preserved,
             freed_bytes,
             dry_run,
-        }
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -359,7 +380,11 @@ impl<'a> GarbageCollector<'a> {
     ///
     /// Walks all collection refs, follows commit chains, reads manifests,
     /// and collects all referenced blob hashes.
-    fn build_live_set(&self, collections: Option<Vec<String>>) -> HashSet<String> {
+    ///
+    /// C17: any FAILED ref read aborts (`Err`) — an unreadable ref's blob
+    /// subtree would otherwise look unreachable and a vacuum could delete
+    /// LIVE data.
+    fn build_live_set(&self, collections: Option<Vec<String>>) -> Result<HashSet<String>, String> {
         let mut live: HashSet<String> = HashSet::new();
 
         // List all refs (paths)
@@ -380,13 +405,16 @@ impl<'a> GarbageCollector<'a> {
             }
 
             // Resolve the ref to a hash
-            if let Some(hash) = self.kernel.resolve(ref_path) {
+            if let Some(hash) = self.kernel.resolve(ref_path)
+                .map_err(|e| format!(
+                    "GC: failed to read ref '{}': {}", ref_path, e))?
+            {
                 // Walk reachable blobs from this hash
                 self.walk_reachable(&hash, &mut live);
             }
         }
 
-        live
+        Ok(live)
     }
 
     /// Walk all blobs reachable from a starting hash.
@@ -482,7 +510,7 @@ mod gc_tests {
         let storage = UnifiedStorage::new_local(dir.path()).unwrap();
         let kernel = storage.kernel();
         let gc = GarbageCollector::new(kernel);
-        let stats = gc.collect(None, false);
+        let stats = gc.collect(None, false).unwrap();
         assert_eq!(stats.live, 0);
         assert_eq!(stats.dead, 0);
     }
@@ -499,7 +527,7 @@ mod gc_tests {
         kernel.reference("ref1", &kernel.write(b"ref1data").unwrap()).unwrap();
 
         let gc = GarbageCollector::new(kernel);
-        let stats = gc.collect(None, false);
+        let stats = gc.collect(None, false).unwrap();
         // "data1" and "data2" are dead (not referenced by any ref)
         // "ref1data" is live (referenced by "ref1")
         assert!(stats.live > 0, "should have some live blobs");
@@ -516,7 +544,7 @@ mod gc_tests {
         kernel.write(b"garbage2").unwrap();
 
         let gc = GarbageCollector::new(kernel);
-        let result = gc.vacuum(None, 0, true); // dry run
+        let result = gc.vacuum(None, 0, true).unwrap(); // dry run
         assert!(result.dry_run);
         assert!(result.deleted >= 2, "dry run should count garbage blobs");
     }
@@ -532,7 +560,7 @@ mod gc_tests {
         let h2 = kernel.write(b"garbage2").unwrap();
 
         let gc = GarbageCollector::new(kernel);
-        let result = gc.vacuum(None, 0, false); // real vacuum
+        let result = gc.vacuum(None, 0, false).unwrap(); // real vacuum
         assert!(result.deleted >= 2, "should delete garbage blobs");
 
         // Verify blobs are gone (read_blob should fail)

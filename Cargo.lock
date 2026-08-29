@@ -1736,6 +1736,7 @@ dependencies = [
  "base64",
  "chrono",
  "hex",
+ "pond_cache",
  "pond_kernel",
  "pond_storage",
  "reqwest",

@@ -68,12 +68,13 @@ enum Commands {
             #[arg(short, long)] message: Option<String> },
     /// Read the RAW bytes of a collection (or a blob by hash).
     ///
-    /// NOTE (C13): the raw path resolves the branch ref — a CACHE of the
-    /// last compaction fold — so it can be journal-STALE for structured
-    /// data written since (write-rows/SQL INSERT append journal packs the
-    /// raw path does not resolve). For journal-aware reads use
-    /// `pond read-rows` or `pond sql`. Kept raw for byte-exact round-trips
-    /// of blobs written with `pond write`.
+    /// JOURNAL-AWARE (C13, fixed N+6): the raw path resolves the journal
+    /// view — the last fold's snapshot PLUS every live journal pack — so
+    /// structured writes (write-rows/SQL INSERT) are visible immediately.
+    /// The bytes are the concatenated live row groups: byte-exact for
+    /// blobs written with `pond write`; for structured data the union of
+    /// base + not-yet-folded packs (use `pond read-rows`/`pond sql` for
+    /// CRDT-merged ROWS).
     Read { name_or_hash: String, #[arg(short, long)] output: Option<String> },
     Branch { collection: String, branch_name: String },
     Checkout { collection: String, branch_name: String,
@@ -286,13 +287,35 @@ fn load_persisted_active_branches(storage: &UnifiedStorage) {
     // Find all _active_branch/ refs
     let names = kernel.list_names_prefix("_active_branch/");
     for name in names {
-        if let Some(hash) = kernel.resolve(&name) {
-            if let Ok(data) = kernel.read_blob(&hash) {
-                let branch = String::from_utf8_lossy(&data).to_string();
-                if let Some(collection) = name.strip_prefix("_active_branch/") {
-                    storage.set_active_branch(collection, &branch);
-                }
+        // C17: best-effort hint loader (the sibling persist fn ignores
+        // write errors the same way) — a FAILED ref read warns and skips
+        // that hint; the branch falls back to "main" until the next write.
+        let hash = match kernel.resolve(&name) {
+            Ok(Some(h)) => h,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("Warning: failed to read active-branch ref '{}': {}", name, e);
+                continue;
             }
+        };
+        if let Ok(data) = kernel.read_blob(&hash) {
+            let branch = String::from_utf8_lossy(&data).to_string();
+            if let Some(collection) = name.strip_prefix("_active_branch/") {
+                storage.set_active_branch(collection, &branch);
+            }
+        }
+    }
+}
+
+/// Resolve a ref for DISPLAY/COMMAND flow, exiting loudly on I/O failure
+/// (C17: an outage must not masquerade as an absent ref). `Ok(None)` still
+/// means "unbound" — only the Err arm exits.
+fn resolve_or_exit(kernel: &pond_kernel::PondKernel, path: &str, what: &str) -> Option<String> {
+    match kernel.resolve(path) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Error: failed to read {} '{}': {}", what, path, e);
+            std::process::exit(1);
         }
     }
 }
@@ -514,9 +537,16 @@ fn cmd_init_s3(url: &str) {
         match pond_s3::S3ObjectStore::from_url(url) {
             Ok(store) => {
                 use pond_kernel::ObjectStore;
-                // Check if .pond/config already exists in S3
-                let existing_config = store.get_path(".pond/config");
-                let already_initialized = existing_config.is_some();
+                // Check if .pond/config already exists in S3.
+                // C17: a FAILED read exits loudly (the CLI's local error
+                // pattern) — an outage is not "not initialized".
+                let already_initialized = match store.get_path(".pond/config") {
+                    Ok(h) => h.is_some(),
+                    Err(e) => {
+                        eprintln!("Error: failed to read .pond/config from S3: {}", e);
+                        std::process::exit(1);
+                    }
+                };
 
                 // Write .pond/config to S3 (create or update)
                 let config = format!(
@@ -668,7 +698,9 @@ fn cmd_branches(storage: &UnifiedStorage, collection: &str) {
     let branches = branch::list_branches(kernel, collection);
     let active = storage.get_active_branch(collection);
     if branches.is_empty() {
-        if kernel.resolve(collection).is_some() {
+        // C17: an outage must not print "(no branches)" for a live
+        // collection — the probe exits loudly on Err.
+        if resolve_or_exit(kernel, collection, "collection ref for").is_some() {
             println!("* main");
         } else {
             println!("(no branches)");
@@ -677,8 +709,12 @@ fn cmd_branches(storage: &UnifiedStorage, collection: &str) {
     }
     for b in branches {
         let marker = if b == active { "*" } else { " " };
-        let hash = kernel.resolve(&pond_storage::branch_ref(collection, &b))
-            .unwrap_or_default();
+        let hash = resolve_or_exit(
+            kernel,
+            &pond_storage::branch_ref(collection, &b),
+            "branch ref for",
+        )
+        .unwrap_or_default();
         let prefix = if hash.len() >= 12 { &hash[..12] } else { &hash };
         println!("{} {}\t{}", marker, b, prefix);
     }
@@ -739,9 +775,15 @@ fn cmd_ls(storage: &UnifiedStorage) {
     collections.sort(); collections.dedup();
     for name in collections {
         let active = storage.get_active_branch(&name);
-        let hash = kernel.resolve(&pond_storage::branch_ref(&name, &active))
-            .or_else(|| kernel.resolve(&name))
-            .unwrap_or_default();
+        // C17: display path — a FAILED read exits loudly (an outage must
+        // not render an empty hash prefix as if the collection were gone).
+        let hash = resolve_or_exit(
+            kernel,
+            &pond_storage::branch_ref(&name, &active),
+            "branch ref for",
+        )
+        .or_else(|| resolve_or_exit(kernel, &name, "collection ref for"))
+        .unwrap_or_default();
         let prefix = if hash.len() >= 12 { &hash[..12] } else { &hash };
         println!("{}\t{}", prefix, name);
     }
@@ -773,7 +815,15 @@ fn cmd_gc(storage: &UnifiedStorage, compute_size: bool, dry_run: bool) {
     let kernel = storage.kernel();
     let gc = pond_storage::maintenance::GarbageCollector::new(kernel);
 
-    let stats = gc.collect(None, compute_size);
+    // C17: GC aborts on ref-read failures — classifying liveness during an
+    // outage risks deleting LIVE blobs (see GarbageCollector::collect).
+    let stats = match gc.collect(None, compute_size) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: GC analysis failed: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     println!("GC Analysis:");
     println!("  Live blobs:     {}", stats.live);
@@ -795,7 +845,13 @@ fn cmd_gc(storage: &UnifiedStorage, compute_size: bool, dry_run: bool) {
             println!("    ... and {} more", stats.dead - 20);
         }
     } else if stats.dead > 0 {
-        let result = gc.vacuum(None, 0, false);
+        let result = match gc.vacuum(None, 0, false) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Error: vacuum failed: {}", e);
+                std::process::exit(1);
+            }
+        };
         println!("\nVacuumed: deleted {} blobs, preserved {}", result.deleted, result.preserved);
     } else {
         println!("\nNo dead blobs to clean up.");
@@ -879,8 +935,14 @@ fn cmd_vacuum(storage: &UnifiedStorage, preserve_days: u32, dry_run: bool) {
     let kernel = storage.kernel();
     let gc = pond_storage::maintenance::GarbageCollector::new(kernel);
 
-    // First analyze
-    let stats = gc.collect(None, false);
+    // First analyze (C17: aborts on ref-read failures — see cmd_gc).
+    let stats = match gc.collect(None, false) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: GC analysis failed: {}", e);
+            std::process::exit(1);
+        }
+    };
     println!("Before vacuum:");
     println!("  Live blobs: {}", stats.live);
     println!("  Dead blobs: {}", stats.dead);
@@ -889,7 +951,13 @@ fn cmd_vacuum(storage: &UnifiedStorage, preserve_days: u32, dry_run: bool) {
         println!("\n  (dry run — no blobs deleted)");
         println!("  Would delete {} blobs (preserving last {} days)", stats.dead, preserve_days);
     } else if stats.dead > 0 {
-        let result = gc.vacuum(None, preserve_days, false);
+        let result = match gc.vacuum(None, preserve_days, false) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Error: vacuum failed: {}", e);
+                std::process::exit(1);
+            }
+        };
         println!("\nVacuum complete:");
         println!("  Deleted:   {} blobs", result.deleted);
         println!("  Preserved: {} blobs", result.preserved);
@@ -1246,7 +1314,12 @@ fn read_rows_as_json(
     // decoded every column, and decoded the manifest with
     // `CollectionManifest::decode` — which cannot resolve PMAN v3 root
     // manifests (roots have leaves, not row_groups).
-    let head = kernel.resolve(&pond_storage::branch_ref(collection, &active));
+    //
+    // C17: a FAILED branch-ref read is its own error arm — an outage is
+    // NOT a fresh collection (distinct from the "no commits" fallback).
+    let head = kernel.resolve(&pond_storage::branch_ref(collection, &active))
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?;
     let pairs = match head {
         Some(_) => pond_storage::read::read_rows_json_pruned(
             kernel, collection, &active, &key_fields, projection.as_deref(), &predicates,
@@ -1255,7 +1328,12 @@ fn read_rows_as_json(
             // Legacy fallback (pre-branch data): the bare collection ref
             // points at a PNPK pack hash. Route it through the SAME pruned
             // pipeline via the head-override entry point.
-            match kernel.resolve(collection) {
+            // C17: the fallback probe propagates Err too — an outage is
+            // not "no legacy data".
+            match kernel.resolve(collection)
+                .map_err(|e| format!(
+                    "Failed to read collection ref for '{}': {}", collection, e))?
+            {
                 Some(pack_hash) => pond_storage::read::read_rows_json_pruned_with_head(
                     kernel, &pack_hash, &key_fields, projection.as_deref(), &predicates,
                 )?,
@@ -1879,9 +1957,23 @@ fn print_sql_result(result: &pond_sql::SqlResult) {
 fn describe_collection(storage: &UnifiedStorage, collection: &str) {
     let kernel = storage.kernel();
     let active = storage.get_active_branch(collection);
-    let head = kernel
-        .resolve(&pond_storage::branch_ref(collection, &active))
-        .or_else(|| kernel.resolve(collection));
+    // C17: display path — a FAILED read reports the error and returns
+    // (an outage is not "no commits").
+    let head = match kernel.resolve(&pond_storage::branch_ref(collection, &active)) {
+        Ok(Some(h)) => Some(h),
+        Ok(None) => match kernel.resolve(collection) {
+            Ok(Some(h)) => Some(h),
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("Error: failed to read collection ref for '{}': {}", collection, e);
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("Error: failed to read branch ref for '{}': {}", collection, e);
+            return;
+        }
+    };
 
     let head = match head {
         Some(h) => h,

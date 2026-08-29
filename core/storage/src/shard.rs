@@ -30,6 +30,10 @@ use pond_kernel::crdt::HLC;
 use pond_kernel::PondKernel;
 use serde_json::{json, Value};
 
+/// The [`read_with_shards`] result: the HEAD manifest hash (None when the
+/// branch has no commits) + every live shard as `(name, hash)`.
+pub type HeadAndShards = (Option<String>, Vec<(String, String)>);
+
 /// Append a CRDT shard to a branch (LEGACY escape hatch).
 ///
 /// The shard is written to a unique path under the branch's shards/
@@ -67,21 +71,29 @@ pub fn append_shard(
 /// Scans the branch's shards/ directory and resolves each ref. Journal-era
 /// upserts/deletes (D7) never appear here — they live in the journal, not
 /// in shards/.
+///
+/// C17: `Err` when a shard ref read FAILED — a shard silently missing
+/// from the list is silently-missing rows in the CRDT union (the same
+/// blindness C8 killed for shard blobs; the ref enumeration must not
+/// reintroduce it for shard discovery).
 pub fn list_shards(
     kernel: &PondKernel,
     collection: &str,
     branch: &str,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>, String> {
     let prefix = shards_prefix(collection, branch);
     let refs = kernel.list_names_prefix(&prefix);
     let mut shards = Vec::new();
     for ref_path in refs {
-        if let Some(hash) = kernel.resolve(&ref_path) {
+        if let Some(hash) = kernel.resolve(&ref_path)
+            .map_err(|e| format!(
+                "Failed to read shard ref for collection '{}': {}", collection, e))?
+        {
             let name = ref_path.strip_prefix(&prefix).unwrap_or(&ref_path).to_string();
             shards.push((name, hash));
         }
     }
-    shards
+    Ok(shards)
 }
 
 /// Read the collection's HEAD manifest + all live shards (LEGACY-COMPAT).
@@ -94,9 +106,12 @@ pub fn read_with_shards(
     kernel: &PondKernel,
     collection: &str,
     branch: &str,
-) -> (Option<String>, Vec<(String, String)>) {
-    // Get HEAD commit
-    let head_commit = kernel.resolve(&branch_ref(collection, branch));
+) -> Result<HeadAndShards, String> {
+    // Get HEAD commit. C17: a FAILED read is an Err — an outage is not
+    // "no HEAD" (the caller unions these shards into the row surface).
+    let head_commit = kernel.resolve(&branch_ref(collection, branch))
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?;
 
     // Get HEAD manifest
     let head_manifest = head_commit.as_ref()
@@ -106,9 +121,9 @@ pub fn read_with_shards(
         });
 
     // List all shards
-    let shards = list_shards(kernel, collection, branch);
+    let shards = list_shards(kernel, collection, branch)?;
 
-    (head_manifest, shards)
+    Ok((head_manifest, shards))
 }
 
 /// Clear all shards for a branch (used after merge/compact).
@@ -123,7 +138,7 @@ pub fn clear_shards(
     collection: &str,
     branch: &str,
 ) -> Result<usize, String> {
-    let shards = list_shards(kernel, collection, branch);
+    let shards = list_shards(kernel, collection, branch)?;
     let mut count = 0;
     for (name, hash) in &shards {
         let shard_ref = format!("{}{}", shards_prefix(collection, branch), name);
@@ -155,12 +170,14 @@ fn delete_blob(kernel: &PondKernel, hash: &str) {
 /// Counts pre-D7 JSON shards only — journal-era upserts/deletes keep the
 /// shard namespace empty (shard_count == 0 is the expected D7 steady
 /// state; live journal entries are reported by journal::status).
+///
+/// C17: `Err` = a shard ref read failed (see list_shards).
 pub fn shard_count(
     kernel: &PondKernel,
     collection: &str,
     branch: &str,
-) -> usize {
-    list_shards(kernel, collection, branch).len()
+) -> Result<usize, String> {
+    Ok(list_shards(kernel, collection, branch)?.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +237,10 @@ fn append_rows_as_journal_pack(
     // Commit object mirroring write_rows_inner (write.rs): parent from the
     // branch-ref resolve, index+1, timestamp. The message includes the
     // shard_name for history visibility.
-    let parent = kernel.resolve(&branch_ref(collection, branch));
+    // C17: a FAILED branch-ref read is an Err, not a phantom "no parent".
+    let parent = kernel.resolve(&branch_ref(collection, branch))
+        .map_err(|e| format!(
+            "Failed to read branch ref for collection '{}': {}", collection, e))?;
     let parent_index = parent
         .as_ref()
         .and_then(|p| crate::commit::read_commit(kernel, p))
@@ -508,7 +528,7 @@ mod tests {
         let _h2 = append_shard(kernel, "events", "main", "shardB", b"shard B data").unwrap();
 
         // List shards
-        let shards = list_shards(kernel, "events", "main");
+        let shards = list_shards(kernel, "events", "main").unwrap();
         assert_eq!(shards.len(), 2);
 
         // Verify shard data
@@ -524,11 +544,11 @@ mod tests {
 
         append_shard(kernel, "events", "main", "s1", b"data1").unwrap();
         append_shard(kernel, "events", "main", "s2", b"data2").unwrap();
-        assert_eq!(shard_count(kernel, "events", "main"), 2);
+        assert_eq!(shard_count(kernel, "events", "main").unwrap(), 2);
 
         let cleared = clear_shards(kernel, "events", "main").unwrap();
         assert_eq!(cleared, 2);
-        assert_eq!(shard_count(kernel, "events", "main"), 0);
+        assert_eq!(shard_count(kernel, "events", "main").unwrap(), 0);
     }
 
     #[test]
@@ -538,13 +558,13 @@ mod tests {
         let kernel = storage.kernel();
 
         // No HEAD, no shards
-        let (head, shards) = read_with_shards(kernel, "events", "main");
+        let (head, shards) = read_with_shards(kernel, "events", "main").unwrap();
         assert!(head.is_none());
         assert!(shards.is_empty());
 
         // Add shards (no HEAD)
         append_shard(kernel, "events", "main", "s1", b"data1").unwrap();
-        let (head, shards) = read_with_shards(kernel, "events", "main");
+        let (head, shards) = read_with_shards(kernel, "events", "main").unwrap();
         assert!(head.is_none()); // no HEAD commit
         assert_eq!(shards.len(), 1);
     }
@@ -577,7 +597,7 @@ mod tests {
         assert_eq!(row.get("name"), Some(&json!("alice")));
 
         // D7: NO JSON shard blob, NO shards/ ref.
-        assert_eq!(shard_count(kernel, "users", "main"), 0);
+        assert_eq!(shard_count(kernel, "users", "main").unwrap(), 0);
     }
 
     #[test]
@@ -603,7 +623,7 @@ mod tests {
         // Delete the row — tombstone pack, NOT a JSON shard blob.
         let del_hash = delete_shard(kernel, "users", "main", "del1", &[rowid], Some("name"), &mut hlc).unwrap();
         assert!(!del_hash.is_empty(), "delete returns the journal pack hash");
-        assert_eq!(shard_count(kernel, "users", "main"), 0);
+        assert_eq!(shard_count(kernel, "users", "main").unwrap(), 0);
 
         // The tombstone suppresses the row (same HLC — strictly later version).
         let live = crate::read::read_rows_json_pruned(kernel, "users", "main", &kc, None, &[])
@@ -629,7 +649,7 @@ mod tests {
 
         let status = crate::journal::status(kernel, "users", "main").unwrap();
         assert_eq!(status.live_entries, 0, "no journal entries may be appended");
-        assert_eq!(shard_count(kernel, "users", "main"), 0);
+        assert_eq!(shard_count(kernel, "users", "main").unwrap(), 0);
 
         let kc = vec!["_rowid".to_string()];
         let live = crate::read::read_rows_json_pruned(kernel, "users", "main", &kc, None, &[])

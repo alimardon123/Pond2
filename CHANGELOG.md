@@ -3,6 +3,85 @@
 > Crucible state file. The deep per-cycle log lives in `worklog.md`
 > (append-only); this file tracks iterations and why.
 
+## 2026-08-30 — Crucible iteration N+6: the error-channel + codec-laws + live-R2 cycle (C17 + C13 + C12)
+
+- **C17 landed (D9 — the ref-surface error channel)**:
+  `ObjectStore::get_path` returns `io::Result<Option<String>>` across
+  the trait and every backend — LocalFS discriminates NotFound, S3
+  discriminates 404 via the shared `is_s3_not_found` (a corrupt ref
+  body is `InvalidData`, not absence), CachingObjectStore propagates
+  errors WITHOUT poisoning the ref cache, `get_path_with_etag` +
+  `get_path_async` follow suit. `PondKernel::resolve` delegates bare
+  and the full 112-caller sweep landed: journal snapshot resolution,
+  branch/transaction/bptx/maintenance/read/write paths, lenses,
+  extensions, mcp-server, CLI, pyo3 (IOError on failure — Python
+  parity), test stores. The critical semantic: **a FAILED journal
+  epoch probe is a TRUNCATED-view error, never an empty suffix** —
+  `probe_writer` is fallible; a transient outage mid-log can no longer
+  silently shorten the journal view. `read_full`, `has_live_state`,
+  `read_with_shards`, `list_shards` all became fallible with the same
+  law (an outage is not "nothing there"). Pinned by
+  test_c17_ref_outage_errors_not_empty / _recovery (SQL errors naming
+  the ref, not empty rows) and
+  test_c17_probe_outage_is_error_not_truncation.
+- **C13 closed (the raw path is journal-aware)**: `read::read`
+  (`pond read`, and thereby the OLTP/streaming lenses' full-replace
+  reads) resolves the D6 read plan — snapshot + live journal entries,
+  RG-granular stale filtering — and concatenates the live RG bytes,
+  instead of resolving the branch ref alone (a cache of the last fold).
+  A second `write_rows` is now visible to raw reads immediately; the
+  entries-only bootstrap window reads entries instead of erroring "has
+  no commits"; post-fold reads stay correct. CRDT row merge remains
+  the row readers' job (documented). Pinned by
+  test_c13_raw_read_is_journal_aware +
+  test_c13_raw_read_no_fold_yet_returns_entry_bytes.
+- **C12 codec laws landed (the C3 zero-coverage residual closed)**:
+  `core/storage/tests/laws_pnps.rs` — 11 proptest laws + 10+
+  adversarial companions attacking PNPK (pack framing) and PSLB (slab
+  framing): lossless round-trips, magic discrimination, truncation
+  rejection, fuzz-no-panic, determinism, the PSLB tail invariant,
+  range-fetch reconstruction (the get_blob_range contract),
+  compressed round-trips, and conservative plan_ranges pruning. The
+  laws found TWO real bugs, both fixed same-cycle:
+  **(1) serde_json 1-ULP float loss** — the pack framing is exact but
+  serde_json's default float parser re-parses ~30% of arbitrary finite
+  f64s 1 ULP off; fixed by enabling serde_json's `float_roundtrip`
+  feature in pond_storage (exact parser; the strict law is now
+  un-ignored and green). **(2) decode_slab_footer ABORT** — an
+  unvalidated footer entry count ran `Vec::with_capacity` on up to
+  u32::MAX → ~192 GiB allocation → process abort (no unwind) on a
+  malformed blob; fixed by validating `n_entries ≤ footer_len / 21`
+  before allocating (un-ignored + green).
+- **CI repaired (stale pond.so hard link)**: run 33259199081 failed
+  the pytest job because the restored cargo target cache carried a
+  pre-D8 `pond.so` HARD link — cargo rebuilt `libpond.so` (new inode)
+  but the `[ ! -f pond.so ]` guard skipped re-linking, so Python
+  imported the stale module (`pond.ObjectStore` missing, 17 substrate
+  tests failed). Fixed with an unconditional relative symlink
+  (`ln -sf libpond.so pond.so`); KG entries for the cycle's new docs
+  fixed the coverage job same-commit.
+- **LIVE R2 validation (first real-object-storage cycle)**: with
+  owner-provided credentials (stored at /home/z/.secrets + gitignored
+  .env; ZERO secret material in the repo), both live harnesses ran
+  green against real Cloudflare R2: the CLI harness
+  (scripts/test_rust_s3_r2.py — 35/35: init, write-rows, read-rows
+  with pushdown + projection, ls, history, branch/checkout/merge with
+  journal-append semantics verified on real storage, raw blobs,
+  cleanup) and the NEW Rust store-primitive harness
+  (core/s3/tests/r2_live.rs + scripts/test_r2_live_rust.sh — SigV4
+  writes, sha256 content addressing, REAL HTTP Range semantics,
+  C17's 404→Ok(None) discrimination on live R2, list_paths, the D3
+  delimiter-LIST writer-discovery primitive, deletes, and warm-read
+  timing). **Timing evidence: cold 4 KiB R2 GET 207–253 ms; warm
+  local-disk cache read 9.8 µs → 1.4 µs — a ~21,000× speedup,
+  single-digit-MICROseconds against the <10 ms warm budget.** Two live
+  findings recorded: C19 (R2's idempotent DELETE blurs delete_path's
+  "existed" — documented trade) and C20 (`pond cat` short-hash prefix
+  resolution, UX NIT).
+- Validation: 543 workspace tests + 65 pond_sql + 44 pytest (+
+  substrate suite) + lens laws + moto green; clippy `-D warnings`
+  clean; CI green on the pushed HEAD.
+
 ## 2026-08-29 — Crucible iteration N+5: the Python-substrate delegation cycle (C5-python phase 1 + C8 + C13)
 
 - **D8 landed (C5-python phase 1)**: the pure-Python kernel stack's

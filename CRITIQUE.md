@@ -5,20 +5,28 @@
 
 ## Open
 
-- **C17 (N+5, discovered by the C8 fix's own test) — `get_path`'s Option
-  API hides transient failures.** `ObjectStore::get_path` returns
-  `Option<String>` with NO error channel, so a failed ref GET (transient
-  S3 500/429) is indistinguishable from an absent ref — for EVERY caller
-  (journal snapshot resolution, writer probes, branch resolution, the
-  Python adapter). A transient ref-read outage can therefore surface as
-  "no commits"/empty rather than an error (verified empirically by
-  test_c8_transient_read_failure_propagates' first version: failing
-  ref reads returned an EMPTY SqlResult, not an error). Fix shape (next
-  natural owner: a get_path refactor cycle): change the signature to
-  `io::Result<Option<String>>` (or add `get_path_res`) across the trait +
-  all backends + all callers — mechanical but wide. The C8 executor fix
-  closes the DATA-blob half (get_blob has an error channel and the
-  executor now propagates it); the REF half stays open here.
+- **C18 (N+6, recorded — C ABI cannot carry the C17 error channel).**
+  `pond_kernel_resolve` (core/kernel/src/c_abi.rs) maps BOTH `Ok(None)`
+  and `Err` to NULL: C callers cannot distinguish a transient backend
+  failure from an unbound ref. Fixing needs an ABI break or a new
+  entry point (`pond_kernel_resolve_err` returning an error code out-param);
+  no C caller reads the distinction today (the Go SDK/C tests go through
+  higher surfaces). Accepted trade, revisited when a C consumer needs
+  honest resolve errors.
+- **C19 (N+6, found LIVE on R2 — idempotent DELETE blurs "existed").**
+  The trait contract says `delete_path` "returns true if it existed",
+  but S3/R2's DELETE is idempotent (204 even for absent keys), so the
+  second `delete_path` on R2 returns `Ok(true)` while LocalFS honestly
+  returns `Ok(false)`. Exact "existed" semantics on R2 would cost a HEAD
+  before every DELETE — an extra round trip per delete for a return
+  value no production caller reads. Documented trade (pinned live in
+  tests/r2_live.rs); do NOT "fix" without a caller that needs it.
+- **C20 (N+6, NIT — `pond cat <short-hash>` prefix resolution).** The
+  live R2 CLI harness found `cat` requires the FULL hash — short-hash
+  prefix resolution errored ("no blob with prefix 'b6d5d430b154'")
+  instead of resolving. UX gap only (CLI convenience); `read` by full
+  hash works. Fix shape: blob_exists/prefix scan via list_raw on the
+  blobs/ tree, or accept full-hash only in help text.
 - **C16 (N+4, residual — CRDT-RG read cost)** — The D7 reader rule (see
   ARCHITECTURE.md) exempts CRDT-update RGs from value pruning in merging
   readers and skips them in non-merging readers. Cost model = the pre-D7
@@ -53,22 +61,26 @@
   _rowid regardless. Fix if it ever matters: dedup identical data-entry
   RG identities in resolve_packs (same mechanism as compact's extension
   dedup). Recorded, not scheduled.
-- **C12 (tribunal r1, F7 — accepted trade-off)** — The lenient non-PND2
-  skip in read.rs (~1197): a corrupted/truncated PND2 RG blob is silently
-  skipped as raw data where the reader previously errored loudly. Raw
-  `write()` blobs must be skipped (journal folds pull them into read
-  paths), and content-addressing makes silent corruption unlikely — but a
-  checksum-verify option (or erroring when the RG's declared n_rows > 0
-  and the blob is non-PND2 AND the manifest schema is non-empty) would be
-  stricter. Revisit with the C3 codec proptest cycle.
-- **C13 (tribunal r1, F10)** — `pond read` / `read::read` (raw path)
-  resolves branch_ref only — journal-stale for structured data. Pre-
-  existing raw-path semantics; now a UX trap that the ref is officially
-  "a cache". DOCUMENTED N+5 (`pond read --help` + docs/API_WORKFLOW.md
-  §2.1: the raw path is a cache of the last fold; use read-rows/SQL for
-  journal-aware reads). The ROUTING fix (resolve the journal view in the
-  raw reader) remains open — natural owner: a future read-path cycle
-  alongside C17.
+- **C12 (tribunal r1, F7 — REVISITED N+6 with the codec laws; trade
+  stands, now INFORMED)** — The lenient non-PND2 skip in read.rs: a
+  corrupted/truncated PND2 RG blob is silently skipped as raw data
+  where the reader previously errored loudly. Raw `write()` blobs must
+  be skipped (journal folds pull them into read paths), and
+  content-addressing makes silent corruption unlikely. The N+6 codec
+  laws (laws_pnps.rs) attacked PNPK/PSLB with adversarial bytes and
+  found the decoders themselves robust (post-fix); the residual skip
+  remains an accepted trade — the stricter checksum-verify option
+  stays on the shelf until a real corruption incident demands it.
+- **C13 (tribunal r1, F10) — RESOLVED N+6** — `read::read` (raw path,
+  incl. `pond read`) now resolves the JOURNAL view via
+  `journal::resolve_packs` (snapshot + live entries, RG-granular stale
+  filtering) and concatenates live RG bytes — see ARCHITECTURE.md D9.
+  Pinned by test_c13_raw_read_is_journal_aware (second write visible
+  pre-fold; post-fold read stays correct) +
+  test_c13_raw_read_no_fold_yet_returns_entry_bytes (entries-only
+  bootstrap window reads entries, not "has no commits"). Docs updated
+  (API_WORKFLOW §2.1 + CLI help: the raw path is journal-aware; CRDT
+  row merge stays with read_rows/SQL).
 - **C14 (bootstrap-fold race, bounded)** — A reader whose branch_ref GET
   predates the FIRST-ever fold (ref=None) probes from seq 1, dies at the
   fold's deleted entry, and observes an EMPTY state — a valid CRDT prefix
@@ -84,7 +96,19 @@
   test_c8_transient_read_failure_propagates (BlobOutage store: outage →
   SQL error naming the collection; recovery → rows intact). The
   REF-read half of the hole moved to C17 (get_path has no error
-  channel).
+  channel) — CLOSED by C17 below.
+- **C17** — RESOLVED N+6 (ARCHITECTURE.md D9):
+  `ObjectStore::get_path` → `io::Result<Option<String>>` across the
+  trait + LocalFS/S3/Caching backends (+`get_path_with_etag`,
+  `get_path_async`), `PondKernel::resolve` + every caller (the
+  112-site sweep), fallible `probe_writer` (a failed epoch probe is a
+  TRUNCATED-view error, never an empty suffix), pyo3 raises IOError.
+  Pinned by test_c17_ref_outage_errors_not_empty +
+  test_c17_ref_outage_recovery (RefOutageStore: healthy blobs, failing
+  refs → SQL errors naming the ref, NOT empty rows; recovery → rows
+  intact) + test_c17_probe_outage_is_error_not_truncation (entry-path
+  outage → resolve_packs Err, not a silently-shorter view). C ABI
+  limitation recorded as C18.
 - **C5** — see **C5-python PHASE 2** above for the residual (format
   unification, conditional). Phase 1 (substrate delegation) RESOLVED
   N+5 — ARCHITECTURE.md D8. C5-a/C5-b (Rust core) RESOLVED N+4:
