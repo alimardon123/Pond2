@@ -5,6 +5,20 @@
 
 ## Open
 
+- **C17 (N+5, discovered by the C8 fix's own test) — `get_path`'s Option
+  API hides transient failures.** `ObjectStore::get_path` returns
+  `Option<String>` with NO error channel, so a failed ref GET (transient
+  S3 500/429) is indistinguishable from an absent ref — for EVERY caller
+  (journal snapshot resolution, writer probes, branch resolution, the
+  Python adapter). A transient ref-read outage can therefore surface as
+  "no commits"/empty rather than an error (verified empirically by
+  test_c8_transient_read_failure_propagates' first version: failing
+  ref reads returned an EMPTY SqlResult, not an error). Fix shape (next
+  natural owner: a get_path refactor cycle): change the signature to
+  `io::Result<Option<String>>` (or add `get_path_res`) across the trait +
+  all backends + all callers — mechanical but wide. The C8 executor fix
+  closes the DATA-blob half (get_blob has an error channel and the
+  executor now propagates it); the REF half stays open here.
 - **C16 (N+4, residual — CRDT-RG read cost)** — The D7 reader rule (see
   ARCHITECTURE.md) exempts CRDT-update RGs from value pruning in merging
   readers and skips them in non-merging readers. Cost model = the pre-D7
@@ -13,6 +27,22 @@
   Mitigation path when it matters: row-level merge compaction (the
   deferred "future cycle" rewrite) would fold base + update RGs into one
   prunable RG. Recorded, not scheduled.
+- **C5-python PHASE 2 (format unification — recorded, conditional)** —
+  Phase 1 (substrate delegation) LANDED N+5: the Python kernel stack's
+  object-store layer runs on the Rust core (ARCHITECTURE.md D8 —
+  `pond.ObjectStore` pyo3 surface + `RustObjectStore` adapter +
+  `make_kernel(backend=…)`; byte-identical layouts, moto-proven S3 via
+  the Rust client, old-layout fallbacks via the raw-key hatch). The
+  residual: the Python world's FORMATS/semantics (UnifiedStorage's own
+  manifest/encoding/stats layers, the SDK's CRDT surface) still live in
+  Python and differ from PND2/PMAN — interop today is at the BLOB/ref
+  layer (same bytes, same keys), not the manifest layer. Phase 2
+  (Python formats → Rust codecs) is CONDITIONAL: only if the lens
+  world's own formats stop earning their keep (the lens algebra is the
+  Python world's raison d'être — D1 forbids porting semantics to
+  Python, it does not demand deleting useful Python formats). The
+  identity-less row-ordering decision (finding #1 from the laws cycle)
+  rides along with any phase-2 work.
 - **C15 (tribunal r3, NIT — duplicate-identical-RG data entries)** — Two
   DATA entries with byte-identical content share an RgIdentity
   `(blob_hash, slab_byte_offset)` but are never plan-filtered (data
@@ -34,8 +64,11 @@
 - **C13 (tribunal r1, F10)** — `pond read` / `read::read` (raw path)
   resolves branch_ref only — journal-stale for structured data. Pre-
   existing raw-path semantics; now a UX trap that the ref is officially
-  "a cache". Fix: route through the journal resolver or document in the
-  CLI help.
+  "a cache". DOCUMENTED N+5 (`pond read --help` + docs/API_WORKFLOW.md
+  §2.1: the raw path is a cache of the last fold; use read-rows/SQL for
+  journal-aware reads). The ROUTING fix (resolve the journal view in the
+  raw reader) remains open — natural owner: a future read-path cycle
+  alongside C17.
 - **C14 (bootstrap-fold race, bounded)** — A reader whose branch_ref GET
   predates the FIRST-ever fold (ref=None) probes from seq 1, dies at the
   fold's deleted entry, and observes an EMPTY state — a valid CRDT prefix
@@ -43,20 +76,21 @@
   bootstrap fold. Root cause: probes cannot discover an entry past a gap
   without the watermark. Acceptable (next read is correct); revisit if
   read-your-writes on fresh collections matters.
-- **C8** — SQL executor still swallows HEAD-read errors (`Err(_) => {}`,
-  executor.rs read_collection_as_json_rows): a transient S3 500 yields
-  silently partial SQL results, while pyo3 propagates. Fix: propagate
-  like pyo3 + test.
-- **C5 (N+4: C5-a DONE in the Rust core; C5-python residual remains)** —
-  C5-a delivered: `upsert_shard`/`delete_shard` journal their packs (D7;
-  commit this cycle) — the JSON-shard write surface is GONE from the Rust
-  core, `shard_count == 0` is the steady state, and C5-b (WriteBuffer
-  slab-packed flush) landed with it. C5-python: the pure-Python SDK/lens
-  stack still writes shards — SCOPING DISCOVERY (N+4): that stack runs on
-  its own pure-Python kernels (PondMinimal/ObjectStoreNativeKernel), a
-  SEPARATE storage world from the Rust core (no interop with CLI/pyo3/Go
-  today; verified — no test mixes the worlds). Fix per D1: SDK delegation
-  to the Rust core via pyo3 (future cycle), NOT a Python journal port.
+- **C8** — RESOLVED N+5: `read_collection_as_json_rows` (SQL executor)
+  PROPAGATES HEAD-read errors (`Failed to read collection '{c}': …`);
+  the ONE legitimate empty-state error (`has no commits`) still reads
+  as zero rows (INSERT INTO a fresh collection depends on it — pinned
+  by test_c8_no_commits_is_empty_not_error). Pinned by
+  test_c8_transient_read_failure_propagates (BlobOutage store: outage →
+  SQL error naming the collection; recovery → rows intact). The
+  REF-read half of the hole moved to C17 (get_path has no error
+  channel).
+- **C5** — see **C5-python PHASE 2** above for the residual (format
+  unification, conditional). Phase 1 (substrate delegation) RESOLVED
+  N+5 — ARCHITECTURE.md D8. C5-a/C5-b (Rust core) RESOLVED N+4:
+  `upsert_shard`/`delete_shard` journal their packs — the JSON-shard
+  write surface is GONE from the Rust core, `shard_count == 0` is the
+  steady state, C5-b (WriteBuffer slab-packed flush) landed with it.
   NOTE (laws-cycle finding #1): full-state CRDT merge
   byte-permutation-invariance needs an owner decision on identity-less
   (legacy) row ordering — legacy rows pass through in input order (the

@@ -3,6 +3,78 @@
 > Crucible state file. The deep per-cycle log lives in `worklog.md`
 > (append-only); this file tracks iterations and why.
 
+## 2026-08-29 — Crucible iteration N+5: the Python-substrate delegation cycle (C5-python phase 1 + C8 + C13)
+
+- **D8 landed (C5-python phase 1)**: the pure-Python kernel stack's
+  OBJECT-STORE layer now runs on the Rust core. `pond.ObjectStore` (pyo3,
+  `Arc<dyn ObjectStore>` — NOT a kernel) exposes the Rust trait surface
+  (put/get_blob + range/suffix + batches + blob_exists/delete_blob +
+  put/get/delete_path + list_paths/list_dirs + store_id), constructors
+  mirroring Storage (local auto-detect + `from_s3` with the 3-tier cache
+  via the shared `s3_store_cached` core), ALL methods GIL-releasing
+  (`py.allow_threads` — the Python kernel's ThreadPoolExecutor batches
+  now parallelize into Rust's native pools). `RustObjectStore`
+  (bindings/python/core/rust_object_store.py) implements the exact
+  LocalFSObjectStore/S3ObjectStore duck interface over it (KeyError
+  parity, stats, list_paths shape parity incl. the legacy `paths/` tree,
+  `base_dir`/`_bucket` duck-compat). `make_kernel(backend="auto")`
+  prefers Rust whenever `import pond` works, with byte-identical
+  pure-Python fallback (one-time stderr note; `POND_PY_BACKEND`
+  override; `memory://` untouched; `backend="rust"` hard-fails).
+- **The layouts CONVERGE — verified, not assumed**: blobs at
+  `blobs/{h[:2]}/{h}` (same sha256 both sides — Rust put_blob returns the
+  hash Python's `hash_bytes` computes), refs at `{path}` as JSON. The Rust
+  ref parser (`extract_hash_from_json`, LocalFS + S3 copies) now reads
+  BOTH the canonical `{"hash":"x"}` and Python `json.dump`'s
+  `{"hash": "x"}` spellings (a space after the colon — without this the
+  Rust core read Python-written refs as absent). Byte-interop pinned BOTH
+  directions: a store written by LocalFSObjectStore reads identically
+  through RustObjectStore and vice versa — same files, same tree.
+- **ObjectStore trait raw-key escape hatch** (`get_raw/put_raw/
+  delete_raw/list_raw`, default Unsupported): store-relative keys without
+  content addressing — the adapter's OLD-layout fallbacks (`b/{h[:2]}/{h}`
+  blobs, `paths/{p}` refs — pre-layout-change stores stay readable
+  through the Rust backend) and `list_all_blob_hashes` enumeration.
+  LocalFS validates keys against root-escape (`..`, absolute, drive
+  prefixes → InvalidInput); S3 maps 404 → None. CachingObjectStore
+  deliberately does NOT implement raw ops (they'd bypass cache layers);
+  the adapter capability-probes once and degrades to new-layout-only on
+  cache-wrapped S3 stores (`cache_dir='off'` restores legacy reads).
+  S3's duplicated list-pagination loop was extracted (`list_all_keys`)
+  and shared with `list_paths` (+ raw parity tests on both backends).
+- **S3 via the Rust client, moto-pinned**: ObjectStoreNativeKernel +
+  UnifiedStorage round trips on `RustObjectStore.from_s3(moto endpoint)`
+  — the Python world's object I/O no longer needs boto3 (the Rust SigV4
+  client + 3-tier disk cache serve it); 20-test suite in
+  tests/test_rust_object_store.py (skips gracefully when `import pond`
+  fails — CI's pytest job runs it, `pond_python` built there).
+- **C8 resolved (tribunal r1 finding 7)**: the SQL executor's
+  `read_collection_as_json_rows` PROPAGATES HEAD-read errors — a
+  transient S3 500 during `SELECT` used to yield silently
+  empty/partial results while pyo3 propagated. The one legitimate
+  empty-state error (`has no commits`) still reads as zero rows (INSERT
+  INTO a fresh collection depends on it). Pinned by a BlobOutage-store
+  test (outage → SQL error naming the collection; recovery → rows
+  intact) + the fresh-collection-empty test.
+- **C17 OPENED (found by the C8 fix's own test)**: `get_path`'s Option
+  API has NO error channel — a transient REF-read failure is
+  indistinguishable from an absent ref for EVERY caller (journal
+  snapshot resolution, writer probes, branch resolution). The C8 fix
+  closes the data-blob half; the ref half needs a trait signature change
+  (`io::Result<Option<String>>`) — recorded in CRITIQUE, out of this
+  cycle's scope.
+- **C13 documented**: `pond read --help` + docs/API_WORKFLOW.md §2.1 now
+  state the raw path's journal-staleness contract (branch ref = cache of
+  the last fold; journal-aware reads go through read-rows/SQL). Routing
+  the raw reader through the journal stays open (natural owner: the C17
+  cycle).
+- Validation: 581 Rust tests green (579 + 2 C8 tests; CI command
+  excludes pond_python/pond_sql, pond_sql 32 green incl. the new ones),
+  clippy `-D warnings` clean (workspace + pond_python), pytest 23
+  passed/4 by-design skips (test_all) + 20/20 new suite, lens laws
+  compliant, moto S3 via Rust client green, knowledge-graph coverage
+  updated (210 files).
+
 ## 2026-08-28 — Crucible iteration N+4: the C5 cycle (journal the CRDT row surface)
 
 - **D7 landed (C5-a)**: `upsert_shard`/`delete_shard` are journal writers —

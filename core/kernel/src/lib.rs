@@ -102,6 +102,20 @@ impl PondKernel {
         }
     }
 
+    /// Create a kernel from an ALREADY-SHARED store handle.
+    ///
+    /// For callers that hold `Arc<dyn ObjectStore>` and also want a
+    /// `PondKernel` over the SAME store instance (e.g. the pyo3
+    /// `pond.ObjectStore` class shares its handle with Storage kernels):
+    /// both keep talking to one store — one set of connection pools,
+    /// one journal writer registry slot (`store_id` is the same).
+    pub fn new_with_arc(store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            store,
+            stats: Mutex::new(KernelStats::default()),
+        }
+    }
+
     // ------------------------------------------------------------------
     // Primitive 1: Write
     // ------------------------------------------------------------------

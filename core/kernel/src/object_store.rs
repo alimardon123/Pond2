@@ -199,6 +199,55 @@ pub trait ObjectStore: Send + Sync {
     /// Best-effort: if the store doesn't support deletion, this is a no-op.
     /// The blob becomes unreachable (orphaned) but the system is still correct.
     fn delete_blob(&self, hash: &str) -> io::Result<bool>;
+
+    // ------------------------------------------------------------------
+    // Raw-key escape hatch — store-relative keys WITHOUT content addressing
+    // or JSON ref wrapping. Used by foreign bindings (the Python adapter)
+    // for legacy-layout fallback reads (`b/{h[:2]}/{h}` blobs, `paths/{p}`
+    // refs) and raw blob enumeration (`list_raw("blobs/")`).
+    //
+    // Key space: keys are RELATIVE to the store root and INCLUDE any
+    // `blobs/` component (e.g. "blobs/ab/ab12...", "b/ab/ab12...",
+    // "paths/collections/x/HEAD"). `get_raw` returns Ok(None) for missing
+    // keys (an existence probe, like get_path — NOT an error); `delete_raw`
+    // returns Ok(false) when the key was absent; `list_raw` returns keys
+    // relative to the store root, sorted, recursive under the prefix.
+    //
+    // **Default impl**: Unsupported — only the real backends (LocalFS, S3)
+    // implement the hatch. CachingObjectStore deliberately does NOT: a raw
+    // op through the caching wrapper would bypass the cache layers (reads)
+    // and the invalidation bookkeeping (writes). Callers probe capability
+    // once (first raw op) and remember the answer.
+    // ------------------------------------------------------------------
+
+    /// Read raw bytes at a store-relative key. `Ok(None)` when absent.
+    fn get_raw(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+        let _ = key;
+        Err(io::Error::new(io::ErrorKind::Unsupported,
+            "get_raw not supported by this ObjectStore"))
+    }
+
+    /// Write raw bytes at a store-relative key (no content addressing).
+    fn put_raw(&self, key: &str, data: &[u8]) -> io::Result<()> {
+        let _ = (key, data);
+        Err(io::Error::new(io::ErrorKind::Unsupported,
+            "put_raw not supported by this ObjectStore"))
+    }
+
+    /// Delete a raw key. `Ok(false)` when the key was absent.
+    fn delete_raw(&self, key: &str) -> io::Result<bool> {
+        let _ = key;
+        Err(io::Error::new(io::ErrorKind::Unsupported,
+            "delete_raw not supported by this ObjectStore"))
+    }
+
+    /// List all raw keys under a prefix, relative to the store root,
+    /// sorted, recursive.
+    fn list_raw(&self, prefix: &str) -> io::Result<Vec<String>> {
+        let _ = prefix;
+        Err(io::Error::new(io::ErrorKind::Unsupported,
+            "list_raw not supported by this ObjectStore"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +331,28 @@ impl LocalFSObjectStore {
 
     fn path_file(&self, path: &str) -> PathBuf {
         self.base_dir.join(path)
+    }
+
+    /// Validate a raw-key escape-hatch key and map it to an absolute path
+    /// under `base_dir`. Rejects keys that escape the store root (`..`
+    /// components, absolute paths, Windows drive prefixes) with
+    /// `InvalidInput` — the raw hatch must never reach outside the store.
+    fn raw_path(&self, key: &str) -> io::Result<PathBuf> {
+        use std::path::Component;
+        if key.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "empty raw key"));
+        }
+        for comp in Path::new(key).components() {
+            match comp {
+                Component::Normal(_) | Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                        format!("raw key escapes the store root: {key:?}")));
+                }
+            }
+        }
+        Ok(self.base_dir.join(key))
     }
 }
 
@@ -520,6 +591,72 @@ impl ObjectStore for LocalFSObjectStore {
             Ok(false)
         }
     }
+
+    // ------------------------------------------------------------------
+    // Raw-key escape hatch (see the trait docs). LocalFS: the key IS a
+    // path under base_dir. Stats are counted like the semantic ops so
+    // benchmark numbers stay honest across backends.
+    // ------------------------------------------------------------------
+
+    fn get_raw(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+        let path = self.raw_path(key)?;
+        match fs::read(&path) {
+            Ok(data) => {
+                let mut s = self.stats.lock().unwrap();
+                s.gets += 1;
+                s.bytes_read += data.len() as u64;
+                Ok(Some(data))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn put_raw(&self, key: &str, data: &[u8]) -> io::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let path = self.raw_path(key)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // Temp + rename (POSIX atomic) — same convention as put_path.
+        let tmp = format!(
+            "{}.tmp.{}.{}",
+            path.display(),
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        fs::write(&tmp, data)?;
+        fs::rename(&tmp, &path)?;
+        let mut s = self.stats.lock().unwrap();
+        s.puts += 1;
+        s.bytes_written += data.len() as u64;
+        Ok(())
+    }
+
+    fn delete_raw(&self, key: &str) -> io::Result<bool> {
+        let path = self.raw_path(key)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn list_raw(&self, prefix: &str) -> io::Result<Vec<String>> {
+        // Validate the prefix like a raw key (empty prefix = store root).
+        if !prefix.is_empty() {
+            self.raw_path(prefix)?;
+        }
+        let prefix_dir = self.base_dir.join(prefix);
+        let mut keys = Vec::new();
+        if prefix_dir.is_dir() {
+            walk_dir(&prefix_dir, &self.base_dir, &mut keys);
+        }
+        keys.sort();
+        Ok(keys)
+    }
 }
 
 /// Walk a directory recursively, collecting file paths relative to root.
@@ -538,16 +675,22 @@ fn walk_dir(dir: &Path, root: &Path, paths: &mut Vec<String>) {
     }
 }
 
-/// Extract the "hash" field from a JSON string like {"hash":"abc123"}.
+/// Extract the "hash" field from a JSON ref body like {"hash":"abc123"}.
+///
+/// Accepts BOTH spellings found in the wild: the canonical Rust form
+/// `{"hash":"abc"}` and Python's `json.dump` form `{"hash": "abc"}` (a
+/// space after the colon — the pure-Python stores write refs with
+/// `json.dump`, and substrate delegation requires the Rust core to read
+/// Python-written stores byte-for-byte; see bindings/python/core/
+/// rust_object_store.py).
 fn extract_hash_from_json(json: &str) -> Option<String> {
-    let needle = r#""hash":""#;
-    if let Some(start) = json.find(needle) {
-        let rest = &json[start + needle.len()..];
-        if let Some(end) = rest.find('"') {
-            return Some(rest[..end].to_string());
-        }
-    }
-    None
+    let key_pos = json.find(r#""hash""#)?;
+    let rest = json[key_pos + 6..].trim_start();
+    let rest = rest.strip_prefix(':')?;
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -637,3 +780,112 @@ impl AsyncObjectStore for LocalFSObjectStore {
         hashes
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests — raw-key escape hatch + ref-JSON parser parity
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempStore(LocalFSObjectStore);
+
+    impl TempStore {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "pond_rawtest_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            Self(LocalFSObjectStore::new(&dir).unwrap())
+        }
+    }
+
+    impl std::ops::Deref for TempStore {
+        type Target = LocalFSObjectStore;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(self.0.base_dir());
+        }
+    }
+
+    #[test]
+    fn test_extract_hash_from_json_both_spellings() {
+        // Canonical Rust form (put_path writes this).
+        assert_eq!(
+            extract_hash_from_json(r#"{"hash":"abc123"}"#),
+            Some("abc123".to_string())
+        );
+        // Python json.dump form (pure-Python stores write this — a space
+        // after the colon). Substrate delegation requires reading it.
+        assert_eq!(
+            extract_hash_from_json(r#"{"hash": "abc123"}"#),
+            Some("abc123".to_string())
+        );
+        // Extra whitespace tolerance + surrounding fields.
+        assert_eq!(
+            extract_hash_from_json(r#"  {"x":1,"hash" : "ff", "y":2}  "#),
+            Some("ff".to_string())
+        );
+        // Not a hash body.
+        assert_eq!(extract_hash_from_json(r#"{"other":1}"#), None);
+        assert_eq!(extract_hash_from_json(""), None);
+    }
+
+    #[test]
+    fn test_localfs_raw_round_trip() {
+        let store = TempStore::new();
+
+        // Missing key → Ok(None) (existence probe, NOT an error).
+        assert_eq!(store.get_raw("b/ab/abcd").unwrap(), None);
+
+        // put/get round trip at an arbitrary raw key.
+        store.put_raw("b/ab/abcd", b"legacy-bytes").unwrap();
+        assert_eq!(store.get_raw("b/ab/abcd").unwrap(), Some(b"legacy-bytes".to_vec()));
+
+        // delete: true when present, false when absent.
+        assert!(store.delete_raw("b/ab/abcd").unwrap());
+        assert!(!store.delete_raw("b/ab/abcd").unwrap());
+        assert_eq!(store.get_raw("b/ab/abcd").unwrap(), None);
+    }
+
+    #[test]
+    fn test_localfs_raw_escape_rejected() {
+        let store = TempStore::new();
+        for key in ["../escape", "a/../../escape", "/etc/passwd", ""] {
+            let err = store.get_raw(key).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "key {key:?}");
+            store.put_raw(key, b"x").unwrap_err();
+            store.delete_raw(key).unwrap_err();
+        }
+        // list_raw validates its prefix too.
+        store.list_raw("../").unwrap_err();
+    }
+
+    #[test]
+    fn test_localfs_list_raw_keys_relative_sorted() {
+        let store = TempStore::new();
+        store.put_blob(b"blob-one").unwrap();
+        store.put_raw("b/ab/legacy", b"x").unwrap();
+        store.put_path("collections/users/HEAD", "deadbeef").unwrap();
+
+        let keys = store.list_raw("blobs/").unwrap();
+        assert!(!keys.is_empty());
+        assert!(keys.iter().all(|k| k.starts_with("blobs/")));
+        assert!(keys.windows(2).all(|w| w[0] <= w[1]), "keys must be sorted");
+
+        let all = store.list_raw("").unwrap();
+        assert!(all.iter().any(|k| k == "collections/users/HEAD"));
+        assert!(all.iter().any(|k| k.starts_with("blobs/")));
+    }
+}
+

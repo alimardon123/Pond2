@@ -29,25 +29,27 @@
 | Versatility | 8 | same plan for pyo3/SQL/CLI/lenses; legacy + journal surfaces both covered |
 | D-S1..D-S6 | 9/7/9/10/9/9 | item 2 scored pre-repair (single-writer laws); the multi-writer law closed it same-cycle |
 
-## Component scorecard (whole repo, updated for the LAWS cycle)
+## Component scorecard (whole repo, updated for the N+5 substrate cycle)
 
 | Component | Simplicity | Efficiency | Beauty | Scalability | Power | Performance | Full-func | Versatility | Trend / note |
 |---|---|---|---|---|---|---|---|---|---|
 | **Journal (D3+D6, journal.rs)** | 9 | 9 | 9 | 9 | 9 | 8 | 9 | 8 | resolve_packs: ONE plan builder, RG-level coverage, zombie cleanup; F1/F2/F3/F6 + C7/C11 all closed |
 | Pruned read pipeline (read.rs) | 9 | 9 | 8 | 9 | 8 | 9 | 8 | 7 | delegates to the plan; lenient non-PND2 skip (C12) |
-| pyo3 binding | 8 | 8 | 7 | 8 | 8 | 8 | 8 | 7 | journal-aware via reader; C10 tiebreak fixed; compact_shards real fold |
+| pyo3 binding | 8 | 8 | 8 | 8 | 8 | 8 | 8 | 8 | journal-aware via reader; C10 tiebreak fixed; compact_shards real fold; N+5: +ObjectStore raw surface (GIL-releasing, cache-wired) — the Python substrate delegates through it |
+| Python core/kernel (bindings/python/core) | 8 | 9 | 8 | 8 | 8 | 9 | 8 | 9 | N+5: RustObjectStore adapter (byte-identical layout, old-layout fallbacks, KeyError parity) + make_kernel(backend=…) auto-Rust with byte-identical pure-Python fallback; moto-proven S3 via the Rust client |
 | Write path | 8 | 9 | 8 | 8 | 9 | 8 | 9 | 8 | all 5 paths journal-append; CAS DELETED; zero shared-object writes |
 | Branch/merge (branch.rs) | 7 | 7 | 7 | 8 | 8 | 7 | 8 | 8 | journal-aware (fold-first); deletion-as-data; PMAN normalization |
 | Codec (PND2 + zstd) | 8 | 9 | 8 | 8 | 7 | 9 | 8 | 7 | PMAN normalize + roundtrip laws now proven (C3); PSLB/PNPK laws still open |
 | S3/SigV4/R2 client | 8 | 8 | 8 | 8 | 8 | 8 | 9 | 8 | +list_dirs (delimiter LIST) + store_id; R2-validated |
 | Cache (disk+moka) | 8 | 8 | 8 | 8 | 7 | 8 | 8 | 8 | unchanged |
 | CLI | 8 | 8 | 8 | 8 | 8 | 8 | 8 | 8 | +journal-status/compact; journal-aware history (folds list) |
-| SQL (core/sql) | 8 | 8 | 8 | 8 | 7 | 8 | 8 | 7 | inherits journal reads + the plan; C8 error-swallowing open |
-| Testing | 9 | 9 | 8 | 8 | 8 | 8 | 9 | 8 | 567 tests; 11 property laws (~1700 pinned-seed cases); child-process + fabricated multi-writer harnesses; honest finding #1 |
+| SQL (core/sql) | 8 | 8 | 8 | 8 | 8 | 8 | 8 | 7 | inherits journal reads + the plan; C8 RESOLVED N+5 (errors propagate; no-commits stays zero-rows); C17 ref-read blindness open |
+| Testing | 9 | 9 | 8 | 8 | 8 | 8 | 9 | 8 | 583 tests; 11 property laws (~1700 pinned-seed cases); child-process + fabricated multi-writer harnesses; honest finding #1; N+5: +20 substrate interop tests (byte-compat both directions, moto-S3, capability probes) + BlobOutage C8 test |
 | Docs/laws | 9 | 7 | 8 | 7 | 7 | 7 | 8 | 7 | D3+D6 settled; laws specs; shard.rs caveat honesty |
 
 Thresholds: nothing below 8 on principles is "done"; nothing below 9 on
-done-statements. Remaining lowest columns: C8 executor error swallowing,
-C5 python-lens shard surface (+ finding #1's owner decision), C12 lenient
-skip, C13 raw-path staleness, C15 duplicate-identical-RG NIT, i64-only
-leaf/bloom pruning (format limits).
+done-statements. Remaining lowest columns: C17 get_path ref-read
+blindness (N+5 discovery), C13 raw-reader journal routing (documented
+N+5), C5-python phase 2 (conditional format unification), C12 lenient
+skip, C15 duplicate-identical-RG NIT, C16 CRDT-RG read cost, i64-only
+leaf/bloom pruning (format limits), PSLB/PNPK codec laws.

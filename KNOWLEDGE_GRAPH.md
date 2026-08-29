@@ -79,8 +79,9 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `bindings/python/core/object_store_native_kernel.py` | — | `ObjectStoreNativeKernel` + `InMemoryObjectStore` + `make_object_store_native_kernel`. No SQLite — refs are content-addressed blobs in the object store. The production kernel backend. |
 | `bindings/python/core/local_fs_object_store.py` | 443 | `LocalFSObjectStore`. Pure local-filesystem content-addressed store (blobs at `{base}/blobs/{hash[:2]}/{hash}.bin`, refs at `{base}/paths/{path}`). Thread-safe (per-hash locks + fcntl/msvcrt CAS). Mirrors the S3 key layout — `rsync` migrates between them. |
 | `bindings/python/core/s3_object_store.py` | 519 | `S3ObjectStore`. Real boto3-backed content-addressed store implementing the same 9-primitive interface as `InMemoryObjectStore` / `LocalFSObjectStore`. S3 conditional PUT (If-Match/If-None-Match) for CAS on small path blobs. |
+| `bindings/python/core/rust_object_store.py` | 451 | `RustObjectStore` — C5-python phase 1 (substrate delegation). Duck-compatible adapter over the pyo3 `pond.ObjectStore` handle: byte-identical layout (blobs at `blobs/{h[:2]}/{h}`, JSON refs at `{path}`), OLD-layout fallbacks (`b/…`, `paths/…`) via the Rust store's raw-key escape hatch (capability-probed), LocalFS-parity exceptions (missing blob → `KeyError`) and stats. |
 | `bindings/python/core/s3_mock_backend.py` | — | S3 mock with simulated latency. Extends `ObjectStoreNativeKernel`. Used by latency-injection benchmarks. |
-| `bindings/python/core/make_kernel.py` | 112 | `make_kernel(url, **kwargs)`. Unified kernel factory — `file://` → `LocalFSObjectStore`, `s3://` → `S3ObjectStore`. Switching backends is one line; everything else (kernel, SDK, lenses) is identical. |
+| `bindings/python/core/make_kernel.py` | 258 | `make_kernel(url, backend="auto", **kwargs)`. Unified kernel factory — `file://`/`s3://` prefer the Rust object-store backend (`RustObjectStore` over `pond.ObjectStore`; byte-identical layout) with graceful pure-Python fallback (`LocalFSObjectStore`/boto3 `S3ObjectStore`, one-time stderr note); `POND_PY_BACKEND=python\|rust\|auto` env override; `memory://` always `InMemoryObjectStore`. Switching backends is one line; everything else (kernel, SDK, lenses) is identical. |
 | `bindings/python/core/__init__.py` | 0 | Package marker. |
 | `bindings/python/core/README.md` | 43 | Folder purpose and usage. |
 
@@ -254,6 +255,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `bindings/python/sdk/extensions/semantic/README.md` | 60 | — | Semantic adapters overview. |
 | `bindings/python/sdk/extensions/physical_structures/README.md` | 90 | — | Physical Structure type hierarchy. |
 | `tests/test_all.py` | 110 | (pytest) | Single pytest entry point: 21 test functions covering all suites. |
+| `tests/test_rust_object_store.py` | 699 | (pytest) | Substrate-delegation suite (20 tests): byte-interop LocalFS⇄Rust both directions, hash equality, old-layout fallbacks, kernel/UnifiedStorage/SDK round trips on the Rust store, make_kernel backend selection + `POND_PY_BACKEND`, batches + stats, moto-S3 via the Rust client, exception/capability parity. Skips gracefully when `import pond` fails. |
 
 ### 2.6 scripts/ (Tests and benchmarks — 35 files)
 
@@ -339,6 +341,7 @@ Graph, Concurrency, Replication, Transport, Schema Evolution.
 | `docs/builder-spec-readplan.md` | — | **D6 read-plan builder spec** (task cron-2026-08-28-1100-a): the read-path builder's contract for `journal::resolve_packs` — ONE plan builder for the five duplicated pack-list loops (C7), RG-identity coverage filtering for partially-covered compact packs (C11), the exact C11 partial-overlap regression construction (ref-LWW winner folded less than the loser), zombie-entry cleanup via compact, plan order stability, and validation gates. |
 | `docs/builder-spec-laws.md` | — | **C3 property-test builder spec** (task cron-2026-08-28-1100-b): the laws builder's contract — three proptest suites (laws_crdt: permutation/idempotence/tombstone/determinism × 256 cases; laws_pman: normalize-invariant/byte-stable-roundtrip/RootManifest × 128; laws_journal: C9-union/compact-preserves-state/multi-writer-interleavings × 24 on real kernels), pinned seeds in code (RngSeed::Fixed, distinct per file), the STOP path for law failures (findings are successful reviews), and validation gates. |
 | `docs/builder-spec-journal-shards.md` | — | **N+4 C5 builder spec** (task 1): the write-path builder’s contract for D7 — `upsert_shard`/`delete_shard` become journal-pack writers (PND2 RGs at per-writer probeable paths, JSON-shard surface leaves the Rust core), legacy shard readers stay compat, C5-b WriteBuffer slab-packed flush (≤2 objects), semantics re-pinning tests, the descope path for C5-b, and validation gates. |
+| `docs/builder-spec-pybackend.md` | — | **N+5 Python-substrate builder spec** (task cron-2026-08-29-1115-a): the substrate builder's contract for C5-python phase 1 — ObjectStore trait raw-key escape hatch (default Unsupported; LocalFS + S3 only), the pyo3 `pond.ObjectStore` class, the `RustObjectStore` adapter (duck-compat + old-layout fallbacks), `make_kernel(backend=…)` wiring with `POND_PY_BACKEND`, the 20-test interop suite, and validation gates. |
 | `docs/archive/` | (18+ files) | Historical docs (Phase reports, red teams, RFCs, etc.). |
 
 ### 2.9 Top-level files

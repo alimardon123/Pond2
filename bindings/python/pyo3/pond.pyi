@@ -545,7 +545,137 @@ class Storage:
 
 
 # ---------------------------------------------------------------------------
-# SemanticLayer — handle for cross-collection semantic layer operations
+# ObjectStore — raw handle to the Rust core's ObjectStore trait
+# ---------------------------------------------------------------------------
+
+class ObjectStore:
+    """A raw object-store handle backed by the Rust core (LocalFS + S3/R2).
+
+    This is the substrate-delegation surface for the pure-Python kernel
+    stack: `RustObjectStore` (bindings/python/core/rust_object_store.py)
+    implements the LocalFSObjectStore/S3ObjectStore duck interface on top
+    of this handle, so the Python world inherits the Rust backends
+    (SigV4, connection pooling, the 3-tier disk cache) and both worlds
+    converge on the same byte-identical layout:
+
+        blobs: blobs/{hash[:2]}/{hash}   (content-addressed, sha256)
+        refs:  {path}                     (JSON {"hash": "..."})
+
+    All I/O-bound methods release the GIL, so thread-pool batches on the
+    Python side actually parallelize.
+    """
+
+    def __new__(
+        cls,
+        location: str,
+        cache_dir: Optional[str] = None,
+    ) -> "ObjectStore":
+        """Open a store at `location` (auto-detects the backend).
+
+        '/var/lib/pond' or 'file:///...' → local filesystem.
+        's3://bucket/prefix?region=...&endpoint=...' → S3/R2 wrapped in
+        the 3-tier smart cache (credentials from AWS_* env vars).
+        """
+        ...
+
+    @staticmethod
+    def from_s3(
+        url: str,
+        cache_dir: Optional[str] = None,
+    ) -> "ObjectStore":
+        """Create a store backed by S3-compatible storage.
+
+        Same cache wiring as `Storage.from_s3`; pass `cache_dir='off'` to
+        skip the cache (NOTE: the raw escape hatch below is unsupported
+        through the cache wrapper — by design it would bypass cache
+        layers).
+        """
+        ...
+
+    # --- Content-addressed blobs ---
+
+    def put_blob(self, data: bytes) -> str:
+        """Write bytes, content-addressed. Returns the sha256 hex hash."""
+        ...
+
+    def get_blob(self, hash: str) -> bytes:
+        """Read bytes by content hash. Raises IOError when absent."""
+        ...
+
+    def get_blob_range(self, hash: str, start: int, end: int) -> bytes:
+        """Read the half-open byte range [start, end) of a blob."""
+        ...
+
+    def get_blob_suffix(self, hash: str, n: int) -> bytes:
+        """Read the last `n` bytes of a blob (single round-trip)."""
+        ...
+
+    def put_blob_batch(self, items: list[bytes]) -> list[str]:
+        """Write a batch of blobs (parallel on S3). Returns the hashes."""
+        ...
+
+    def get_blob_batch(self, hashes: list[str]) -> list[bytes]:
+        """Fetch a batch of blobs (parallel on S3; order preserved)."""
+        ...
+
+    def blob_exists(self, hash: str) -> bool:
+        """Check if a blob exists (HEAD on S3)."""
+        ...
+
+    def delete_blob(self, hash: str) -> bool:
+        """Physically delete a blob (maintenance). True if it existed."""
+        ...
+
+    # --- Named path refs (JSON {"hash": "..."} at {path}) ---
+
+    def put_path(self, path: str, hash: str) -> None:
+        """Bind a named path to a hash (last-writer-wins)."""
+        ...
+
+    def get_path(self, path: str) -> Optional[str]:
+        """Resolve a named path to its hash, or None if unbound."""
+        ...
+
+    def delete_path(self, path: str) -> bool:
+        """Delete a named path. True if it existed."""
+        ...
+
+    def list_paths(self, prefix: str = "") -> list[str]:
+        """List keys under a prefix (relative, sorted). NOTE: LocalFS
+        includes blob keys when the prefix covers the `blobs/` tree, S3
+        filters them — RustObjectStore.list_paths normalizes to the
+        pure-Python shape (blob keys always excluded)."""
+        ...
+
+    def list_dirs(self, prefix: str) -> list[str]:
+        """List immediate child directory names under a prefix (one level)."""
+        ...
+
+    def store_id(self) -> str:
+        """Stable identity of this store instance (canonical location)."""
+        ...
+
+    # --- Raw-key escape hatch (no content addressing, no JSON wrapping) ---
+
+    def get_raw(self, key: str) -> Optional[bytes]:
+        """Read raw bytes at a store-relative key. None when absent."""
+        ...
+
+    def put_raw(self, key: str, data: bytes) -> None:
+        """Write raw bytes at a store-relative key."""
+        ...
+
+    def delete_raw(self, key: str) -> bool:
+        """Delete a raw key. True if it existed."""
+        ...
+
+    def list_raw(self, prefix: str = "") -> list[str]:
+        """List raw keys under a prefix (relative, sorted, recursive)."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# RowBatchStream — streaming read iterator
 # ---------------------------------------------------------------------------
 
 class RowBatchStream:
@@ -679,6 +809,7 @@ def encode(
 
 __all__: list[str] = [
     "Storage",
+    "ObjectStore",
     "SemanticLayer",
     "decode",
     "encode",

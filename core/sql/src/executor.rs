@@ -1251,17 +1251,23 @@ fn read_collection_as_json_rows(
     // via coalesced range reads (not full blob GETs), PSLB v2 zstd
     // decompression, PMAN v3 leaf pruning, zone-map/bloom pruning,
     // projection + predicate pushdown.
-    // A HEAD read error yields no HEAD rows and the caller proceeds to
-    // shards (preserves the previous read_all_row_groups error behavior).
-    // Convert HashSet<&str> → Vec<String> for the storage reader's
-    // projection parameter (a few short clones per query — negligible).
+    // C8 (tribunal r1 finding 7, fixed N+5): read errors PROPAGATE — a
+    // transient S3 500/429 used to yield silently partial SQL results
+    // (rows missing, no signal), while pyo3 propagated. The ONE
+    // non-error Err this reader produces is `Collection '{c}' has no
+    // commits` (a legitimate empty/fresh state — querying a collection
+    // with no commits must return zero rows, not error; INSERT INTO a
+    // fresh collection depends on it). Convert HashSet<&str> →
+    // Vec<String> for the projection parameter.
     let proj_vec: Option<Vec<String>> =
         projection.map(|s| s.iter().map(|c| c.to_string()).collect());
     match pond_storage::read::read_rows_json_pruned(
         kernel, collection, &active, key_fields, proj_vec.as_deref(), predicates,
     ) {
         Ok(head_rows) => rows.extend(head_rows),
-        Err(_) => { /* no HEAD data — proceed to shards */ }
+        Err(e) if e.contains("has no commits") => { /* empty collection — zero rows */ }
+        Err(e) => return Err(format!(
+            "Failed to read collection '{}': {}", collection, e)),
     }
 
     // --- Read shard data (CRDT) ---

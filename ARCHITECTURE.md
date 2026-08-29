@@ -147,6 +147,33 @@ stack DELEGATES to the Rust core via pyo3 when available — never a
 Python port of the journal protocol (parallel semantics drift is the
 thing D1 exists to prevent).
 
+**D8 — Python substrate delegation (settled N+5; C5-python phase 1).**
+The Python kernel stack's OBJECT-STORE layer runs on the Rust core:
+`pond.ObjectStore` (pyo3) exposes the Rust `ObjectStore` trait
+(LocalFS + S3/R2 with the 3-tier cache), `RustObjectStore`
+(bindings/python/core/rust_object_store.py) implements the exact
+LocalFSObjectStore/S3ObjectStore duck interface over it, and
+`make_kernel(backend="auto")` prefers Rust whenever the module is
+importable (`POND_PY_BACKEND` overrides; pure-Python fallback preserved
+byte-identically). The layouts were verified to CONVERGE — blobs at
+`blobs/{h[:2]}/{h}` (same sha256 both sides), refs at `{path}` with JSON
+bodies (the Rust ref parser reads BOTH the canonical and Python
+`json.dump` spellings) — so a store written by either world is readable
+by the other, and the Python world inherits the Rust S3 client (SigV4,
+connection reuse, disk cache) instead of boto3 per-call. The Python
+world KEEPS its formats and semantics this phase (its manifest/encoding
+layer still differs from PND2/PMAN — that unification is phase 2, and
+only if the lens world's own formats stop earning their keep; the lens
+algebra is the Python world's raison d'être, not a porting target).
+Trait escape hatch: `get_raw/put_raw/delete_raw/list_raw` give the
+adapter store-relative raw keys (OLD-layout fallbacks `b/…` + `paths/…`,
+blob enumeration) — implemented by LocalFS + S3 ONLY (a raw op through
+CachingObjectStore would bypass cache layers; the adapter
+capability-probes and degrades to new-layout-only when the store is
+cache-wrapped). All pyo3 ObjectStore methods release the GIL, so the
+Python kernel's ThreadPoolExecutor batches parallelize into the Rust
+core's native pools.
+
 **D4 — One pruned read pipeline (settled).** There is exactly ONE production
 read pipeline: leaf pruning (PMAN v3) → zone-map pruning → parallel bloom
 pre-check → slab-aware range GETs + coalescing → projection pushdown →

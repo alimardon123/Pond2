@@ -1074,3 +1074,131 @@ fn test_where_pushdown_after_delete() {
     let result = execute(&storage, "SELECT name FROM users").expect("all");
     assert_eq!(result.rows.len(), 2);
 }
+
+// ===========================================================================
+// C8 (tribunal r1 finding 7, fixed N+5): the executor must PROPAGATE
+// HEAD-read errors — a transient store failure (S3 500/429, network blip)
+// used to yield silently partial SQL results while pyo3 propagated.
+// ===========================================================================
+
+/// A store wrapper that starts healthy and fails BLOB-DATA reads once the
+/// shared `fail` flag is set — simulates a transient backend outage
+/// mid-session (the S3 500/429 class: a data GET fails while tiny ref
+/// GETs succeed or are cached). Ref ops stay healthy, which isolates
+/// exactly the failure class C8 covers: data-read errors surfacing
+/// through the pruned reader. (Ref-read failures are a SEPARATE hole:
+/// `get_path` returns Option with no error channel, so a failed ref GET
+/// is indistinguishable from an absent ref — recorded as C17, out of
+/// scope here.) The flag lives in an Arc so the test can flip it while
+/// the kernel owns the store.
+struct FlakyStore {
+    inner: pond_kernel::LocalFSObjectStore,
+    fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FlakyStore {
+    fn new(dir: &std::path::Path) -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            Self {
+                inner: pond_kernel::LocalFSObjectStore::new(dir).unwrap(),
+                fail: std::sync::Arc::clone(&fail),
+            },
+            fail,
+        )
+    }
+    fn failing(&self) -> bool {
+        self.fail.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn err<T>(&self) -> std::io::Result<T> {
+        Err(std::io::Error::other("simulated transient outage (503)"))
+    }
+}
+
+impl pond_kernel::ObjectStore for FlakyStore {
+    fn put_blob(&self, data: &[u8]) -> std::io::Result<String> {
+        self.inner.put_blob(data) // writes stay healthy (outage = read-side)
+    }
+    fn get_blob(&self, hash: &str) -> std::io::Result<Vec<u8>> {
+        if self.failing() { return self.err(); }
+        self.inner.get_blob(hash)
+    }
+    fn put_path(&self, path: &str, hash: &str) -> std::io::Result<()> {
+        self.inner.put_path(path, hash)
+    }
+    fn get_path(&self, path: &str) -> Option<String> {
+        self.inner.get_path(path) // ref reads stay healthy (see C17 note)
+    }
+    fn delete_path(&self, path: &str) -> std::io::Result<bool> {
+        self.inner.delete_path(path)
+    }
+    fn list_paths(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        self.inner.list_paths(prefix)
+    }
+    fn list_dirs(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        self.inner.list_dirs(prefix)
+    }
+    fn store_id(&self) -> String {
+        // Same-store identity: delegate so the journal writer registry
+        // converges with the underlying directory.
+        self.inner.store_id()
+    }
+    fn blob_exists(&self, hash: &str) -> bool {
+        if self.failing() { return false; }
+        self.inner.blob_exists(hash)
+    }
+    fn delete_blob(&self, hash: &str) -> std::io::Result<bool> {
+        if self.failing() { return self.err(); }
+        self.inner.delete_blob(hash)
+    }
+}
+
+/// A transient backend failure during a SELECT must surface as an SQL
+/// error — NOT silently-empty (or silently-partial) results.
+#[test]
+fn test_c8_transient_read_failure_propagates() {
+    let dir = setup();
+    let (store, fail) = FlakyStore::new(dir.path());
+    let kernel = pond_kernel::PondKernel::new_with_store(Box::new(store));
+    let storage = UnifiedStorage::new(kernel);
+
+    // Seed while healthy (INSERT → journal packs on the flaky store).
+    execute(&storage, "INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob')")
+        .expect("seed while healthy");
+    let result = execute(&storage, "SELECT * FROM users").expect("healthy read");
+    assert_eq!(result.rows.len(), 2, "seeded rows readable while healthy");
+
+    // Flip the outage switch: the SAME query must now ERROR loudly (C8:
+    // it used to return an empty/partial result with no signal).
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let err = execute(&storage, "SELECT * FROM users")
+        .expect_err("transient outage must surface as an SQL error");
+    assert!(
+        err.contains("users"),
+        "error should name the collection: {err}"
+    );
+
+    // Recovery: after the outage, the same query returns the same rows.
+    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    let result = execute(&storage, "SELECT * FROM users").expect("recovered read");
+    assert_eq!(result.rows.len(), 2, "rows intact after recovery");
+}
+
+/// A fresh collection with no commits is a LEGITIMATE empty state:
+/// SELECT returns zero rows (not an error) — INSERT INTO a fresh
+/// collection depends on this.
+#[test]
+fn test_c8_no_commits_is_empty_not_error() {
+    let dir = setup();
+    let storage = open_storage(&dir);
+
+    let result = execute(&storage, "SELECT * FROM never_written")
+        .expect("fresh collection must read as zero rows, not error");
+    assert_eq!(result.rows.len(), 0);
+
+    // And INSERT into that fresh collection works (it reads first).
+    execute(&storage, "INSERT INTO never_written (id) VALUES (1)")
+        .expect("insert into fresh collection");
+    let result = execute(&storage, "SELECT * FROM never_written").expect("read back");
+    assert_eq!(result.rows.len(), 1);
+}

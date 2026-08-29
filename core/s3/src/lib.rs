@@ -400,6 +400,13 @@ impl S3ObjectStore {
         }
     }
 
+    /// Full S3 key for a raw-key escape-hatch key (no content addressing,
+    /// no JSON wrapping — the key is relative to the store root, which on
+    /// S3 means under the store prefix).
+    fn raw_key(&self, key: &str) -> String {
+        self.path_key(key)
+    }
+
     // --- HTTP request with SigV4 signing ---
 
     /// Build a fully-signed S3 request (URL + headers + body), without
@@ -651,6 +658,61 @@ impl S3ObjectStore {
             }
             Err(_) => None,
         }
+    }
+
+    /// List ALL object keys under `list_prefix` (the FULL S3 key including
+    /// the store prefix), paginating through ListObjectsV2. Shared by
+    /// `list_paths` (which filters blob keys and strips the store prefix)
+    /// and the raw-key escape hatch `list_raw` (which returns every key).
+    ///
+    /// Simple XML extraction: find all <Key>...</Key> values via string
+    /// searching — simpler and more robust than a hand-rolled XML parser.
+    fn list_all_keys(&self, list_prefix: &str) -> io::Result<Vec<String>> {
+        let mut all_keys = Vec::new();
+
+        let mut cont: Option<String> = None;
+        loop {
+            let mut query = format!("list-type=2&prefix={}", urlencoding::encode(list_prefix));
+            if let Some(ref token) = cont {
+                query.push_str(&format!("&continuation-token={}", urlencoding::encode(token)));
+            }
+
+            let resp = self.s3_request("GET", "", Some(&query), None, &[])?;
+            let body = resp.into_string()
+                .map_err(io::Error::other)?;
+
+            let mut search_from = 0;
+            while search_from < body.len() {
+                // Find next <Key> tag
+                let key_start = match body[search_from..].find("<Key>") {
+                    Some(p) => search_from + p + 5, // skip "<Key>"
+                    None => break,
+                };
+                let key_end = match body[key_start..].find("</Key>") {
+                    Some(p) => key_start + p,
+                    None => break,
+                };
+                let key = &body[key_start..key_end];
+                // URL-decode the key (S3 may return URL-encoded keys if encoding-type=url was used)
+                let key = url_decode(key);
+                all_keys.push(key);
+                search_from = key_end + 6; // skip "</Key>"
+            }
+
+            // Check for pagination — look for <IsTruncated>true</IsTruncated>
+            // and <NextContinuationToken>...</NextContinuationToken>
+            if body.contains("<IsTruncated>true</IsTruncated>") {
+                if let Some(tok_start) = body.find("<NextContinuationToken>") {
+                    if let Some(tok_end) = body[tok_start..].find("</NextContinuationToken>") {
+                        cont = Some(body[tok_start + 23..tok_start + tok_end].to_string());
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
+
+        Ok(all_keys)
     }
 
     /// Upload a large blob using S3 multipart upload.
@@ -1150,57 +1212,7 @@ impl ObjectStore for S3ObjectStore {
 
     fn list_paths(&self, prefix: &str) -> io::Result<Vec<String>> {
         let list_prefix = self.path_key(prefix);
-        let mut all_keys = Vec::new();
-
-        let mut cont: Option<String> = None;
-        loop {
-            let mut query = format!("list-type=2&prefix={}", urlencoding::encode(&list_prefix));
-            if let Some(ref token) = cont {
-                query.push_str(&format!("&continuation-token={}", urlencoding::encode(token)));
-            }
-
-            let resp = self.s3_request("GET", "", Some(&query), None, &[])?;
-            let body = resp.into_string()
-                .map_err(io::Error::other)?;
-
-            // Simple XML extraction: find all <Key>...</Key> values.
-            // S3 ListObjectsV2 XML wraps keys in <Contents><Key>...</Key></Contents>.
-            // We use string searching — simpler and more robust than a hand-rolled XML parser.
-            let mut search_from = 0;
-            let mut next_token: Option<String> = None;
-            while search_from < body.len() {
-                // Find next <Key> tag
-                let key_start = match body[search_from..].find("<Key>") {
-                    Some(p) => search_from + p + 5, // skip "<Key>"
-                    None => break,
-                };
-                let key_end = match body[key_start..].find("</Key>") {
-                    Some(p) => key_start + p,
-                    None => break,
-                };
-                let key = &body[key_start..key_end];
-                // URL-decode the key (S3 may return URL-encoded keys if encoding-type=url was used)
-                let key = url_decode(key);
-                all_keys.push(key);
-                search_from = key_end + 6; // skip "</Key>"
-            }
-
-            // Check for pagination — look for <IsTruncated>true</IsTruncated>
-            // and <NextContinuationToken>...</NextContinuationToken>
-            if let Some(start) = body.find("<IsTruncated>true</IsTruncated>") {
-                let _ = start; // IsTruncated is true
-                if let Some(tok_start) = body.find("<NextContinuationToken>") {
-                    if let Some(tok_end) = body[tok_start..].find("</NextContinuationToken>") {
-                        next_token = Some(body[tok_start + 23..tok_start + tok_end].to_string());
-                    }
-                }
-            }
-
-            if next_token.is_none() {
-                break;
-            }
-            cont = next_token;
-        }
+        let all_keys = self.list_all_keys(&list_prefix)?;
 
         // Strip the prefix from keys to return relative paths
         let strip_len = if self.prefix.is_empty() {
@@ -1345,6 +1357,74 @@ impl ObjectStore for S3ObjectStore {
                 }
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Raw-key escape hatch (see the ObjectStore trait docs). Keys are
+    // relative to the store root (i.e. under the store prefix, without
+    // the JSON ref wrapping or content addressing).
+    // ------------------------------------------------------------------
+
+    fn get_raw(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+        let full = self.raw_key(key);
+        match self.s3_request("GET", &full, None, None, &[]) {
+            Ok(resp) => {
+                let mut body = Vec::new();
+                resp.into_reader()
+                    .read_to_end(&mut body)
+                    .map_err(io::Error::other)?;
+                let mut s = self.stats.lock().unwrap();
+                s.gets += 1;
+                s.bytes_read += body.len() as u64;
+                Ok(Some(body))
+            }
+            Err(e) if is_s3_not_found(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn put_raw(&self, key: &str, data: &[u8]) -> io::Result<()> {
+        let full = self.raw_key(key);
+        let _resp = self.s3_request("PUT", &full, None, Some(data), &[])?;
+        let mut s = self.stats.lock().unwrap();
+        s.puts += 1;
+        s.bytes_written += data.len() as u64;
+        Ok(())
+    }
+
+    fn delete_raw(&self, key: &str) -> io::Result<bool> {
+        let full = self.raw_key(key);
+        match self.s3_request("DELETE", &full, None, None, &[]) {
+            Ok(_) => Ok(true),
+            Err(e) if is_s3_not_found(&e) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn list_raw(&self, prefix: &str) -> io::Result<Vec<String>> {
+        let list_prefix = self.raw_key(prefix);
+        let all_keys = self.list_all_keys(&list_prefix)?;
+
+        // Return keys RELATIVE to the store root (strip the store prefix),
+        // sorted — mirrors LocalFS list_raw's shape.
+        let strip_len = if self.prefix.is_empty() {
+            0
+        } else {
+            self.prefix.len() + 1 // +1 for the '/'
+        };
+        let mut result: Vec<String> = all_keys.iter()
+            .map(|k| {
+                if k.len() > strip_len {
+                    &k[strip_len..]
+                } else {
+                    k
+                }
+                .to_string()
+            })
+            .collect();
+        result.sort();
+        result.dedup();
+        Ok(result)
     }
 }
 
@@ -1536,17 +1616,30 @@ impl S3ObjectStore {
     }
 }
 
-/// Extract the "hash" field from a JSON string like {"hash":"abc123"}.
+/// True when an `io::Error` produced by `s3_request` is an S3 404 (key
+/// absent). The error message format is `"S3 returned {code}: ..."` —
+/// matching the prefix avoids false positives from keys/bodies that
+/// happen to contain "404".
+fn is_s3_not_found(e: &io::Error) -> bool {
+    e.to_string().starts_with("S3 returned 404")
+}
+
+/// Extract the "hash" field from a JSON ref body like {"hash":"abc123"}.
 /// (Same minimal parser as LocalFSObjectStore — copied to avoid a cross-crate dep.)
+///
+/// Accepts BOTH spellings found in the wild: the canonical Rust form
+/// `{"hash":"abc"}` and Python's `json.dump` form `{"hash": "abc"}` (a
+/// space after the colon — the pure-Python stores write refs with
+/// `json.dump`, and substrate delegation requires the Rust core to read
+/// Python-written stores byte-for-byte).
 fn extract_hash_from_json(json: &str) -> Option<String> {
-    let needle = r#""hash":""#;
-    if let Some(start) = json.find(needle) {
-        let rest = &json[start + needle.len()..];
-        if let Some(end) = rest.find('"') {
-            return Some(rest[..end].to_string());
-        }
-    }
-    None
+    let key_pos = json.find(r#""hash""#)?;
+    let rest = json[key_pos + 6..].trim_start();
+    let rest = rest.strip_prefix(':')?;
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 // Minimal URL-encoding helpers (avoid pulling in the `urlencoding` crate)
@@ -1766,8 +1859,21 @@ mod tests {
             extract_hash_from_json(r#"{"hash":"abc123"}"#),
             Some("abc123".to_string())
         );
+        // Python json.dump spelling (pure-Python stores) — a space after
+        // the colon. Substrate delegation requires reading it.
+        assert_eq!(
+            extract_hash_from_json(r#"{"hash": "abc123"}"#),
+            Some("abc123".to_string())
+        );
         assert_eq!(extract_hash_from_json(r#"{"foo":"bar"}"#), None);
         assert_eq!(extract_hash_from_json(""), None);
+    }
+
+    #[test]
+    fn test_is_s3_not_found() {
+        assert!(is_s3_not_found(&io::Error::other("S3 returned 404: Not Found — body")));
+        assert!(!is_s3_not_found(&io::Error::other("S3 returned 500: key=404 in body")));
+        assert!(!is_s3_not_found(&io::Error::other("transport error: connect 404 refused")));
     }
 
     #[test]

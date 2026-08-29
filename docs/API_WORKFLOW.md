@@ -47,6 +47,18 @@ content-addressed dedup, and storage-independence (local FS / S3).
 
 ## 1. Setup — create a Storage connection
 
+> **Python kernel stack note (D8, C5-python phase 1):** the pure-Python
+> kernel world (`make_kernel` from `bindings/python/core`) also runs its
+> object-store layer on the Rust core when the compiled `pond` module is
+> importable — `make_kernel("file:///path")` and
+> `make_kernel("s3://bucket/prefix")` transparently use the Rust
+> LocalFS/S3 backends (byte-identical layouts with the pure-Python
+> stores; old-layout stores stay readable). Force either side with
+> `make_kernel(url, backend="python"|"rust")` or the `POND_PY_BACKEND`
+> environment variable. This section covers the pyo3 `Storage` API (the
+> full Rust surface); the Python-kernel SDK keeps its own
+> `PondStorage` API on top of the same stores.
+
 ```python
 from pond import Storage
 
@@ -202,6 +214,17 @@ data = s.read('images/logo.png')   # → raw bytes
 Raw bytes get the same benefits as structured data: versioning (branch/merge),
 content-addressed dedup, and storage-independence. But they do NOT get
 _rowid/_version (no structure to tag) — use `write_rows` for CRDT compatibility.
+
+**C13 caveat — the raw path is journal-stale for structured data.** The raw
+read (`pond read` / `s.read` / `storage_read::read`) resolves the branch ref,
+which after the D3 journal is a CACHE of the last compaction fold: structured
+writes (`write_rows`, SQL INSERT/UPDATE/DELETE, upserts) append journal packs
+the raw path does not resolve, so a raw read can miss them until the next
+`compact`. Raw reads stay byte-exact for blobs written with the RAW write
+path (`pond write` / `s.write`) — those carry the journal watermark and fold
+correctly. For journal-aware structured reads use `read_rows` / `pond
+read-rows` / SQL. (CRITIQUE.md C13 tracks routing the raw reader through
+the journal resolver; until then this caveat is the contract.)
 
 ### 2.2 Semi-structured data (JSON in columns or as raw blobs)
 

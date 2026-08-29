@@ -69,10 +69,10 @@ The project is done only when every statement below is demonstrably true:
 - No reimplementation of SQL planning beyond what the pond_sql crate already
   does (pushdown into the reader, not a new optimizer).
 - Not this cycle: string zone maps, BPTX index wiring for journal entries,
-  cross-process HLC persistence, C8 executor error parity, C5-python
-  (the pure-Python SDK/lens stack's shard surface — separate storage world,
-  see ARCHITECTURE.md D7 boundary note; endgame is SDK delegation to the
-  Rust core, not a Python journal port).
+  cross-process HLC persistence, C16 row-level merge compaction, C15
+  identity dedup, and **C5-python PHASE 2** (format unification: the Python
+  lens world's manifest/encoding layer still differs from PND2/PMAN — this
+  cycle lands the SUBSTRATE delegation only; see ARCHITECTURE.md D8).
 
 ## Assumptions (recorded, autonomous mode)
 
@@ -84,60 +84,88 @@ The project is done only when every statement below is demonstrably true:
 - CI runners are 2-vCPU: keep the bitpack benchmark calibrated (f85a351) —
   do not add uncalibrated long benchmarks.
 
-## This-cycle acceptance (crucible iteration N+4 — the C5 cycle)
+## This-cycle acceptance (crucible iteration N+5 — the Python-substrate delegation cycle)
 
-Mission for this cycle: **kill the JSON-shard write surface in the Rust
-core** (C5-a): `upsert_shard`/`delete_shard` — and every high-level
-operation built on them (pyo3 update_rows/delete_rows/merge_rows/upload) —
-become journal writers (PND2 columnar packs at probeable per-writer paths,
-zero shared objects, warm reads without LIST). Plus C5-b: buffered
-multi-batch flushes land as ONE PSLB slab. Scoping discovery recorded
-this cycle: the Python lens stack (keyvalue/streaming/oltp + pure-Python
-UnifiedStorage on PondMinimal/ObjectStoreNativeKernel) is a SEPARATE
-storage world from the Rust core — it shares path CONVENTIONS but not ref
-mechanisms, and does not interop with CLI/pyo3/Go today. Its shard surface
-is the C5-python residual (D1 says delegate to Rust, never port the
-journal semantics to Python).
+Mission for this cycle: **open the C5-python fence — phase 1, the I/O
+substrate**. The pure-Python kernel stack (ObjectStoreNativeKernel +
+UnifiedStorage + SDK + the Python lens world) stops needing its own object
+store implementations: a new `pond.ObjectStore` pyo3 class exposes the Rust
+core's ObjectStore trait (LocalFS + S3/R2 with the 3-tier cache), a Python
+`RustObjectStore` adapter implements the exact LocalFSObjectStore/
+S3ObjectStore duck interface on top of it (byte-identical layouts — the
+stores were verified to converge: `blobs/{h[:2]}/{h}` + JSON `{"hash":...}`
+refs at `{path}`), and `make_kernel()` prefers the Rust backend whenever
+the compiled module is importable (graceful pure-Python fallback, env
+override `POND_PY_BACKEND=python|rust|auto`). The Python world keeps its
+formats/semantics this cycle; what it delegates is the I/O layer — so it
+inherits the Rust S3 client (SigV4, connection reuse, disk cache) instead
+of boto3 per-call, and Python-written stores become readable by the Rust
+kernel (same bytes, same keys). Plus two same-cycle repairs: **C8** (SQL
+executor must PROPAGATE HEAD-read errors like pyo3 does — no more silent
+partial SQL results on transient S3 failures) and **C13** (document the
+raw-path `pond read` journal staleness in the CLI help + docs; routing
+deferred with an honest CRITIQUE note).
 
-1. **C5-a — journal the CRDT row surface**: `shard::upsert_shard` and
-   `shard::delete_shard` stamp rows exactly as today (_rowid UUIDv7,
-   _version HLC, _deleted tombstones) but append ONE journal pack per call
-   (stamped rows → PND2 RG → manifest → `journal::append_pack`) instead of
-   a JSON blob at a `shards/` ref. No JSON shard blob is written anywhere
-   in the Rust core afterwards.
-2. **Semantics preserved, pinned by tests**: upsert → `read_rows` returns
-   the live rows (CRDT merge across journal packs — the existing
-   read.rs:1079 merge); tombstones suppress; resurrection (later live
-   version) works; two concurrent writers' upserts union; round-trip
-   through a FRESH process (empty caches) sees the same rows (the C9
-   law applied to the upsert surface). Existing shard tests' SEMANTICS
-   re-pinned against the journal-era surface (shard_count 0, rows
-   visible via read_rows).
-3. **Legacy compat**: `read_with_shards`/`list_shards`/`shard_count`
-   keep reading pre-migration shards (old repos stay readable);
-   `compact` still folds them; a test pins MIXED state (pre-existing
-   JSON shard + new journal upsert) reading correctly through both the
-   shard-compat reader and read_rows.
-4. **C5-b — SlabWriter default for buffered flush**:
-   `WriteBuffer::flush_internal` packs its staged RGs into ONE PSLB slab
-   blob (footer: offsets + bloom) before the journal append — N buffered
-   writes flush as ≤ 2 new blob objects (slab + pack), read back
-   identically through the slab-aware reader (byte-count + row-equality
-   tests). Descope path: if SlabWriter integration reveals a real format
-   blocker, record it in CRITIQUE with evidence and deliver C5-a alone —
-   the tribunal judges the honesty of the descope.
-5. **pyo3 surface honesty**: `shard_count`/`read_with_shards`/
-   `compact_shards` docstrings marked legacy-compat; upsert/delete
-   visibility surfaces through the journal (`read_rows`,
-   `journal::status` live_entries). Every pyo3/pytest assertion that
-   pinned shard-era behavior updated to journal-era expectations.
-6. Zero-warning build: `cargo clippy --workspace --all-targets -- -D
-   warnings` clean; `cargo test --workspace` green; pytest green (incl.
-   the pyo3 suites that exercise upsert/update/delete/merge/upload);
-   moto S3 green; live R2 green (streaming, small footprint); lens laws
-   untouched-green.
-7. CI green on the pushed HEAD.
-8. Honest gap report: C5-python residual (separate world, SDK delegation
-   endgame), finding #1 disposition note (journal-era upserts/deletes
-   ALWAYS carry _rowid — the identity-less input class shrinks to
-   pre-migration data + explicit `write_rows_no_crdt`).
+1. **`pond.ObjectStore` pyo3 surface** (bindings/python/pyo3/src/lib.rs +
+   pond.pyi): constructors `ObjectStore(base_dir)` (LocalFS) and
+   `ObjectStore.from_s3(url, cache_dir=None)` (S3/R2 — cache wired via
+   the same `s3_kernel_cached` path Storage uses); semantic methods
+   mapping the trait — `put_blob/get_blob/get_blob_range/get_blob_suffix/
+   put_blob_batch/get_blob_batch/blob_exists/delete_blob/put_path/get_path/
+   delete_path/list_paths/list_dirs/store_id`; plus a raw-key escape
+   hatch `get_raw/put_raw/delete_raw/list_raw` (new default-Unsupported
+   trait methods, implemented by LocalFS + S3 only — the Python adapter
+   uses them for OLD-layout fallback reads `b/…` + `paths/…` and
+   `list_all_blob_hashes`). I/O-bound methods release the GIL
+   (`py.allow_threads`) so the Python kernel's ThreadPoolExecutor batches
+   actually parallelize.
+2. **`RustObjectStore` adapter** (bindings/python/core/rust_object_store.py):
+   duck-compatible with LocalFSObjectStore/S3ObjectStore (put_blob,
+   get_blob, put/get_blob_batch, has_blob, delete_blob,
+   list_all_blob_hashes, put_path, get_path, delete_path, list_paths,
+   stats, reset_stats, print_stats). NEW-layout ops delegate to the Rust
+   semantic methods; OLD-layout blob reads (`b/{h[:2]}/{h}`) and old refs
+   (`paths/{path}`) fall back via raw ops; hash computation comes from the
+   Rust `put_blob` return (sha256, identical to Python's `hash_bytes`).
+3. **`make_kernel` wiring** (bindings/python/core/make_kernel.py): new
+   `backend="auto"` kwarg — "auto" uses RustObjectStore when `import pond`
+   succeeds (file:// → `pond.ObjectStore(base_dir)`; s3:// →
+   `pond.ObjectStore.from_s3` with region/endpoint/creds translated to URL
+   query params + env, mirroring pond.Storage's constructor), falls back to
+   the pure-Python stores (with a one-time stderr note) when the module is
+   absent or construction fails; `POND_PY_BACKEND=python` forces the
+   fallback; `memory://` unchanged (InMemoryObjectStore).
+4. **Byte-interop pinned by tests**: (a) a store written via pure-Python
+   LocalFSObjectStore reads identically through RustObjectStore and
+   vice versa (same dir, same files — blobs + JSON refs byte-identical);
+   (b) `hash_bytes` equality across the boundary for identical data;
+   (c) old-layout fallback: a `b/…` blob + `paths/…` ref written by hand
+   (pre-layout-change shape) resolves through RustObjectStore.
+5. **The Python kernel stack works end-to-end on the Rust store**:
+   ObjectStoreNativeKernel(RustObjectStore) + UnifiedStorage write/read/
+   point-lookup round trip; PondStorage (SDK) write/read round trip;
+   make_kernel("file://…", backend="auto") picks Rust when built and
+   pure-Python when not (both asserted in tests via forced backends).
+6. **S3 via the Rust client, pinned by moto**: ObjectStoreNativeKernel on
+   RustObjectStore.from_s3(moto endpoint) — put/get/list/delete round
+   trips, ref resolution, kernel read-your-write; proves the Python world
+   no longer needs boto3 for its object I/O.
+7. **C8 repaired**: `read_collection_as_json_rows` (core/sql executor)
+   propagates HEAD-read errors (Err no longer swallowed); a test pins a
+   failing store → SQL query returns an error, not silently-partial rows.
+8. **C13 documented**: `pond read --help` + docs/API_WORKFLOW.md note that
+   the raw path resolves the branch ref (a CACHE of the last fold) and can
+   be journal-stale for structured data; use `pond read-rows`/SQL for
+   journal-aware reads. CRITIQUE keeps C13 open for the routing fix.
+9. Zero-warning build: `cargo clippy --workspace --all-targets -- -D
+   warnings` clean (pond_python included in clippy; excluded from cargo
+   test per CI policy — its surface is covered by the pytest job);
+   `cargo test --workspace --exclude pond_python --exclude pond_sql` green
+   (CI command) + pond_sql suite green; pytest green (existing suites +
+   the new tests in tests/test_rust_object_store.py); lens laws
+   untouched-green; moto S3 (Rust suite) green.
+10. CI green on the pushed HEAD (the pytest job builds pond_python and
+    runs the new tests through `import pond`).
+11. Honest gap report: C5-python phase 2 (format unification — Python
+    manifests/encoding vs PND2/PMAN; the SDK's semantics still live in
+    Python), C12/C14/C15/C16 dispositions unchanged, C13 routing deferred.

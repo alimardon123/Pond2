@@ -83,7 +83,10 @@ jobs:
         run: cargo test --workspace --release --exclude pond_python
 
   # ─────────────────────────────────────────────────────────────────────
-  # Python tests via tests/test_all.py (the canonical pytest entry point).
+  # Python tests via tests/test_all.py (the canonical pytest entry point)
+  # + tests/test_rust_object_store.py (the substrate-delegation suite:
+  # pond.ObjectStore pyo3 surface, RustObjectStore adapter, make_kernel
+  # backend wiring — skips gracefully when `import pond` fails).
   #
   # Builds the Rust workspace first so the PyO3 `pond.so` module, the
   # C ABI static libs, and the `pond` CLI binary all exist when pytest
@@ -110,7 +113,7 @@ jobs:
   #     requirements.txt, so it actually runs in CI).
   # ─────────────────────────────────────────────────────────────────────
   python-tests:
-    name: Python pytest (tests/test_all.py)
+    name: Python pytest (test_all.py + test_rust_object_store.py)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -156,7 +159,7 @@ jobs:
         env:
           PYTHONPATH: "target/release:bindings/python/core:bindings/python/sdk:bindings/python/sdk/extensions/physical_structures:lenses/keyvalue/python:lenses/lakehouse/python:archive/legacy-extensions"
         run: |
-          pytest tests/test_all.py -v
+          pytest tests/test_all.py tests/test_rust_object_store.py -v
 
   # ─────────────────────────────────────────────────────────────────────
   # Go SDK (bindings/go/) — cgo over libpond_storage.a + libpond_kernel.a.

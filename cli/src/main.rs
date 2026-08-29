@@ -66,6 +66,14 @@ enum Commands {
             #[arg(long, group = "input")] json: Option<String>,
             #[arg(long, group = "input")] bytes: bool,
             #[arg(short, long)] message: Option<String> },
+    /// Read the RAW bytes of a collection (or a blob by hash).
+    ///
+    /// NOTE (C13): the raw path resolves the branch ref — a CACHE of the
+    /// last compaction fold — so it can be journal-STALE for structured
+    /// data written since (write-rows/SQL INSERT append journal packs the
+    /// raw path does not resolve). For journal-aware reads use
+    /// `pond read-rows` or `pond sql`. Kept raw for byte-exact round-trips
+    /// of blobs written with `pond write`.
     Read { name_or_hash: String, #[arg(short, long)] output: Option<String> },
     Branch { collection: String, branch_name: String },
     Checkout { collection: String, branch_name: String,

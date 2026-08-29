@@ -1306,6 +1306,7 @@ use {ENC_RAW as _, ENC_RLE as _, ENC_DICT as _, ENC_BITPACK as _};
 //   - revert(collection, commit_hash)
 
 use pond_kernel::PondKernel;
+use pond_kernel::ObjectStore;
 use pond_storage::UnifiedStorage;
 use pond_storage::{write as storage_write, read as storage_read, branch as storage_branch,
                     commit as storage_commit};
@@ -1314,7 +1315,12 @@ use pond_hnsw_index::HNSWIndex as RustHNSWIndex;
 use pond_simple_index::SimpleIndex as RustSimpleIndex;
 use pond_semantic::SemanticDefinitions;
 use serde_json::{json, Value as JsonValue};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+/// Map an `io::Error` from the store layer to a Python `IOError`.
+fn py_io_err(e: std::io::Error) -> PyErr {
+    pyo3::exceptions::PyIOError::new_err(e.to_string())
+}
 
 /// Build a full S3 URL from a base URL and optional parameters.
 ///
@@ -1362,6 +1368,29 @@ fn build_s3_url(
     url
 }
 
+/// Build an S3 store wrapped in the 3-tier smart cache, as a SHAREABLE
+/// `Arc<dyn ObjectStore>` handle — the construction core shared by
+/// `s3_kernel_cached` (kernels) and the `pond.ObjectStore` class
+/// (substrate delegation). Same cache-dir resolution and graceful
+/// degradation as documented on [`s3_kernel_cached`].
+#[cfg(all(feature = "s3", feature = "cache"))]
+fn s3_store_cached(url: &str, cache_dir: Option<&str>) -> PyResult<Arc<dyn ObjectStore>> {
+    let py_err = |e: std::io::Error| pyo3::exceptions::PyIOError::new_err(e.to_string());
+    if let Some(dir) = pond_cache::resolve_cache_dir(cache_dir) {
+        let store = pond_s3::S3ObjectStore::from_url(url).map_err(py_err)?;
+        return match pond_cache::CachingObjectStore::new(Box::new(store), &dir) {
+            Ok(cached) => Ok(Arc::new(cached)),
+            Err(e) => {
+                eprintln!("pond: local cache disabled ({e}); using direct storage");
+                let raw = pond_s3::S3ObjectStore::from_url(url).map_err(py_err)?;
+                Ok(Arc::new(raw))
+            }
+        };
+    }
+    let raw = pond_s3::S3ObjectStore::from_url(url).map_err(py_err)?;
+    Ok(Arc::new(raw))
+}
+
 /// Build the kernel for an S3 URL, wrapped in the 3-tier smart cache
 /// (memory → local disk → S3) when the `cache` feature is enabled.
 ///
@@ -1379,20 +1408,7 @@ fn build_s3_url(
 /// store after the cache constructor consumed the first one is free).
 #[cfg(all(feature = "s3", feature = "cache"))]
 fn s3_kernel_cached(url: &str, cache_dir: Option<&str>) -> PyResult<PondKernel> {
-    let py_err = |e: std::io::Error| pyo3::exceptions::PyIOError::new_err(e.to_string());
-    if let Some(dir) = pond_cache::resolve_cache_dir(cache_dir) {
-        let store = pond_s3::S3ObjectStore::from_url(url).map_err(py_err)?;
-        return match pond_cache::CachingObjectStore::new(Box::new(store), &dir) {
-            Ok(cached) => Ok(PondKernel::new_with_store(Box::new(cached))),
-            Err(e) => {
-                eprintln!("pond: local cache disabled ({e}); using direct storage");
-                let raw = pond_s3::S3ObjectStore::from_url(url).map_err(py_err)?;
-                Ok(PondKernel::new_with_store(Box::new(raw)))
-            }
-        };
-    }
-    let raw = pond_s3::S3ObjectStore::from_url(url).map_err(py_err)?;
-    Ok(PondKernel::new_with_store(Box::new(raw)))
+    Ok(PondKernel::new_with_arc(s3_store_cached(url, cache_dir)?))
 }
 
 /// A Pond storage handle backed by the Rust UnifiedStorage.
@@ -4101,8 +4117,6 @@ impl RowBatchStream {
 // standard (dbt Semantic Layer, Cube Semantic Layer, Looker LookML).
 // ===========================================================================
 
-use std::sync::Arc;
-
 /// A handle to a semantic layer. All semantic operations go through this handle.
 ///
 /// Get one via: `m = s.layer('sales')`
@@ -5577,6 +5591,292 @@ fn evaluate_udf(
 // (fetch_udf_functions removed — UDF funcs are fetched inline in sql()
 // where the `py` token is available for clone_ref.)
 
+// ===========================================================================
+// ObjectStore — PyO3 wrapper around the Rust core's ObjectStore trait
+// ===========================================================================
+//
+// The substrate-delegation surface for the pure-Python kernel stack
+// (ACCEPTANCE.md §"Python-substrate delegation", ARCHITECTURE.md D1/D8
+// phase 1): the Python world keeps its formats and semantics, and
+// `RustObjectStore` (bindings/python/core/rust_object_store.py) implements
+// the LocalFSObjectStore/S3ObjectStore duck interface on top of this
+// handle — so the Python kernel stack inherits the Rust LocalFS + S3/R2
+// backends (SigV4, connection pooling, the 3-tier disk cache) instead of
+// its own implementations, and both worlds converge on the SAME
+// byte-identical layout:
+//
+//   blobs: blobs/{hash[:2]}/{hash}      (content-addressed, sha256)
+//   refs:  {path}                        (JSON {"hash": "..."})
+//
+// This is a RAW store handle — NOT a kernel, NOT UnifiedStorage. It holds
+// `Arc<dyn ObjectStore>` directly so Python and Rust callers can share
+// one store instance (same connection pool, same store_id).
+//
+// All I/O-bound methods release the GIL (`py.allow_threads`) so the
+// Python kernel's ThreadPoolExecutor batches actually parallelize into
+// the Rust core's native thread pools.
+
+/// A raw object-store handle — the Rust core's `ObjectStore` trait
+/// exposed to Python.
+///
+/// # Example (Python)
+/// ```python
+/// from pond import ObjectStore
+///
+/// store = ObjectStore("/var/lib/pond")            # local FS
+/// # store = ObjectStore.from_s3("s3://bucket/p?region=us-east-1&endpoint=...")
+///
+/// h = store.put_blob(b"hello")                    # content-addressed
+/// assert store.get_blob(h) == b"hello"
+/// store.put_path("collections/users/HEAD", h)     # JSON ref at {path}
+/// assert store.get_path("collections/users/HEAD") == h
+/// assert store.blob_exists(h)
+///
+/// # Raw-key escape hatch (legacy layouts, foreign key spaces):
+/// raw = store.get_raw("blobs/" + h[:2] + "/" + h)
+/// keys = store.list_raw("blobs/")
+/// ```
+#[pyclass(name = "ObjectStore")]
+struct RawObjectStore {
+    store: Arc<dyn ObjectStore>,
+}
+
+#[pymethods]
+impl RawObjectStore {
+    /// Create an ObjectStore from a location string.
+    ///
+    /// Auto-detects the backend:
+    ///   - `ObjectStore('/var/lib/pond')` → local filesystem
+    ///   - `ObjectStore('file:///var/lib/pond')` → local filesystem
+    ///   - `ObjectStore('s3://bucket/prefix?region=...&endpoint=...')` →
+    ///     S3/R2, wrapped in the 3-tier smart cache (same wiring as
+    ///     `Storage`; credentials from AWS_* env vars)
+    ///
+    /// For S3, `cache_dir` follows `resolve_cache_dir` (kwarg →
+    /// `POND_CACHE_DIR` → default `~/.pond_cache`; `'off'`/`'none'`
+    /// disables). Local FS ignores `cache_dir`.
+    #[new]
+    #[pyo3(signature = (location, cache_dir=None))]
+    fn new(location: &str, cache_dir: Option<&str>) -> PyResult<Self> {
+        if location.starts_with("s3://") {
+            #[cfg(feature = "s3")]
+            {
+                #[cfg(feature = "cache")]
+                let store = s3_store_cached(location, cache_dir)?;
+                #[cfg(not(feature = "cache"))]
+                let store = {
+                    let s = pond_s3::S3ObjectStore::from_url(location).map_err(py_io_err)?;
+                    Arc::new(s) as Arc<dyn ObjectStore>
+                };
+                Ok(Self { store })
+            }
+            #[cfg(not(feature = "s3"))]
+            {
+                let _ = cache_dir;
+                Err(pyo3::exceptions::PyIOError::new_err(
+                    "S3 support not compiled in. Rebuild with default features."
+                ))
+            }
+        } else {
+            // Local filesystem — cache_dir is S3-only (silence the unused
+            // param when built without the cache feature).
+            let _ = cache_dir;
+            let path = location.strip_prefix("file://").unwrap_or(location);
+            let store = pond_kernel::LocalFSObjectStore::new(path).map_err(py_io_err)?;
+            Ok(Self { store: Arc::new(store) })
+        }
+    }
+
+    /// Create an ObjectStore backed by S3-compatible storage.
+    ///
+    /// Equivalent to `ObjectStore('s3://...')` — kept for explicit clarity,
+    /// mirroring `Storage.from_s3`. Uses the 3-tier smart cache (see
+    /// `POND_CACHE_DIR` / the `cache_dir` kwarg; `'off'` to skip).
+    ///
+    /// NOTE: with the cache wrapper in place, the RAW escape hatch
+    /// (`get_raw`/`put_raw`/`delete_raw`/`list_raw`) is UNSUPPORTED by
+    /// design (raw ops bypass the cache layers) — pass `cache_dir='off'`
+    /// if the Python adapter needs legacy-layout raw reads.
+    #[staticmethod]
+    #[pyo3(signature = (url, cache_dir=None))]
+    fn from_s3(url: &str, cache_dir: Option<&str>) -> PyResult<Self> {
+        #[cfg(feature = "s3")]
+        {
+            #[cfg(feature = "cache")]
+            let store = s3_store_cached(url, cache_dir)?;
+            #[cfg(not(feature = "cache"))]
+            let store = {
+                let s = pond_s3::S3ObjectStore::from_url(url).map_err(py_io_err)?;
+                Arc::new(s) as Arc<dyn ObjectStore>
+            };
+            Ok(Self { store })
+        }
+        #[cfg(not(feature = "s3"))]
+        {
+            let _ = (url, cache_dir);
+            Err(pyo3::exceptions::PyIOError::new_err(
+                "S3 support not compiled in. Rebuild with default features."
+            ))
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Semantic trait methods (content-addressed blobs + JSON refs)
+    // ------------------------------------------------------------------
+
+    /// Write bytes, content-addressed. Returns the sha256 hex hash.
+    ///
+    /// Idempotent: same bytes → same hash → same key.
+    fn put_blob(&self, py: Python<'_>, data: Vec<u8>) -> PyResult<String> {
+        py.allow_threads(|| self.store.put_blob(&data)).map_err(py_io_err)
+    }
+
+    /// Read bytes by content hash. Raises IOError when the blob is absent.
+    fn get_blob<'py>(&self, py: Python<'py>, hash: String) -> PyResult<Bound<'py, PyBytes>> {
+        let data = py.allow_threads(|| self.store.get_blob(&hash)).map_err(py_io_err)?;
+        Ok(PyBytes::new_bound(py, &data))
+    }
+
+    /// Read the byte range `[start, end)` from a content-addressed blob
+    /// (half-open; native range reads — no full-object fetch).
+    fn get_blob_range<'py>(
+        &self,
+        py: Python<'py>,
+        hash: String,
+        start: u64,
+        end: u64,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let data = py
+            .allow_threads(move || self.store.get_blob_range(&hash, start, end))
+            .map_err(py_io_err)?;
+        Ok(PyBytes::new_bound(py, &data))
+    }
+
+    /// Read the last `n` bytes of a content-addressed blob
+    /// (single round-trip — S3 `Range: bytes=-N`, FS seek-from-end).
+    fn get_blob_suffix<'py>(
+        &self,
+        py: Python<'py>,
+        hash: String,
+        n: u64,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let data = py
+            .allow_threads(move || self.store.get_blob_suffix(&hash, n))
+            .map_err(py_io_err)?;
+        Ok(PyBytes::new_bound(py, &data))
+    }
+
+    /// Write a batch of blobs (S3 impl parallelizes across a thread pool).
+    fn put_blob_batch(&self, py: Python<'_>, items: Vec<Vec<u8>>) -> PyResult<Vec<String>> {
+        py.allow_threads(move || self.store.put_blob_batch(&items))
+            .map_err(py_io_err)
+    }
+
+    /// Fetch a batch of blobs (S3 impl parallelizes; order preserved).
+    fn get_blob_batch<'py>(
+        &self,
+        py: Python<'py>,
+        hashes: Vec<String>,
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        // Build the Vec<Vec<u8>> off-GIL, convert to PyBytes after.
+        let results = py
+            .allow_threads(move || self.store.get_blob_batch(&hashes))
+            .map_err(py_io_err)?;
+        Ok(results.iter().map(|d| PyBytes::new_bound(py, d)).collect())
+    }
+
+    /// Check if a blob exists (HEAD on S3; existence check on FS).
+    fn blob_exists(&self, py: Python<'_>, hash: String) -> bool {
+        py.allow_threads(move || self.store.blob_exists(&hash))
+    }
+
+    /// Physically delete a blob (maintenance op). True if it existed.
+    fn delete_blob(&self, py: Python<'_>, hash: String) -> PyResult<bool> {
+        py.allow_threads(move || self.store.delete_blob(&hash)).map_err(py_io_err)
+    }
+
+    /// Bind a named path to a hash — writes the JSON ref body
+    /// `{"hash":"..."}` at `{path}`. Last-writer-wins.
+    fn put_path(&self, py: Python<'_>, path: String, hash: String) -> PyResult<()> {
+        py.allow_threads(move || self.store.put_path(&path, &hash))
+            .map_err(py_io_err)
+    }
+
+    /// Resolve a named path to its hash, or None if unbound.
+    fn get_path(&self, py: Python<'_>, path: String) -> Option<String> {
+        py.allow_threads(move || self.store.get_path(&path))
+    }
+
+    /// Delete a named path. True if it existed.
+    fn delete_path(&self, py: Python<'_>, path: String) -> PyResult<bool> {
+        py.allow_threads(move || self.store.delete_path(&path))
+            .map_err(py_io_err)
+    }
+
+    /// List all keys under a prefix (relative to the store root, sorted).
+    /// NOTE: backend-dependent on the blob tree — LocalFS walks raw keys
+    /// (a prefix covering `blobs/` includes blob keys), S3 filters `/blobs/`
+    /// keys. The Python adapter (RustObjectStore.list_paths) normalizes
+    /// to the pure-Python store shape (blob keys always excluded).
+    #[pyo3(signature = (prefix = "".to_string()))]
+    fn list_paths(&self, py: Python<'_>, prefix: String) -> PyResult<Vec<String>> {
+        py.allow_threads(move || self.store.list_paths(&prefix))
+            .map_err(py_io_err)
+    }
+
+    /// List immediate child DIRECTORY names under a prefix (one level —
+    /// the journal's writer-discovery primitive).
+    fn list_dirs(&self, py: Python<'_>, prefix: String) -> PyResult<Vec<String>> {
+        py.allow_threads(move || self.store.list_dirs(&prefix))
+            .map_err(py_io_err)
+    }
+
+    /// Stable identity of this store instance (canonical location string
+    /// — same store ⇒ same id).
+    fn store_id(&self) -> String {
+        self.store.store_id()
+    }
+
+    // ------------------------------------------------------------------
+    // Raw-key escape hatch — store-relative keys WITHOUT content
+    // addressing or JSON wrapping (legacy layouts `b/{h[:2]}/{h}` +
+    // `paths/{p}`, foreign key spaces, blob enumeration). Unsupported on
+    // cache-wrapped stores (raises IOError) — see from_s3's docstring.
+    // ------------------------------------------------------------------
+
+    /// Read raw bytes at a store-relative key. None when absent.
+    fn get_raw<'py>(
+        &self,
+        py: Python<'py>,
+        key: String,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        let data = py
+            .allow_threads(move || self.store.get_raw(&key))
+            .map_err(py_io_err)?;
+        Ok(data.map(|d| PyBytes::new_bound(py, &d)))
+    }
+
+    /// Write raw bytes at a store-relative key (no content addressing).
+    fn put_raw(&self, py: Python<'_>, key: String, data: Vec<u8>) -> PyResult<()> {
+        py.allow_threads(move || self.store.put_raw(&key, &data))
+            .map_err(py_io_err)
+    }
+
+    /// Delete a raw key. True if it existed.
+    fn delete_raw(&self, py: Python<'_>, key: String) -> PyResult<bool> {
+        py.allow_threads(move || self.store.delete_raw(&key))
+            .map_err(py_io_err)
+    }
+
+    /// List all raw keys under a prefix (relative to the store root,
+    /// INCLUDING any `blobs/` component, sorted, recursive).
+    #[pyo3(signature = (prefix = "".to_string()))]
+    fn list_raw(&self, py: Python<'_>, prefix: String) -> PyResult<Vec<String>> {
+        py.allow_threads(move || self.store.list_raw(&prefix))
+            .map_err(py_io_err)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Python module definition
 // ---------------------------------------------------------------------------
@@ -5586,6 +5886,7 @@ fn pond(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode, m)?)?;
     m.add_function(wrap_pyfunction!(encode, m)?)?;
     m.add_class::<Storage>()?;
+    m.add_class::<RawObjectStore>()?;
     m.add_class::<RowBatchStream>()?;
     m.add_class::<SemanticLayer>()?;
     Ok(())
