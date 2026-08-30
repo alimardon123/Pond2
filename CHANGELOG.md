@@ -3,6 +3,48 @@
 > Crucible state file. The deep per-cycle log lives in `worklog.md`
 > (append-only); this file tracks iterations and why.
 
+## 2026-08-30 — Crucible iteration N+7: C20 short-hash cat (sandbox-recovery rebuild)
+
+- **Context**: the N+7 builder cycle completed its C20 work but left it
+  UNCOMMITTED; the sandbox was reset before the commit/push. This cycle
+  re-cloned, re-established credentials/toolchain, verified origin/main
+  CI green on aadf04d (N+6), and re-delivered C20 from the worklog
+  record + fresh implementation. No user-visible spec drift: resolution
+  semantics, error shapes, and test coverage match the lost build.
+- **C20 landed (`pond cat <short-hash>` prefix resolution)**: 6–63-char
+  lowercase-hex prefixes resolve against the blobs/ tree on EVERY
+  backend — including the default S3+cache configuration that produced
+  the live R2 finding (prefixed-S3 `list_paths` filters blob keys and
+  `CachingObjectStore` deliberately refuses the raw hatch, so the
+  kernel's own listing surfaces cannot see `blobs/` at all). The CLI
+  builds a throwaway raw-listing handle from the storage root URL
+  (LocalFS / pure-URL-parsed S3 — no connections; the kernel and its
+  3-tier cache stay the READ path), PARSES the hash out of each key
+  (only well-formed 64-char hex components — never whole-key
+  string-match), and reports: one match → the blob's bytes; zero → the
+  historical "no blob with prefix" error verbatim; many → ambiguity
+  error with up to 5 sorted candidates + "... and K more". A listing
+  failure exits loudly (C17 law: Err ≠ absence). Bonus crash fix found
+  during root-cause: 0/1-char args previously PANICKED in the store
+  layer (`blob_path` slices `hash[..2]`, exit 101) — now a clean
+  exit-1 error. `pond cat --help` documents the full contract. Pinned
+  by 6 new CLI integration tests incl. a deterministic in-memory
+  birthday grind for the ambiguity case (first 6-char collision at
+  grind i=5652, cross-checked with an independent python sha256 probe)
+  and the below-minimum gate (a 4-char prefix that uniquely matches
+  must NOT resolve).
+- **Live R2 verification**: `scripts/test_rust_s3_r2.py` now 36/36 —
+  step 10's `cat <12-char-prefix>` RESOLVES the commit blob on live
+  prefixed R2 (was SKIP pre-C20). The step's assertion was also
+  corrected: the 12-char prefix from `pond write` is the COMMIT hash,
+  so a resolved cat returns the commit JSON (asserted structurally:
+  manifest + timestamp fields), not the raw payload — the old
+  `stdout == payload` check could never have passed for a commit hash.
+- **C21 opened (adjacent gap)**: the same S3 `list_paths` blob-filter
+  blinds every `list_names_prefix("blobs/…")` caller on prefixed
+  stores — maintenance GC/vacuum enumerate 0 blobs there (silent
+  under-collection). Recorded in CRITIQUE with a fix shape.
+
 ## 2026-08-30 — Crucible iteration N+6: the error-channel + codec-laws + live-R2 cycle (C17 + C13 + C12)
 
 - **C17 landed (D9 — the ref-surface error channel)**:

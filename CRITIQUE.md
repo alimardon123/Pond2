@@ -21,12 +21,36 @@
   before every DELETE — an extra round trip per delete for a return
   value no production caller reads. Documented trade (pinned live in
   tests/r2_live.rs); do NOT "fix" without a caller that needs it.
-- **C20 (N+6, NIT — `pond cat <short-hash>` prefix resolution).** The
-  live R2 CLI harness found `cat` requires the FULL hash — short-hash
-  prefix resolution errored ("no blob with prefix 'b6d5d430b154'")
-  instead of resolving. UX gap only (CLI convenience); `read` by full
-  hash works. Fix shape: blob_exists/prefix scan via list_raw on the
-  blobs/ tree, or accept full-hash only in help text.
+- **C20 (N+6 NIT; RESOLVED N+7 — `pond cat <short-hash>` prefix
+  resolution).** The live R2 CLI harness found `cat` requires the FULL
+  hash — short-hash prefix resolution errored ("no blob with prefix
+  'b6d5d430b154'") instead of resolving. ROOT CAUSE (deeper than a UX
+  gap): on a PREFIXED S3 store, `S3ObjectStore::list_paths` filters out
+  every key under `blobs/` (content-addressed keys, "not named refs"),
+  so `PondKernel::list_blobs_prefix` — the old resolution path — always
+  saw an empty shard listing; and the default S3 kernel wraps the store
+  in `CachingObjectStore`, which deliberately does not support the raw
+  hatch, so NEITHER kernel listing surface can see the blobs/ tree
+  there. FIX (N+7): `cmd_cat` resolves 6–63-char lowercase-hex prefixes
+  by listing `blobs/<shard>/` via a throwaway raw-listing handle built
+  from the storage root URL (LocalFS / pure-URL-parsed S3 — the kernel
+  and its 3-tier cache stay the READ path); the hash is PARSED out of
+  each key (only well-formed 64-char hex components), zero matches keeps
+  the historical error, many → ambiguity error capped at 5 candidates;
+  0/1-char args error cleanly (pre-fix: store-layer PANIC, exit 101).
+  Live-R2 verified: harness step 10 now RESOLVES (was SKIP). Adjacent
+  gap recorded as C21.
+- **C21 (N+7, OPEN — S3 `list_paths` blob-filter blinds `blobs/`
+  callers on prefixed stores).** The SAME `k.contains("/blobs/") → None`
+  filter that broke C20 blinds EVERY `list_names_prefix("blobs/…")`
+  caller on a prefixed S3 store: `maintenance.rs` GC/vacuum collect
+  enumerates 0 blobs there (they report nothing to delete — silent
+  under-collection, not data loss), and any future blobs/-tree walker
+  inherits the blindness. LocalFS and bucket-root S3 are unaffected.
+  Fix shape: either teach list_paths a blobs/ passthrough mode or route
+  maintenance enumeration through the raw hatch (with a capability
+  probe). `PondKernel::list_blobs_prefix` is now UNUSED by the CLI but
+  still exposed for other callers.
 - **C16 (N+4, residual — CRDT-RG read cost)** — The D7 reader rule (see
   ARCHITECTURE.md) exempts CRDT-update RGs from value pruning in merging
   readers and skips them in non-merging readers. Cost model = the pre-D7

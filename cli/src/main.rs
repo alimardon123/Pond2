@@ -87,7 +87,19 @@ enum Commands {
     Undo { collection: String, #[arg(default_value = "1")] steps: usize },
     Revert { collection: String, commit_hash: String },
     Ls,
-    Cat { hash: String },
+    /// Print the raw bytes of a blob to stdout.
+    ///
+    /// <HASH> may be a FULL 64-char sha256 hex hash or a SHORT hex prefix
+    /// of 6–63 chars. Short prefixes are resolved against the blobs/ tree
+    /// on the storage backend: exactly one match → that blob's bytes;
+    /// zero matches → "no blob with prefix" error; multiple matches → an
+    /// ambiguity error listing up to 5 candidate hashes (add more chars
+    /// to disambiguate). Prefixes shorter than 6 chars are never resolved.
+    Cat {
+        /// Full 64-char hash or 6–63-char hex prefix (unique → cat,
+        /// ambiguous → error listing candidates).
+        hash: String,
+    },
     /// Garbage collect unreachable blobs.
     /// Analyzes reachability and optionally deletes dead blobs.
     Gc {
@@ -246,7 +258,7 @@ fn main() {
                     cmd_revert(&storage, &collection, &commit_hash);
                 }
                 Commands::Ls => { cmd_ls(&storage); }
-                Commands::Cat { hash } => { cmd_cat(&storage, &hash); }
+                Commands::Cat { hash } => { cmd_cat(&storage, &storage_url, &hash); }
                 Commands::Gc { compute_size, dry_run } => {
                     cmd_gc(&storage, compute_size, dry_run);
                 }
@@ -789,24 +801,145 @@ fn cmd_ls(storage: &UnifiedStorage) {
     }
 }
 
-fn cmd_cat(storage: &UnifiedStorage, hash: &str) {
+/// Cat a blob to stdout by full hash or short hex prefix (C20).
+///
+/// Resolution order:
+///   1. 64-char full hash → direct kernel read (exact lookup, no listing).
+///   2. 6..=63-char lowercase-hex prefix → resolve against the blobs/ tree:
+///      one match → cat it; zero → the historical "no blob with prefix"
+///      error; many → ambiguity error listing up to 5 sorted candidates.
+///   3. Anything else (2–5 chars, non-hex, wrong case) → the historical
+///      "no blob with prefix" error.
+///
+/// A listing failure exits LOUDLY — an outage must not masquerade as
+/// "no blob" (the C17 law: Err ≠ absence).
+fn cmd_cat(storage: &UnifiedStorage, storage_url: &str, hash: &str) {
     let kernel = storage.kernel();
+    // Degenerate args error cleanly — the store layer slices hash[..2]
+    // and PANICS on 0/1-char inputs (pre-C20 crash, verified: exit 101).
+    if hash.len() < 2 {
+        eprintln!("Error: no blob with prefix '{}'", hash);
+        std::process::exit(1);
+    }
     match kernel.read_blob(hash) {
         Ok(data) => { io::stdout().write_all(&data).unwrap(); }
         Err(_) if hash.len() < 64 => {
-            let matches = kernel.list_blobs_prefix(hash);
-            if matches.len() == 1 {
-                kernel.read_blob(&matches[0]).map(|d| { io::stdout().write_all(&d).unwrap(); }).ok();
-                return;
-            } else if matches.is_empty() {
+            // C20 prefix resolution. PondKernel::list_blobs_prefix goes
+            // through ObjectStore::list_paths, which on a PREFIXED S3 store
+            // filters out every key under blobs/ (content-addressed keys,
+            // "not named refs") — and the default S3 kernel wraps the store
+            // in CachingObjectStore, which deliberately does NOT support the
+            // raw-key hatch. NEITHER kernel listing surface can see the
+            // blobs/ tree there. So we list blobs/<shard>/ ourselves through
+            // a raw-listing handle built from the storage root URL; the
+            // kernel (with its 3-tier cache) stays the READ path.
+            if !is_plausible_hex_prefix(hash) {
                 eprintln!("Error: no blob with prefix '{}'", hash);
-            } else {
-                eprintln!("Error: ambiguous prefix '{}'", hash);
+                std::process::exit(1);
             }
-            std::process::exit(1);
+            match resolve_blob_prefix(storage_url, hash) {
+                Ok(candidates) => {
+                    if candidates.len() == 1 {
+                        let full = &candidates[0];
+                        match kernel.read_blob(full) {
+                            Ok(data) => { io::stdout().write_all(&data).unwrap(); }
+                            Err(e) => {
+                                eprintln!("Error: '{}': {}", full, e);
+                                std::process::exit(1);
+                            }
+                        }
+                    } else if candidates.is_empty() {
+                        eprintln!("Error: no blob with prefix '{}'", hash);
+                        std::process::exit(1);
+                    } else {
+                        eprintln!(
+                            "Error: ambiguous prefix '{}' — {} blobs match, add more chars. Candidates:",
+                            hash, candidates.len());
+                        for c in candidates.iter().take(5) {
+                            eprintln!("  {}", c);
+                        }
+                        if candidates.len() > 5 {
+                            eprintln!("  ... and {} more", candidates.len() - 5);
+                        }
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: listing blobs for prefix '{}': {}", hash, e);
+                    std::process::exit(1);
+                }
+            }
         }
         Err(e) => { eprintln!("Error: '{}': {}", hash, e); std::process::exit(1); }
     }
+}
+
+/// Is `s` a plausible blob-hash prefix: pure lowercase hex, 6..=63 chars.
+/// (Blob hashes are sha256 lowercase hex; anything else keeps the
+/// historical prefix error instead of a backend listing.)
+fn is_plausible_hex_prefix(s: &str) -> bool {
+    (6..64).contains(&s.len())
+        && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Resolve a short hex hash prefix against the blobs/ tree by listing
+/// `blobs/<first-2-chars>/` through a raw-listing handle built from the
+/// storage root URL. Works on EVERY backend — including prefixed S3
+/// stores, where the kernel's list_paths-based surfaces cannot see blob
+/// keys at all (they're filtered as content-addressed).
+///
+/// The hash is PARSED out of each key (`blobs/<shard>/<hash>` → `<hash>`,
+/// only well-formed 64-char lowercase-hex components count) — never
+/// whole-key string-matched, so foreign keys sharing the prefix text
+/// can't shadow or spoof a candidate.
+fn resolve_blob_prefix(storage_url: &str, prefix: &str) -> io::Result<Vec<String>> {
+    let shard = &prefix[..2];
+    let list_prefix = format!("blobs/{}/", shard);
+    let keys = raw_list(storage_url, &list_prefix)?;
+    let mut candidates: Vec<String> = keys.into_iter()
+        .filter_map(|k| {
+            let parts: Vec<&str> = k.split('/').collect();
+            match parts.as_slice() {
+                ["blobs", s, h] if *s == shard
+                    && h.len() == 64
+                    && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
+                {
+                    Some(h.to_string())
+                }
+                _ => None,
+            }
+        })
+        .filter(|h| h.starts_with(prefix))
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    Ok(candidates)
+}
+
+/// List raw store-relative keys under `prefix` on the backend that owns
+/// `storage_url`. Builds a THROWAWAY raw-listing handle from the root URL:
+/// LocalFSObjectStore for local/file:// roots, S3ObjectStore::from_url
+/// (a pure URL parser — no connections made) for s3://. The kernel and
+/// its 3-tier cache are untouched; this handle is listing-only.
+fn raw_list(storage_url: &str, prefix: &str) -> io::Result<Vec<String>> {
+    if storage_url.starts_with("s3://") {
+        #[cfg(feature = "s3")]
+        {
+            let store = pond_s3::S3ObjectStore::from_url(storage_url)?;
+            use pond_kernel::ObjectStore as _;
+            return store.list_raw(prefix);
+        }
+        #[cfg(not(feature = "s3"))]
+        {
+            return Err(io::Error::new(io::ErrorKind::Unsupported,
+                "S3 support not compiled in (build with the s3 feature)"));
+        }
+    }
+    // Local filesystem root (plain path or file:// URL).
+    let path = storage_url.strip_prefix("file://").unwrap_or(storage_url);
+    let store = pond_kernel::LocalFSObjectStore::new(path)?;
+    use pond_kernel::ObjectStore as _;
+    store.list_raw(prefix)
 }
 
 

@@ -402,18 +402,28 @@ class R2TestRunner:
         self.check("read returns the payload we wrote", r.stdout.strip() == payload,
                    f"(got: {r.stdout.strip()[:100]!r})")
 
-        # cat by hash — need the full hash. The CLI `cat` takes a hash; we only
-        # have the 12-char prefix. The CLI resolves short prefixes (per
-        # cli_integration.rs patterns), so try the prefix.
+        # cat by short hash prefix (C20): the 12-char prefix printed by
+        # `pond write` is the COMMIT hash; `cat <prefix>` must resolve it
+        # against the blobs/ tree on live R2 — the exact case that was
+        # broken pre-C20 (prefixed-S3 list_paths filters blob keys, so the
+        # kernel's listing surfaces see nothing and cat errored "no blob
+        # with prefix").
         if hash_prefix:
             r = self.pond_cmd("cat", hash_prefix, expect_ok=False)
-            # cat may or may not accept short prefixes — don't fail the suite if not
             if r.returncode == 0:
-                self.check("cat <hash> returns the blob", r.stdout.strip() == payload)
+                try:
+                    commit_obj = json.loads(r.stdout.strip())
+                    self.check("cat <short-hash> resolves the commit blob",
+                               isinstance(commit_obj, dict)
+                               and "manifest" in commit_obj
+                               and "timestamp" in commit_obj,
+                               f"(got: {r.stdout.strip()[:120]!r})")
+                except json.JSONDecodeError:
+                    self.check("cat <short-hash> returns the commit blob JSON",
+                               False, f"(non-JSON: {r.stdout.strip()[:120]!r})")
             else:
-                # Not a hard failure — prefix resolution may require full hash.
-                print(f"  [SKIP] cat <short-hash> (prefix resolution may need full hash; "
-                      f"stderr: {r.stderr[:120].strip()!r})")
+                self.check("cat <short-hash> resolves (C20)", False,
+                           f"(stderr: {r.stderr[:120].strip()!r})")
 
     # — cleanup ——————————————————————————————————————————————
 

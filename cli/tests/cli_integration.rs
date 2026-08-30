@@ -721,3 +721,130 @@ fn test_shell_shell_escape() {
     assert!(ok);
     assert!(out.contains("hello_from_shell"), "\\! should forward shell output: {}", out);
 }
+
+// ---------------------------------------------------------------------------
+// C20 — `pond cat <short-hash>` prefix resolution tests.
+//
+// Blob seeding uses a local PondKernel over the SAME directory the CLI
+// opens (kernel.write returns the content hash), so the CLI's raw-listing
+// handle and the kernel agree on the store layout byte-for-byte.
+// ---------------------------------------------------------------------------
+
+/// Run pond expecting FAILURE; return (stdout, stderr). Panics if it succeeds.
+fn run_fail(root: &std::path::Path, args: &[&str]) -> (String, String) {
+    let output = pond(root, args).output().unwrap();
+    if output.status.success() {
+        panic!("pond {:?} unexpectedly succeeded: {}", args,
+            String::from_utf8_lossy(&output.stdout));
+    }
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+/// Seed one blob into the store rooted at `dir` and return its full hash.
+fn seed_blob(dir: &std::path::Path, data: &[u8]) -> String {
+    let kernel = pond_kernel::PondKernel::new_local(dir).unwrap();
+    kernel.write(data).unwrap()
+}
+
+#[test]
+fn test_cat_full_hash() {
+    let dir = TempDir::new().unwrap();
+    run(dir.path(), &["init", "."]);
+    let h = seed_blob(dir.path(), b"full-hash-payload");
+    let out = run(dir.path(), &["cat", &h]);
+    assert_eq!(out, "full-hash-payload");
+}
+
+#[test]
+fn test_cat_unique_short_hash_prefix() {
+    let dir = TempDir::new().unwrap();
+    run(dir.path(), &["init", "."]);
+    let h1 = seed_blob(dir.path(), b"prefix-target-blob");
+    let _h2 = seed_blob(dir.path(), b"prefix-decoy-blob");
+    // 8 chars of h1 uniquely identify it (verified distinct from h2 below).
+    let short = &h1[..8];
+    assert_ne!(&_h2[..8], short, "test premise: prefixes differ");
+    let out = run(dir.path(), &["cat", short]);
+    assert_eq!(out, "prefix-target-blob");
+}
+
+#[test]
+fn test_cat_ambiguous_short_hash_prefix_errors() {
+    let dir = TempDir::new().unwrap();
+    run(dir.path(), &["init", "."]);
+    // Deterministic birthday grind (in-memory, self-verifying): the first
+    // pair of `ambig-grind-{i}` contents whose sha256 hashes share a
+    // 6-char prefix. Cross-checked against an independent python sha256
+    // probe: first collision lands at i=5652 (first seen at i=4145,
+    // prefix ef5830) — but the test never hard-codes those: it re-grinds
+    // with the kernel's own hash_bytes and asserts the collision exists.
+    let mut seen: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut pair: Option<(usize, usize)> = None;
+    for i in 0..20000usize {
+        let h = pond_kernel::hash_bytes(format!("ambig-grind-{i}").as_bytes());
+        let p = h[..6].to_string();
+        if let Some(&first) = seen.get(&p) {
+            pair = Some((first, i));
+            break;
+        }
+        seen.insert(p, i);
+    }
+    let (i1, i2) = pair.expect("grind must find a 6-char collision within 20000");
+    let h1 = seed_blob(dir.path(), format!("ambig-grind-{i1}").as_bytes());
+    let h2 = seed_blob(dir.path(), format!("ambig-grind-{i2}").as_bytes());
+    assert_eq!(&h1[..6], &h2[..6], "test premise: shared 6-char prefix");
+    assert_ne!(h1, h2);
+    let (out, err) = run_fail(dir.path(), &["cat", &h1[..6]]);
+    assert!(out.is_empty(), "ambiguity must not write stdout: {out:?}");
+    assert!(err.contains("ambiguous prefix"), "stderr: {err}");
+    assert!(err.contains("2 blobs match"), "stderr: {err}");
+    assert!(err.contains(&h1), "candidate h1 must be listed: {err}");
+    assert!(err.contains(&h2), "candidate h2 must be listed: {err}");
+}
+
+#[test]
+fn test_cat_short_hash_prefix_no_match_errors() {
+    let dir = TempDir::new().unwrap();
+    run(dir.path(), &["init", "."]);
+    let h = seed_blob(dir.path(), b"no-match-anchor");
+    // Guaranteed non-matching 6-char prefix: flip the last hex digit of a
+    // real hash (0→1 etc.) — stays plausible hex, matches nothing.
+    let mut probe = h[..6].to_string();
+    let last = probe.pop().unwrap();
+    probe.push(if last == '0' { '1' } else { '0' });
+    let (out, err) = run_fail(dir.path(), &["cat", &probe]);
+    assert!(out.is_empty());
+    // The HISTORICAL error message, kept verbatim.
+    assert!(err.contains(&format!("Error: no blob with prefix '{}'", probe)),
+        "expected historical no-match error, got: {err}");
+}
+
+#[test]
+fn test_cat_prefix_below_minimum_not_resolved() {
+    let dir = TempDir::new().unwrap();
+    run(dir.path(), &["init", "."]);
+    let h = seed_blob(dir.path(), b"below-minimum-anchor");
+    // A 4-char prefix that UNIQUELY matches a blob must NOT resolve —
+    // the resolution gate starts at 6 chars.
+    let short = &h[..4];
+    let (out, err) = run_fail(dir.path(), &["cat", short]);
+    assert!(out.is_empty());
+    assert!(err.contains(&format!("Error: no blob with prefix '{}'", short)),
+        "4-char prefix must keep the historical error, got: {err}");
+}
+
+#[test]
+fn test_cat_single_char_argument_errors_cleanly() {
+    let dir = TempDir::new().unwrap();
+    run(dir.path(), &["init", "."]);
+    // Pre-C20 this PANICKED in the store layer (blob_path slices
+    // hash[..2]); now it must be a clean exit-1 error.
+    let (out, err) = run_fail(dir.path(), &["cat", "x"]);
+    assert!(out.is_empty());
+    assert!(err.contains("Error: no blob with prefix 'x'"), "stderr: {err}");
+    assert!(!err.contains("panicked"), "must not panic: {err}");
+}
